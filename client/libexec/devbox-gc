@@ -1,0 +1,390 @@
+#!/bin/bash
+# Remove devbox workspaces whose local worktree is gone, on every deployed target.
+#
+# Usage: devbox gc [--dry-run] [--yes] <root>...
+#
+# The list of live worktrees is computed HERE, from paths that still exist, and
+# passed to the devbox as a keep-list. The devbox cannot work this out on its
+# own: a slug is a hash of a laptop path, and the hash is one-way.
+set -euo pipefail
+
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox-gc: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-config
+source "$_here/devbox-config"
+# shellcheck source=client/libexec/devbox-transport
+source "$_here/devbox-transport"
+# shellcheck source=client/libexec/devbox-targets
+source "$_here/devbox-targets"
+DEVBOX_GUARD_WHO="devbox-gc"
+
+# Which targets lose workspaces is read from ONE file, never guessed: the
+# .devbox.env of the first passed root that has one, or whose main checkout has
+# one (devbox_env_find, the lookup `devbox verify` uses). A guessed host is a gc
+# run against somebody else's workspaces.
+#
+# DEVBOX_GC_HOST named one host and overrode that file in an older client. gc acts
+# on every target in DEVBOX_TARGETS, so a value still exported from
+# an earlier shell is refused rather than ignored: an operator who set it meant
+# one host, and a run over every target is not what they asked for.
+resolve_env() {
+  local root env_file
+  for root in "$@"; do
+    env_file="$(devbox_env_find "$(workspace_path "$root")")" || continue
+    printf '%s' "$env_file"
+    return 0
+  done
+  echo "devbox-gc: no .devbox.env in any root passed, or beside its main checkout. gc acts on the targets that file lists in DEVBOX_TARGETS." >&2
+  return 1
+}
+
+# The keep-list slug has to come out byte-identical to the one `devbox verify`
+# builds for the same checkout, because the server deletes every workspace whose
+# slug is NOT on the list. verify hashes `git rev-parse --show-toplevel`, which
+# is PHYSICAL: git resolves every symlink in the path. This used to hash `cd
+# "$root" && pwd`, which is LOGICAL and keeps them, so one symlink anywhere above
+# a checkout put a slug on the keep-list that no workspace has, and gc deleted
+# the live workspace, its volume, its Postgres role and every database that role
+# owns. The two derivations must not drift apart again.
+workspace_path() {
+  local root="$1" top
+  top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$top" ] && { printf '%s' "$top"; return; }
+  # Not a git checkout, so there is no toplevel to ask for. `pwd -P` is physical
+  # too, which keeps this branch in agreement with the one above.
+  (cd "$root" && pwd -P)
+}
+
+MACHINE_ID="$(devbox_machine_id)"
+# devbox_machine_id names its own failure; devbox_machine_label does not, and a
+# hostname that sanitizes to empty ended this whole command through set -e with
+# no output at all. A gc that stops without a word reads as a gc that ran and
+# found nothing to do, so the next person runs it again rather than fixing it.
+MACHINE="$(devbox_machine_label)" || {
+  echo "devbox-gc: cannot build this machine's label from 'hostname', so no slug can be computed." >&2
+  exit 2
+}
+
+# --dry-run resolves the host and the whole keep-list, asks the server what that
+# keep-list would remove, prints both, and deletes nothing. Every other path
+# through this command ends in a delete, so an operator had no way to read the
+# keep-list until the server had already acted on it. That is the only way to
+# tell a retired checkout from a path that is merely mistyped, which the refusals
+# below cannot do for them.
+#
+# The flag is read out of the arguments in any position, because a keep-list is
+# typed as a long line of roots and the check belongs wherever it was typed.
+DRY_RUN=0
+# --yes is the confirmation for a run the server says would REMOVE something. A
+# flag rather than a prompt, because gc is also run from scripts and a prompt in
+# a script is a hang. It is read in any position for the same reason --dry-run
+# is: the roots are typed as one long line.
+ASSUME_YES=0
+roots=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --yes) ASSUME_YES=1 ;;
+    *) roots+=("$arg") ;;
+  esac
+done
+
+keep=()
+# The root each slug came from, kept in step with keep. A slug ends in a one-way
+# hash, so it cannot be traced back to the root that produced it, and --dry-run
+# has to show the operator that pairing to be worth reading.
+plan=()
+for root in "${roots[@]}"; do
+  # Both of these used to `continue`: a missing directory printed one line on
+  # stderr, a missing profile printed nothing at all. Either skip drops the
+  # root's slug from the keep-list, and the server deletes every workspace whose
+  # slug is not on that list, so one mistyped argument destroyed a live
+  # workspace, its volume, its Postgres role and every database that role owns.
+  # A typo and a retired checkout reach this loop as the same event, so it
+  # refuses the whole run and names which condition the root failed.
+  [ -d "$root" ] || {
+    echo "devbox-gc: $root is not a directory (mistyped, not mounted, or already removed). Check the path, or drop it from the arguments to gc the rest." >&2
+    exit 2
+  }
+  # The toplevel is resolved FIRST, and everything below is read from it. The
+  # project came from $root/.devbox/profile.sh while the path came from git's
+  # toplevel of $root, so a root pointing at a SUBDIRECTORY of a checkout paired
+  # one checkout's project with another directory's path. That slug names no
+  # workspace, and a slug that names no workspace is a live workspace the server
+  # deletes.
+  top="$(workspace_path "$root")"
+  # Compared physically, because workspace_path is physical on both its
+  # branches. A relative argument and a path through a symlink are the same
+  # checkout, not a subdirectory of one, and must not be reported as one. A root
+  # that cannot be entered falls back to its own name, which differs from the
+  # toplevel and so prints the line below rather than ending the run silently.
+  root_phys="$(cd "$root" && pwd -P)" || root_phys="$root"
+  [ "$top" = "$root_phys" ] || echo "devbox-gc: $root is inside the checkout at $top, so the config and the slug are read from $top." >&2
+  # A checkout that carries only the older .devbox/profile.sh is named as one.
+  # The refusal below tells a person to pass the checkout root, which
+  # this root already is, so it named the wrong repair. devbox_config_load
+  # prints the one message verify and doctor print for it.
+  if [ ! -f "$top/.devbox/config.env" ] && [ -f "$top/.devbox/profile.sh" ]; then
+    echo "devbox-gc: $top cannot be collected:" >&2
+    (cd "$top" && devbox_config_load) || true
+    exit 2
+  fi
+  [ -f "$top/.devbox/config.env" ] || {
+    echo "devbox-gc: no .devbox/config.env in $root, so its slug cannot be computed. Pass the checkout root itself, not a directory inside it." >&2
+    exit 2
+  }
+  # Read by devbox_config_load, the one reader `devbox verify` also uses. A
+  # separate `awk -F=` reader disagreed with verify over `DEVBOX_PROJECT="x"`,
+  # over a trailing comment, and over any second `=`: the quotes or the comment
+  # came back as part of the value. A project name that differs by one character
+  # is a keep-list slug that matches no workspace, so gc deleted the live one.
+  #
+  # gc once read the profile alone while verify sourced `.devbox.env` first, so
+  # a DEVBOX_PROJECT built out of a value that `.devbox.env` set came out
+  # different in the two programs, and gc deleted the live workspace. Now
+  # neither file is sourced and nothing in a value is expanded, so the
+  # project is the config's literal text in both programs, and `.devbox.env`
+  # takes no part in it.
+  #
+  # The subshell keeps the config's token counts and DEVBOX_NEEDS_POSTGRES from
+  # becoming this script's own for the next root in the run. Its stdout goes to
+  # stderr because anything the loader prints would otherwise be captured as
+  # part of the project name.
+  project="$(
+    cd "$top"
+    devbox_config_load 1>&2
+    printf '%s' "${DEVBOX_PROJECT:-}"
+  )" || project=""
+  # Refuse the whole run rather than skip this root. A root dropped from the
+  # keep-list is a workspace the server then deletes, which is the failure this
+  # command must never cause, so name the root and stop.
+  [ -n "$project" ] || {
+    echo "devbox-gc: no DEVBOX_PROJECT from $top/.devbox (unset, empty, or the config failed to load)." >&2
+    exit 2
+  }
+  # devbox_slug refuses a machine, project or path that sanitizes to empty, and
+  # that refusal used to end the run through set -e with nothing printed: the
+  # keep-list simply stopped being built. Name the root and every component, so
+  # the operator can see which one is empty.
+  slug="$(devbox_slug "$MACHINE" "$MACHINE_ID" "$project" "$top")" || {
+    echo "devbox-gc: no slug for $root: devbox_slug refused machine '$MACHINE', project '$project', path '$top'. One of them sanitizes to empty." >&2
+    exit 2
+  }
+  keep+=("$slug")
+  plan+=("$top -> $slug")
+done
+
+if [ "${#keep[@]}" -eq 0 ]; then
+  echo "refusing to run with an empty keep-list: that would delete every workspace." >&2
+  echo "Pass the checkouts you want kept. This only ever considers workspaces THIS machine created." >&2
+  exit 2
+fi
+
+# After the refusal above, so that `devbox gc` with no roots is answered by the
+# empty-keep-list message rather than by a complaint about the targets.
+if [ -n "${DEVBOX_GC_HOST:-}" ]; then
+  echo "devbox-gc: DEVBOX_GC_HOST is no longer read. gc acts on every target in DEVBOX_TARGETS of the .devbox.env it reads; unset DEVBOX_GC_HOST. Nothing was contacted." >&2
+  exit 2
+fi
+DEVBOX_ENV="$(resolve_env "${roots[@]}")" || exit 2
+# The gate password comes from this file and nowhere else. The loader unsets it
+# first, so a value exported by some earlier shell does not stand in for the
+# line this developer's file is missing.
+devbox_env_load "$DEVBOX_ENV" || exit 2
+if [ "${#DEVBOX_DEPLOYED[@]}" -eq 0 ]; then
+  echo "devbox-gc: $DEVBOX_ENV lists no DEVBOX_TARGETS, so no deployed target holds a workspace to collect. A rented target deletes itself." >&2
+  exit 2
+fi
+devbox_targets_check || exit 2
+
+# Name the machines before they are told to delete anything. One root decides
+# the targets for the whole run, and it decided silently: an operator passing
+# roots from two projects could not see which machines were about to lose
+# workspaces until they were gone.
+#
+# The machine id prints beside the targets because it is the OTHER half of what
+# scopes the run. The server only ever considers workspaces carrying this label,
+# so a plan read without it does not say whose workspaces are in scope.
+targets_text=""
+for name in "${DEVBOX_DEPLOYED[@]}"; do
+  devbox_target_use "$name"
+  targets_text="$targets_text${targets_text:+, }$name ($TARGET_ADDR)"
+done
+echo "targets: $targets_text (from $DEVBOX_ENV)"
+echo "machine: $MACHINE_ID"
+echo "keeping: ${keep[*]}"
+# A slug ends in a one-way hash, so this pairing is the only way to read the
+# keep-list back to the checkouts it came from. It used to print on the dry run
+# alone, which is the run that deletes nothing.
+for entry in "${plan[@]}"; do
+  echo "  $entry"
+done
+
+# The function is guarded rather than called blind, because a library copy on
+# THIS laptop that predates the handshake carries neither DEVBOX_PROTOCOL_VERSION
+# nor this function. An unguarded read of that variable died with a raw "unbound
+# variable" under `set -u`, and an unguarded call reports "command not found". A
+# stale library here is a client-side repair, which no `devbox server install`
+# can make, so this names that fix.
+if ! declare -F devbox_handshake_verdict >/dev/null 2>&1; then
+  echo "devbox-gc: $DEVBOX_LIB carries no devbox_handshake_verdict, so this client predates the handshake. Reinstall or update the devbox client on this machine." >&2
+  exit 5
+fi
+# Every target's master ends with this run, not 60 seconds after it.
+trap devbox_targets_close_all EXIT
+
+# Each target is collected on its own, in DEVBOX_TARGETS order, and a target
+# that cannot be collected is named and never skipped in silence:
+# the next gc depends on knowing which hosts were cleaned. The run's exit is the
+# first non-zero code a target gave, so a script sees a gc that did not finish.
+RUN_RC=0
+NOT_COLLECTED=()
+not_collected() {  # $1 the code, then the reason
+  local code="$1"; shift
+  echo "devbox-gc: $TARGET: not collected: $*" >&2
+  NOT_COLLECTED+=("$TARGET")
+  [ "$RUN_RC" -ne 0 ] || RUN_RC="$code"
+}
+
+# One target: the handshake, the plan, and the gc it confirms.
+collect_target() {
+  local open_rc=0 remote verdict verdict_rc plan_out remove_count gc_rc
+  echo "== $TARGET ($TARGET_ADDR)"
+  devbox_gate_open || open_rc=$?
+  # A refused password, a host key off its pin and a target that does not answer
+  # each end THIS target's run, by name. After a password rotation, a client
+  # with the old value is told so, never skipped in silence.
+  case "$open_rc" in
+    0) ;;
+    3) not_collected 3 "the gate password was refused. Set the current DEVBOX_GATE_PASSWORD in $DEVBOX_ENV. Nothing was deleted there."; return ;;
+    4) not_collected 3 "$GATE_OPEN_ERROR. Nothing was deleted there."; return ;;
+    *) not_collected 3 "unreachable ($GATE_OPEN_ERROR). Nothing was deleted there."; return ;;
+  esac
+  [ -z "$GATE_NEW_HOSTKEY" ] || echo "recorded the pinned host key of $TARGET ($TARGET_ADDR): $GATE_NEW_HOSTKEY"
+
+  # The same handshake `devbox verify` runs, for a stronger reason. verify only
+  # builds; gc DESTROYS, and it deletes the container, the volume, the Postgres
+  # role and every database that role owns. The command that destroys must not
+  # have the weaker precondition, so it asks the same question before the host
+  # is used for anything else. Client and server each read
+  # DEVBOX_PROTOCOL_VERSION from their OWN copy of the shared library, so a
+  # library that drifted between this laptop and that host answers with a
+  # different number here. Drift in devbox_pg_ident is the case that costs data:
+  # it truncates a slug from the left, keeping the last seven characters because
+  # they are the only part that tells two worktrees apart, so a host computing
+  # it differently maps this keep-list onto another worktree's Postgres role and
+  # gc drops that one instead.
+  #
+  # The parse and the comparison are devbox_handshake_verdict's, in the shared
+  # library, and this file keeps only the words: its own name, the host, and
+  # the repair each case needs. The copy that used to sit here was written when
+  # the answer was one integer and was never updated: it matched a correct
+  # "<integer> <sha256>" against `*[!0-9]*`, so EVERY gc run against a server
+  # this repository installs exited 5 and named an outage, a missing runner or
+  # an old one. The command that destroys was the one that could no longer run,
+  # and the cause was a third hand-written copy of a rule the library already
+  # owns.
+  remote="$(devbox_gate version 2>/dev/null || true)"
+  verdict=""
+  verdict_rc=0
+  # `|| verdict_rc=$?` rather than a bare assignment: under `set -e` the failing
+  # substitution would end the run with the library's status and print nothing,
+  # and the status is the whole point of this call.
+  verdict="$(devbox_handshake_verdict "$remote" "$DEVBOX_LIB")" || verdict_rc=$?
+  case "$verdict_rc" in
+    0) ;;
+    # A stale library on THIS laptop, which no `devbox server install` repairs,
+    # and which every other target would refuse the same way.
+    1|2)
+      echo "devbox-gc: $verdict. Reinstall or update the devbox client on this machine." >&2
+      exit 5 ;;
+    # An empty answer is also what a host gives back when it drops the
+    # connection after the master opened, so this message names that case as
+    # well rather than reporting an outage as an old server.
+    3|5)
+      not_collected 5 "$verdict. $TARGET is unreachable, its devbox-runner is missing, or it predates the handshake. Run 'devbox server install' for $TARGET."
+      return ;;
+    # Another protocol. A change to devbox_pg_ident is the case that costs data,
+    # and it is a protocol bump for that reason: it
+    # truncates a slug from the left, keeping the last seven characters because
+    # they are the only part that tells two worktrees apart, so a host computing
+    # it differently maps this keep-list onto another worktree's Postgres role
+    # and gc drops that one instead.
+    *)
+      not_collected 5 "$verdict. Run 'devbox server install' for $TARGET."
+      return ;;
+  esac
+
+  # Ask the server what this keep-list DOES, before it is allowed to act on it.
+  # --dry-run printed the keep-list and stopped, and the keep-list is the half
+  # that SURVIVES: it never named one workspace that would be removed. A stale
+  # .devbox.env retargets the whole run at a host where none of these slugs
+  # exist, every workspace there is then absent from the keep-list, and gc
+  # deletes all of them. Only the server can say that, because only the server
+  # knows what it holds.
+  #
+  # So a dry run contacts every target, where it used to contact nothing. That
+  # trade is deliberate: the local half of the answer (the targets, the machine
+  # id, the root-to-slug pairing) is already printed above, before this call,
+  # so an operator checking a keep-list against a target that is down still
+  # reads it and then sees why the plan is missing.
+  #
+  # The targets here are read from a file rather than typed, and this is the one
+  # client command that destroys data: the container, the volume, the Postgres
+  # role and every database that role owns. It should be the hardest one to fire
+  # by accident, so the plan is shown first and a run that would remove anything
+  # needs --yes.
+  plan_out="$(devbox_gate gc --dry-run "$MACHINE_ID" "${keep[@]}")" || {
+    not_collected 5 "it would not say what gc would remove, so nothing was deleted there. Read its own refusal above; a server with no 'gc --dry-run' at all needs 'devbox server install' for $TARGET."
+    return
+  }
+  [ -n "$plan_out" ] && printf '%s
+' "$plan_out"
+  # `|| true` because grep -c exits 1 when it counts nothing, and under set -e a
+  # plan with nothing to remove would end the run here, before the gc it asked for.
+  remove_count="$(printf '%s
+' "$plan_out" | grep -c '^would remove ' || true)"
+
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  # A plan that removes nothing has nothing to confirm, and nothing to do. The
+  # verb that deletes is not sent at all in that case, so the one command string
+  # that can destroy a workspace leaves this laptop only after a plan named a
+  # workspace to destroy. Quiet, because this is the normal outcome of a gc run
+  # from a script.
+  [ "$remove_count" -ne 0 ] || return 0
+
+  # Refuse, and delete nothing. The exit is non-zero so a wrapper that ignores
+  # this output cannot read a printed plan as a gc that ran.
+  if [ "$ASSUME_YES" -eq 0 ]; then
+    echo "devbox-gc: $remove_count workspace(s) on $TARGET would be removed, with their volumes, their Postgres roles and every database those roles own. Nothing was deleted. Re-run the same command with --yes to proceed." >&2
+    [ "$RUN_RC" -ne 0 ] || RUN_RC=3
+    return 0
+  fi
+
+  gc_rc=0
+  devbox_gate gc "$MACHINE_ID" "${keep[@]}" || gc_rc=$?
+  if [ "$gc_rc" -ne 0 ]; then
+    echo "devbox-gc: $TARGET: gc exited $gc_rc; read its own lines above." >&2
+    [ "$RUN_RC" -ne 0 ] || RUN_RC="$gc_rc"
+  fi
+}
+
+for name in "${DEVBOX_DEPLOYED[@]}"; do
+  devbox_target_use "$name"
+  collect_target
+done
+
+if [ "${#NOT_COLLECTED[@]}" -gt 0 ]; then
+  echo "devbox-gc: not collected: ${NOT_COLLECTED[*]}. Run gc again once each one answers." >&2
+fi
+[ "$DRY_RUN" -eq 0 ] || echo "dry run: nothing was deleted."
+exit "$RUN_RC"

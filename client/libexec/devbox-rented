@@ -1,0 +1,80 @@
+#!/bin/bash
+# What the two rented targets share on the laptop. Sourced by devbox-runpod and
+# devbox-hetzner, which each own one provider's API and lifecycle.
+# shellcheck shell=bash
+#
+# Both providers take a bearer token, both answer a missing resource with 404, and
+# both name a rental after this laptop so that a cleanup can prove ownership before
+# it deletes anything. One copy of each rule, because two copies of a protocol rule
+# drift: devbox-gc once read a correct two-field version answer as no version at all.
+
+# One API request. $1 the token, $2 the method, $3 the URL, $4 the path to name in
+# an error, $5 an optional JSON body file. The caller sets RENTED_HTTP_WHO, the
+# prefix of every message, and RENTED_HTTP_DIR, a private directory for the
+# response. Prints the body, or `null` for 204 and 404.
+#
+# The token reaches curl as a header FILE, a process substitution that printf, a
+# builtin, writes: `ps aux` is readable by every user, so an argument is a public
+# string for as long as curl runs. An error names the HTTP status and the
+# provider's error code, never the body, which may echo the request.
+#
+# RENTED_HTTP_UNAVAILABLE=1 makes HTTP 412 with the error code
+# resource_unavailable return 3 with no message, and the caller names it. Hetzner
+# answers a create that way when a server type has no capacity in the location,
+# and devbox-hetzner then tries the next type of its list. Every other caller
+# leaves it unset, so that answer stays a failure with its line.
+rented_http() {
+  local token="$1" method="$2" url="$3" shown="$4" body="${5:-}" response code err
+  response="$RENTED_HTTP_DIR/response.$BASHPID"
+  local args=(--silent --show-error --connect-timeout 10 --max-time 60
+    --request "$method" --output "$response" --write-out '%{http_code}')
+  [ -z "$body" ] || args+=(--data-binary "@$body")
+  code=$(curl "${args[@]}" --header @<(printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$token") "$url") || { rm -f "$response"; return 1; }
+  case "$code" in
+    200|201|202) cat "$response" ;;
+    204|404) printf 'null\n' ;;
+    *)
+      err="$(jq -r '.error.code // empty' "$response" 2>/dev/null || true)"
+      [[ "$err" =~ ^[a-z_]{1,64}$ ]] || err=""
+      if [ "$code" = 412 ] && [ "$err" = resource_unavailable ] && [ "${RENTED_HTTP_UNAVAILABLE:-}" = 1 ]; then
+        rm -f "$response"; return 3
+      fi
+      echo "$RENTED_HTTP_WHO: $method ${shown%%\?*}: HTTP $code${err:+ ($err)}" >&2
+      rm -f "$response"; return 1 ;;
+  esac
+  rm -f "$response"
+}
+
+# Replace a JSON record by rename, so a run killed mid-write leaves the old record
+# or the new one. $1 the file, then jq's arguments.
+rented_save() {
+  local file="$1" temporary
+  shift
+  temporary="$file.$BASHPID.tmp"
+  jq "$@" "$file" > "$temporary" || return 1
+  mv "$temporary" "$file"
+}
+
+# A rental's name: $1 the provider prefix, then this laptop's label, a hash of its
+# machine id, and $2 random bytes as hex. The machine id tells two laptops with
+# one hostname apart; the random part tells two rentals of one laptop apart.
+rented_name() {
+  local prefix="$1" bytes="$2" label machine identity random
+  label=$(devbox_machine_label) || return 1
+  machine=$(devbox_machine_id) || return 1
+  identity=$(printf '%s' "$machine" | sha256sum) || return 1
+  random=$(od -An -N"$bytes" -tx1 /dev/urandom | tr -d ' \n') || return 1
+  printf '%s-%.8s-%.10s-%s\n' "$prefix" "$label" "$identity" "$random"
+}
+
+# RunPod's REST API, and the test of a RunPod rental's name. They live here and
+# not in devbox-runpod, because `devbox status` lists this laptop's pods too, and
+# devbox-runpod runs a whole rental when it is sourced. A second copy of the name
+# rule in status would drift, as devbox-gc's copy of the version parse once did.
+# shellcheck disable=SC2034  # read by devbox-runpod and devbox-status, which source this file
+RENTED_RUNPOD_API=https://rest.runpod.io/v1
+
+runpod_owner_name() {
+  # Older rentals have only the random suffix; rejecting them would strand their cleanup.
+  [[ "$1" =~ ^devbox-cpu-([a-z0-9][a-z0-9-]{0,7}-[a-f0-9]{10}-)?[a-f0-9]{32}$ ]]
+}

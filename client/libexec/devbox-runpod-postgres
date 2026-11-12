@@ -1,0 +1,55 @@
+#!/bin/bash
+# Run as root on a RunPod pod when the project sets DEVBOX_NEEDS_POSTGRES=1. It gives the
+# gate what a deployed target gives a workspace: pgvector Postgres 16 on 127.0.0.1:5435, one
+# role with CREATEDB, CREATEROLE and pg_signal_backend that owns its database, `vector` in
+# template1, and a psycopg URL. A pod has no pool, so without this the database tests skip
+# and pass. CREATEROLE because a project's tests run CREATE ROLE, which failed on a
+# devbox with "permission denied to create role". The cluster is the pod's own and goes
+# with the pod, so no role this one makes needs collecting.
+set -euo pipefail
+: "${DEVBOX_DSN_FILE:?devbox-runpod-postgres: set DEVBOX_DSN_FILE, where the URL is written}"
+state="${DEVBOX_POD_STATE:-/workspace}"
+port=5435
+
+if [ ! -f "$state/.devbox-postgres-ready" ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends postgresql-common ca-certificates curl
+  install -d /usr/share/postgresql-common/pgdg
+  curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+  codename="$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")"
+  printf 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n' \
+    "$codename" | install -m 644 /dev/stdin /etc/apt/sources.list.d/pgdg.list
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends postgresql-16 postgresql-16-pgvector
+  # 300 matches the cap of a deployed target; a pod serves one gate.
+  pg_createcluster 16 devbox --port "$port" -o max_connections=300 \
+    -- --encoding=UTF8 --locale=C.UTF-8
+  # The address goes in conf.d, never in an -o. pg_createcluster writes an -o value bare
+  # when it matches ^-?[\d.]+$, and 127.0.0.1 does: a pod's first gate stopped before it
+  # started, because Postgres refused `listen_addresses = 127.0.0.1` with "syntax error near
+  # token .0". Any other value it quotes, quotes included, so -o "listen_addresses='127.0.0.1'"
+  # gave '''127.0.0.1''', a host name that does not resolve. Proven against postgresql-16 on
+  # bookworm. The cluster's postgresql.conf includes conf.d last, so this line wins.
+  printf "listen_addresses = '127.0.0.1'\n" | install -m 644 /dev/stdin /etc/postgresql/16/devbox/conf.d/devbox.conf
+  pg_ctlcluster 16 devbox start
+  pw="$(head -c 24 /dev/urandom | base64 | tr -d /+=)"
+  # The password crosses on stdin only: an argument is readable by every user through ps.
+  {
+    printf "CREATE ROLE devbox LOGIN CREATEDB CREATEROLE PASSWORD '%s';\n" "$pw"
+    printf 'CREATE DATABASE devbox OWNER devbox;\n'
+    printf 'GRANT pg_signal_backend TO devbox;\n'
+    # SET and INHERIT on the roles this role creates, as on a deployed target: a
+    # project's tests run SET ROLE and DROP OWNED BY on a role they made.
+    printf "ALTER ROLE devbox SET createrole_self_grant = 'set, inherit';\n"
+  } | runuser -u postgres -- psql -q -p "$port" -v ON_ERROR_STOP=1
+  for db in template1 devbox; do
+    runuser -u postgres -- psql -q -p "$port" -v ON_ERROR_STOP=1 -d "$db" -c 'CREATE EXTENSION IF NOT EXISTS vector'
+  done
+  install -m 600 -o dev -g dev /dev/null "$DEVBOX_DSN_FILE"
+  printf 'postgresql+psycopg://devbox:%s@127.0.0.1:%s/devbox\n' "$pw" "$port" > "$DEVBOX_DSN_FILE"
+  touch "$state/.devbox-postgres-ready"
+fi
+pg_ctlcluster 16 devbox status >/dev/null 2>&1 || pg_ctlcluster 16 devbox start
+pg_isready -q -h 127.0.0.1 -p "$port"

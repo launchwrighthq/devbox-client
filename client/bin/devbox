@@ -1,0 +1,131 @@
+#!/bin/bash
+# The client CLI. One entry point, one program per subcommand under libexec/.
+#
+# This is the file a project reaches through node_modules/.bin/devbox,
+# .venv/bin/devbox or ~/.local/bin/devbox, and every one of those is a symlink.
+# So each path below is resolved from this file's REAL location: `dirname
+# "${BASH_SOURCE[0]}"` alone names the symlink's own directory, where there is
+# no lib/, no libexec/ and no VERSION.
+#
+# Every subcommand is exec'd, so its exit code is this CLI's exit code with no
+# shell in between. `make verify` and `npm run verify` read that code.
+set -euo pipefail
+
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+
+LIBEXEC="$_here/../libexec"
+REPO="$_here/../.."
+
+usage() {
+  cat <<'EOF'
+usage: devbox <command> [args]
+
+  verify [--local | --target <name>]
+                         run this checkout's gate on a target; --local runs it here,
+                         --target names one target from .devbox.env, runpod or hetzner
+  run [--target <name>] -- <command>
+                         run one command in this checkout's workspace on a target, never here
+  runpod up|status|down   manage this checkout's temporary CPU rental
+  hetzner up|status|down  manage this checkout's rented Hetzner server
+  compare [--target <name>]  run both gates and diff the outcomes, not the clock
+  gc <root>...           remove workspaces whose local checkout is gone, on every target
+  doctor                 check every prerequisite and every target, and print what to fix
+  status [--watch [--interval <s>]] [--target <name>]
+                         show every target: its pool, every gate it runs or queues,
+                         and which are this laptop's; --watch redraws it until q
+  requires-local <token>...  check this machine against a project's DEVBOX_REQUIRES
+  ssh-install            write this host's ~/.ssh/config block; --remove takes it out
+  server install <host>  install or update the server half on <host>
+  version                print the release version and the protocol version
+  help                   print this message
+EOF
+}
+
+# Two versions, because they answer two questions. The release version says
+# which devbox this is; the protocol version says which servers it can talk to,
+# and only changes when the shared library or a runner verb changes. Both lines
+# are one name and one value, so a script can read either.
+cmd_version() {
+  local file="$REPO/VERSION" release=""
+  if [ -r "$file" ]; then
+    read -r release <"$file" || true
+  fi
+  # An empty VERSION prints as `devbox ` and is read back as a release, so a
+  # blank file fails exactly like a missing one rather than half-answering.
+  [ -n "$release" ] || { echo "devbox: no release version in $file" >&2; exit 1; }
+  [ -n "${DEVBOX_PROTOCOL_VERSION:-}" ] \
+    || { echo "devbox: $DEVBOX_LIB carries no DEVBOX_PROTOCOL_VERSION" >&2; exit 1; }
+  printf 'devbox %s\nprotocol %s\n' "$release" "$DEVBOX_PROTOCOL_VERSION"
+}
+
+# A wheel is a zip, and a zip carries no exec bit, so `pip install devbox-client`
+# can land client/libexec/ without one. The console script in
+# packaging/python/devbox_client already names `bash` rather than fail with
+# EACCES on THIS file, and that fallback stopped here: the six programs below
+# were exec'd directly, so such an install answered `devbox version` and then
+# died on the first `devbox verify` with "permission denied". Every arm asks for
+# its program through this guard first. A file that is present without the bit
+# runs under `bash`; a file that is not there at all is named, because a missing
+# program and a missing mode are two different repairs.
+#
+# The exec stays on the arm rather than moving inside the guard.
+# tests/test-cli-dispatch.sh reads each subcommand's target out of these lines
+# and checks it on disk, and a path reachable only through a helper is a target
+# that test cannot see.
+runnable() {
+  [ -e "$1" ] || { echo "devbox: no program at $1; reinstall the devbox client" >&2; exit 1; }
+  [ -x "$1" ] || exec bash "$@"
+}
+
+case "${1:-}" in
+  verify)  shift; runnable "$LIBEXEC/devbox-verify" "$@"; exec "$LIBEXEC/devbox-verify" "$@" ;;
+  run)     shift; runnable "$LIBEXEC/devbox-run" "$@"; exec "$LIBEXEC/devbox-run" "$@" ;;
+  runpod) shift; runnable "$LIBEXEC/devbox-runpod" "$@"; exec "$LIBEXEC/devbox-runpod" "$@" ;;
+  hetzner) shift; runnable "$LIBEXEC/devbox-hetzner" "$@"; exec "$LIBEXEC/devbox-hetzner" "$@" ;;
+  compare) shift; runnable "$LIBEXEC/devbox-compare" "$@"; exec "$LIBEXEC/devbox-compare" "$@" ;;
+  gc)      shift; runnable "$LIBEXEC/devbox-gc" "$@"; exec "$LIBEXEC/devbox-gc" "$@" ;;
+  doctor)  shift; runnable "$LIBEXEC/devbox-doctor"; exec "$LIBEXEC/devbox-doctor" ;;
+  status)  shift; runnable "$LIBEXEC/devbox-status" "$@"; exec "$LIBEXEC/devbox-status" "$@" ;;
+  requires-local) shift; runnable "$LIBEXEC/devbox-requires-local" "$@"; exec "$LIBEXEC/devbox-requires-local" "$@" ;;
+  # The only verb that writes ~/.ssh/config, and it writes it only when asked
+  # for by name. doctor prints the same block and changes nothing,
+  # because that file is global, shared with every other tool, and hard to
+  # reverse safely.
+  ssh-install) shift; runnable "$LIBEXEC/devbox-ssh-install" "$@"; exec "$LIBEXEC/devbox-ssh-install" "$@" ;;
+  server)
+    # Installing a server is an explicit operator action and never a side effect
+    # of `devbox verify`. Clients are pinned per project, so a
+    # verify that upgraded a shared host would let one project's pin decide
+    # every other project's server. Nothing else in this CLI runs the server
+    # installer.
+    shift
+    # A package install carries client/, lib/ and the rented runtimes, and not
+    # the server installer. runnable alone would answer "reinstall the devbox
+    # client" there, and a reinstall brings back the same tree. So a tree with
+    # no server half says so, and exits before any connection is made.
+    case "${1:-}" in
+      install)
+        shift
+        [ -e "$REPO/server/install.sh" ] || {
+          echo "devbox: this client carries no server half, so 'devbox server install' cannot run here; it needs the devbox server half, which this package does not carry" >&2
+          exit 1
+        }
+        runnable "$REPO/server/install.sh" "$@"; exec "$REPO/server/install.sh" "$@" ;;
+      *) echo "devbox: server needs a subcommand: devbox server install <host>" >&2; usage >&2; exit 2 ;;
+    esac
+    ;;
+  version) cmd_version ;;
+  help|-h|--help) usage ;;
+  "") usage >&2; exit 2 ;;
+  *) echo "devbox: unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac

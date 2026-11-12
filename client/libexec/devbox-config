@@ -1,0 +1,326 @@
+#!/bin/bash
+# Read a project's committed .devbox/config.env and a developer's .devbox.env, both as
+# data, and build the hooks a workspace runs.
+# shellcheck shell=bash
+
+# Parse a file as DATA and never source it: one KEY=value per line, `#`
+# comment lines, one pair of matching outer quotes stripped, nothing expanded.
+# A sourced profile made every value code, which is why devbox-verify carries a
+# guard per value and doctor carried an awk reader that disagreed with `source`
+# over quotes.
+#
+# ONE parser reads both files a client reads, .devbox/config.env and
+# .devbox.env, each with its own key list. An older client sourced .devbox.env,
+# so a gate password that held `$`, a quote or a backtick broke the run, or ran
+# as code on the laptop.
+#
+#   $1  the file
+#   $2  the keys it may set, space padded
+#   $3  optional: a regex for further keys it may set (DEVBOX_TARGET_<NAME>)
+#   $4  optional: a function that prints the replacement of a removed key and
+#       returns 0, or returns 1 for a key it does not know
+#
+# Each key becomes a shell variable, never exported. DEVBOX_KV_SEEN lists the
+# keys the file set, space padded, so a caller can tell a key the file set from
+# a value some earlier shell exported.
+DEVBOX_KV_SEEN=" "
+devbox_kv_parse() {
+  local file="$1" keys="$2" extra="${3:-}" removed="${4:-}" line key value n=0 seen=" " repl
+  DEVBOX_KV_SEEN=" "
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ""|"#"*) continue ;; esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [ "$key" = "$line" ] || [[ ! "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+      echo "devbox: $file:$n is not KEY=value" >&2; return 2
+    fi
+    case "$keys" in *" $key "*) ;; *)
+      if [ -n "$removed" ] && repl="$("$removed" "$key")"; then
+        echo "devbox: $file:$n: $key is no longer read. $repl" >&2; return 2
+      fi
+      if [ -z "$extra" ] || [[ ! "$key" =~ $extra ]]; then
+        echo "devbox: $file:$n: unknown key $key" >&2; return 2
+      fi ;;
+    esac
+    case "$seen" in *" $key "*)
+      echo "devbox: $file:$n: $key is set twice" >&2; return 2 ;;
+    esac
+    seen="$seen$key "
+    case "$value" in \"*|\'*)
+      if [ "${#value}" -lt 2 ] || [ "${value:0:1}" != "${value: -1}" ]; then
+        echo "devbox: $file:$n: $key opens a quote it does not close" >&2; return 2
+      fi
+      value="${value:1:${#value}-2}" ;;
+    esac
+    printf -v "$key" '%s' "$value"
+  done <"$file"
+  DEVBOX_KV_SEEN="$seen"
+}
+
+# Every key a project may set. A key outside this list is refused, so a typo
+# fails the run instead of silently running it with a default.
+DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
+DEVBOX_FORWARD_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR DEVBOX_RUNPOD_IMAGE \
+DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS "
+
+devbox_config_parse() {
+  local file="$1" image="${DEVBOX_RUNPOD_IMAGE:-}" key
+  devbox_kv_parse "$file" "$DEVBOX_CONFIG_KEYS" || return 2
+  # The image is a default: a developer's .devbox.env, read first, may pick another.
+  [ -z "$image" ] || DEVBOX_RUNPOD_IMAGE="$image"
+  for key in DEVBOX_PROJECT DEVBOX_SETUP DEVBOX_VERIFY; do
+    case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) echo "devbox: $file sets no $key" >&2; return 2 ;; esac
+  done
+}
+
+# Load the config of the checkout in $PWD. Sets DEVBOX_CONFIG, the file to name
+# in messages, and DEVBOX_EXCLUDE, the rsync exclude list.
+#
+# An older client sourced .devbox/profile.sh, with a notice on every run.
+# This client reads only .devbox/config.env, and names the old file when it
+# finds one, so a checkout that never converted is told what to do.
+# devbox-sync, sourced by the caller, reads DEVBOX_EXCLUDE.
+# shellcheck disable=SC2034
+devbox_config_load() {
+  if [ -f .devbox/config.env ]; then
+    DEVBOX_CONFIG="$PWD/.devbox/config.env"
+    DEVBOX_EXCLUDE=.devbox/exclude
+    devbox_config_parse "$DEVBOX_CONFIG"
+  elif [ -f .devbox/profile.sh ]; then
+    echo "devbox: .devbox/profile.sh is an older format this client does not read. Convert it to .devbox/config.env and rename .devbox/rsync-filter to .devbox/exclude." >&2
+    return 2
+  else
+    echo "devbox: no .devbox/config.env in $PWD" >&2
+    return 2
+  fi
+}
+
+# ── the developer's .devbox.env ──────────────────────────────────────────────
+
+# Every key a developer may set in .devbox.env, beside DEVBOX_TARGET_<NAME> and
+# DEVBOX_TARGET_<NAME>_HOSTKEY. A target name holds no underscore, so the
+# second can never be read as the address of a target named <NAME>_HOSTKEY.
+DEVBOX_ENV_KEYS=" DEVBOX_TARGETS DEVBOX_GATE_PASSWORD DEVBOX_RENT RUNPOD_KEY HCLOUD_TOKEN \
+DEVBOX_MAX_QUEUE_WAIT DEVBOX_QUEUE_FULL_ACTION DEVBOX_RUNPOD_IMAGE DEVBOX_RUNPOD_CPUS \
+DEVBOX_RUNPOD_IDLE_SECONDS DEVBOX_RUNPOD_MAX_HOURLY DEVBOX_RUNPOD_REGIONS \
+DEVBOX_HETZNER_SERVER_TYPE DEVBOX_HETZNER_LOCATION DEVBOX_HETZNER_IDLE_SECONDS "
+DEVBOX_ENV_TARGET_RE='^DEVBOX_TARGET_[A-Z0-9]+(_HOSTKEY)?$'
+
+# A host key pin: the SHA256 fingerprint of an ed25519 host key, exactly as
+# `ssh-keygen -lf` prints it. SHA-256 is 32 bytes, which is 43 characters of
+# unpadded base64. One rule, read by the parser here and by devbox-transport.
+devbox_hostkey_pin_ok() {
+  [[ "${1-}" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]
+}
+
+# The replacement of each removed key. A removed key is refused by name,
+# never ignored: an older file that still says DEVBOX_ENABLED=0 would otherwise run
+# its gates on a target the developer meant to switch off.
+devbox_env_removed_key() {
+  case "$1" in
+    DEVBOX_HOST) echo "Name each host in DEVBOX_TARGETS, and give each its address in DEVBOX_TARGET_<NAME>, such as DEVBOX_TARGETS=lan1 and DEVBOX_TARGET_LAN1=<its address>." ;;
+    DEVBOX_ENABLED) echo "A file that sets DEVBOX_TARGETS or DEVBOX_RENT is on. Remove both keys, or the file, to run the gate here." ;;
+    DEVBOX_BACKEND) echo "Write DEVBOX_RENT=runpod to rent when no deployed target can take the gate, or run 'devbox verify --target runpod'." ;;
+    DEVBOX_RUNPOD_SECONDS) echo "Write DEVBOX_RUNPOD_IDLE_SECONDS." ;;
+    *) return 1 ;;
+  esac
+}
+
+# The .devbox.env a checkout uses, printed as one path, or a non-zero exit when
+# it has none. $1 is the checkout root.
+#
+# `.devbox.env` names one developer's machines, so every project that has one
+# gitignores it, and a git worktree holds no gitignored file. Looking in $ROOT
+# alone therefore sent every worktree down run_local while the main checkout of
+# the same project used the devbox: concurrent gate runs put more test
+# workers on one laptop than it had cores, and the load average went far
+# above the core count, MEASURED. A linked
+# worktree borrows the main checkout's file, beside the git common dir, which
+# names the same machines. verify, gc and doctor each carried this lookup, and
+# now share this one.
+devbox_env_find() {
+  local root="$1" env_file git_common
+  env_file="$root/.devbox.env"
+  if [ ! -f "$env_file" ]; then
+    git_common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    [ -n "$git_common" ] && env_file="$(dirname "$git_common")/.devbox.env"
+  fi
+  [ -f "$env_file" ] || return 1
+  printf '%s' "$env_file"
+}
+
+# Read a .devbox.env as data, and check what one key says about another.
+#
+# Every key in the list is unset first, and so is every DEVBOX_TARGET_<NAME>.
+# A value exported by some earlier shell must not stand in for a line this
+# developer's file is missing: an exported RUNPOD_KEY once rented a pod for a
+# file that named none. DEVBOX_STRICT=1 is the one exception, and only for a
+# DEVBOX_* key: the caller hands those values over in DEVBOX_ENV_KEEP. No value
+# is exported here, so the gate password and the rental keys stay out of every
+# child's environment. devbox-transport sets the password in the environment
+# of each ssh it starts, and nowhere else.
+#
+# Sets DEVBOX_DEPLOYED, the deployed targets in DEVBOX_TARGETS order, and
+# DEVBOX_RENTED, the rented targets in DEVBOX_RENT order. The addresses are
+# checked by devbox-targets, which knows the transport's rule. Each listed
+# target needs its pin, DEVBOX_TARGET_<NAME>_HOSTKEY: without one, the first
+# contact would record whatever answered, and send it the gate password.
+# shellcheck disable=SC2034  # DEVBOX_DEPLOYED and DEVBOX_RENTED are read by the callers
+devbox_env_load() {
+  local file="$1" key name var pair pin listed=" " rent=" " kept=" "
+  local -a names=()
+  for key in $DEVBOX_ENV_KEYS $(compgen -v DEVBOX_TARGET_); do
+    unset "$key"
+  done
+  DEVBOX_DEPLOYED=()
+  DEVBOX_RENTED=()
+  devbox_kv_parse "$file" "$DEVBOX_ENV_KEYS" "$DEVBOX_ENV_TARGET_RE" devbox_env_removed_key || return 2
+  # DEVBOX_STRICT=1 lets the environment win. devbox-verify fills
+  # DEVBOX_ENV_KEEP with NAME=value for each DEVBOX_* key of this list that the
+  # environment set, because a test driver names its target for one call, and
+  # an older client let the file replace that host, so the run went to the developer's
+  # machine instead. The values land after the parse and before every check
+  # below, so a kept value is checked like a line of the file. None is exported:
+  # the unset above dropped the export, and printf -v sets a shell variable.
+  # shellcheck disable=SC2153  # devbox-verify assigns it; gc and doctor leave it unset
+  for pair in ${DEVBOX_ENV_KEEP[@]+"${DEVBOX_ENV_KEEP[@]}"}; do
+    key="${pair%%=*}"
+    printf -v "$key" '%s' "${pair#*=}"
+    kept="$kept$key "
+    case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) DEVBOX_KV_SEEN="$DEVBOX_KV_SEEN$key " ;; esac
+  done
+  if [ -n "${DEVBOX_TARGETS:-}" ]; then
+    IFS=, read -r -a names <<<"$DEVBOX_TARGETS"
+    for name in "${names[@]}"; do
+      if [[ ! "$name" =~ ^[a-z0-9]+$ ]]; then
+        echo "devbox: $file: DEVBOX_TARGETS holds '$name'. A target name is lowercase letters and digits only, and the list is separated by commas with no spaces." >&2
+        return 2
+      fi
+      # A deployed target named like a rented one, or like the laptop, would
+      # make `--target runpod` mean two things.
+      case "$name" in runpod|hetzner|local)
+        echo "devbox: $file: DEVBOX_TARGETS may not name '$name', which names a rented target or the laptop" >&2
+        return 2 ;;
+      esac
+      case "$listed" in *" $name "*)
+        echo "devbox: $file: DEVBOX_TARGETS names $name twice" >&2; return 2 ;;
+      esac
+      listed="$listed$name "
+      var="DEVBOX_TARGET_${name^^}"
+      case "$DEVBOX_KV_SEEN" in *" $var "*) ;; *)
+        echo "devbox: $file: DEVBOX_TARGETS lists $name, and the file sets no $var. Write $var=<address> or <address>:<port>." >&2
+        return 2 ;;
+      esac
+      case "$DEVBOX_KV_SEEN" in *" ${var}_HOSTKEY "*) ;; *)
+        echo "devbox: $file: DEVBOX_TARGETS lists $name, and the file sets no ${var}_HOSTKEY, the fingerprint of its ed25519 host key. Copy the ${var}_HOSTKEY line that the operator's deploy prints for $name. Without it, the first contact would send the gate password to whatever answered." >&2
+        return 2 ;;
+      esac
+      pin="${var}_HOSTKEY"
+      pin="${!pin}"
+      if ! devbox_hostkey_pin_ok "$pin"; then
+        echo "devbox: $file: ${var}_HOSTKEY is '$pin', and a pin is SHA256:<43 characters>, as ssh-keygen -lf prints it. Copy the ${var}_HOSTKEY line that the operator's deploy prints for $name." >&2
+        return 2
+      fi
+      DEVBOX_DEPLOYED+=("$name")
+    done
+  fi
+  for key in $DEVBOX_KV_SEEN; do
+    [[ "$key" =~ $DEVBOX_ENV_TARGET_RE ]] || continue
+    # A target list the environment named replaces the file's list, so an
+    # address only the file sets is a target this call does not use.
+    case "$kept" in *" DEVBOX_TARGETS "*)
+      case "$kept" in *" $key "*) ;; *) continue ;; esac ;;
+    esac
+    name="${key#DEVBOX_TARGET_}"
+    name="${name%_HOSTKEY}"
+    name="${name,,}"
+    case "$listed" in *" $name "*) ;; *)
+      echo "devbox: $file sets $key, and DEVBOX_TARGETS does not list $name. Add $name to DEVBOX_TARGETS, or remove the line." >&2
+      return 2 ;;
+    esac
+  done
+  if [ "${#DEVBOX_DEPLOYED[@]}" -gt 0 ] && [ -z "${DEVBOX_GATE_PASSWORD:-}" ]; then
+    echo "devbox: $file lists deployed targets and sets no DEVBOX_GATE_PASSWORD. A client reaches every deployed target as the gate account with that password." >&2
+    return 2
+  fi
+  if [ -n "${DEVBOX_RENT:-}" ]; then
+    IFS=, read -r -a names <<<"$DEVBOX_RENT"
+    for name in "${names[@]}"; do
+      # `devbox status` passes keyless-rent as $2: a provider with no key is a
+      # line in its view, and a refusal here would hide every
+      # target with it. Every caller that rents keeps the refusal.
+      case "$name" in
+        runpod)
+          [ -n "${RUNPOD_KEY:-}" ] || [ "${2-}" = keyless-rent ] || {
+            echo "devbox: $file: DEVBOX_RENT names runpod, and RUNPOD_KEY is missing from the file" >&2; return 2; } ;;
+        hetzner)
+          [ -n "${HCLOUD_TOKEN:-}" ] || [ "${2-}" = keyless-rent ] || {
+            echo "devbox: $file: DEVBOX_RENT names hetzner, and HCLOUD_TOKEN is missing from the file" >&2; return 2; } ;;
+        *)
+          echo "devbox: $file: DEVBOX_RENT holds '$name'. Write runpod or hetzner, separated by commas, with no spaces." >&2
+          return 2 ;;
+      esac
+      case "$rent" in *" $name "*)
+        echo "devbox: $file: DEVBOX_RENT names $name twice" >&2; return 2 ;;
+      esac
+      rent="$rent$name "
+      DEVBOX_RENTED+=("$name")
+    done
+  fi
+}
+
+# Fill DEVBOX_ENV_KEEP with NAME=value for each DEVBOX_* key of the .devbox.env
+# list, and each DEVBOX_TARGET_<NAME>, that the environment exports. A caller
+# runs it under DEVBOX_STRICT=1 alone, before devbox_env_load. devbox-verify
+# and devbox-status both apply the strict rule, and two copies of this loop
+# would let the two disagree on which target a strict caller named.
+# shellcheck disable=SC2034  # read by devbox_env_load
+devbox_env_keep_from_environment() {
+  local env_name
+  DEVBOX_ENV_KEEP=()
+  while IFS= read -r env_name; do
+    case "$env_name" in DEVBOX_*) ;; *) continue ;; esac
+    if [[ "$DEVBOX_ENV_KEYS" == *" $env_name "* ]] || [[ "$env_name" =~ $DEVBOX_ENV_TARGET_RE ]]; then
+      DEVBOX_ENV_KEEP+=("$env_name=${!env_name}")
+    fi
+  done < <(compgen -e)
+}
+
+# Decide whether one DEVBOX_FORWARD_ENV name crosses to the gate. Returns 0 to
+# forward it, 1 to skip a name this run's environment does not export, and
+# exits 2 to refuse it, marked as devbox's own exit for strict mode.
+#
+# DEVBOX_FORWARD_ENV sits in .devbox/config.env, which any contributor edits.
+# Its test was `${!name+x}`, which is true for every SHELL variable, and
+# devbox_env_load sets the gate password, the rental keys and every target
+# address as shell variables that are never exported. So a committed
+# `DEVBOX_FORWARD_ENV=DEVBOX_GATE_PASSWORD RUNPOD_KEY` wrote both secrets into
+# the gate's env file on every target, and into the pod's run script. A
+# .devbox.env key is refused by name, and any other name crosses only when the
+# environment this run started with exports it, which is where a developer's
+# switch comes from.
+devbox_forward_name() {
+  local name="$1"
+  require_env_name "$name" "$DEVBOX_CONFIG"
+  if [[ "$DEVBOX_ENV_KEYS" == *" $name "* ]] || [[ "$name" =~ $DEVBOX_ENV_TARGET_RE ]]; then
+    echo "${DEVBOX_GUARD_WHO:-devbox}: refusing $name in DEVBOX_FORWARD_ENV from $DEVBOX_CONFIG: it is a .devbox.env key, and no .devbox.env value reaches a gate" >&2
+    devbox_guard_exit
+  fi
+  [ -n "${!name+x}" ] || return 1
+  [[ "${!name@a}" == *x* ]]
+}
+
+# The shell text that defines devbox_environment, devbox_setup, devbox_verify
+# and, when set, devbox_provision. It crosses to the workspace on stdin, so no
+# command from config.env ever becomes part of an ssh argv. The remote entry
+# still ends in `devbox_setup` or `devbox_verify`, a stable name that a caller
+# can match.
+devbox_hooks_script() {
+  printf 'devbox_environment() {\n%s\n}\n' "${DEVBOX_ENVIRONMENT:-:}"
+  [ -z "${DEVBOX_PROVISION:-}" ] || printf 'devbox_provision() {\n%s\n}\n' "$DEVBOX_PROVISION"
+  printf 'devbox_setup() {\n%s\n}\n' "$DEVBOX_SETUP"
+  printf 'devbox_verify() {\n%s\n}\n' "$DEVBOX_VERIFY"
+}

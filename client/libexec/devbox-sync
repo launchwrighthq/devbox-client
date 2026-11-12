@@ -1,0 +1,92 @@
+#!/bin/bash
+# Shared by Docker workspaces and CPU rentals; deleted source must disappear on both.
+# shellcheck shell=bash
+#
+# The caller supplies the two remote steps, because the two backends reach the
+# host in two different ways:
+#
+#   devbox_sync_push <subdir> <rsync args...>
+#       rsync the args to the workspace directory, or to <subdir> under it.
+#       devbox-verify sends it to the gate account (sync/<slug>/<project>/);
+#       devbox-runpod sends it to the pod as root.
+#   devbox_sync_finish <worktree>
+#       run lib/devbox-lib.sh's devbox_sync_finish_script in the workspace.
+#
+# This file builds no command for a remote shell. Before the gate account it
+# built five, each run as root on the shared devbox.
+devbox_sync() {
+local -a rsync_args=()
+if declare -p SYNC_RSYNC_ARGS >/dev/null 2>&1; then rsync_args=("${SYNC_RSYNC_ARGS[@]}"); fi
+local f
+for f in devbox_sync_push devbox_sync_finish; do
+  declare -F "$f" >/dev/null || { echo "devbox sync: the caller defines no $f, so nothing was synced" >&2; return 1; }
+done
+local WORKTREE=""
+# devbox-runpod/ and devbox-hetzner/ in the git dir are the rental records. The
+# first holds the pod's private ssh key and the second its server's gate password,
+# and a workspace runs any code a gate brings.
+# The P rules protect the caches that make a warm run fast. node_modules and
+# .venv are rebuilt by devbox_setup, never synced: each is hundreds of MB,
+# several times the size of the source payload.
+# The `-` rules carry NO trailing slash, and that is the whole point of them. A pattern
+# ending in `/` matches DIRECTORIES ONLY, so a project whose own rsync-filter says
+# `- .venv/` still shipped a SYMLINK named `.venv`. A worktree whose .venv is a symlink to
+# another checkout sent a pointer to a laptop path the workspace has no such file for, and
+# several worktrees did so; `uv venv --allow-existing` then adopted the dangling
+# link and left a venv with no pyvenv.cfg. MEASURED. Excluding here rather
+# than trusting each project's filter is deliberate: this runner already states that
+# both directories are rebuilt by devbox_setup and never synced, so it should enforce
+# that itself rather than depend on every consumer spelling it correctly.
+# The editor, agent and browser scratch after /.build/ is excluded for every project, which
+# had each listed it in its own exclude file.
+devbox_sync_push "" -a --delete "${rsync_args[@]}" \
+  --filter='P node_modules/' --filter='P .venv/' \
+  --filter='- .venv' --filter='- node_modules' \
+  --filter='P .mypy_cache/' --filter='P .pytest_cache/' --filter='P .ruff_cache/' \
+  --filter='P /.git-common/' \
+  --filter='- devbox-runpod/' --filter='- devbox-hetzner/' \
+  --filter='+ .env*.example' --filter='- .env*' --filter='- .devbox.env' \
+  --filter='- *.pem' --filter='- *.key' --filter='- /vendor/' --filter='- /.build/' \
+  --filter='- .idea/' --filter='- .aider*' --filter='- .playwright-mcp/' \
+  --filter='- playwright-report/' --filter='- test-results/' \
+  --filter='- /.claude/settings.local.json' --filter='- /.claude/logs/' --filter='- /.claude/worktrees/' \
+  --exclude-from="$DEVBOX_EXCLUDE" \
+  "$ROOT/"
+
+# A linked worktree's `.git` is a one-line `gitdir:` pointer at a path on THIS
+# laptop, so the copy the sync just made dangles. So send the common dir too,
+# and devbox_sync_finish points the workspace's `.git` at that copy:
+# devbox_sync_finish_script in lib/devbox-lib.sh records which tests fail
+# without it. The `P /.git-common/` rule above is what stops the next run's
+# `--delete` throwing the copy away and re-sending hundreds of MB.
+if [ -f "$ROOT/.git" ]; then
+  GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
+  WORKTREE="$(basename "$(git rev-parse --path-format=absolute --git-dir)")"
+  # The same rule as DEVBOX_PROJECT, applied where this value is derived. It is
+  # a directory name, so whoever ran `git worktree add` chose it. Before the gate
+  # account, two `cat >` lines interpolated it unquoted into a remote root
+  # shell. Now it crosses as one word that devbox-gate and gate-root check again,
+  # and it names a path in the workspace.
+  #
+  # git is not the guard here. It rewrites only whitespace and globs when it
+  # names the private gitdir after the directory: `wt bad` becomes `wt-bad`, but
+  # `a;id`, `a|b`, a backquote and `$(...)` all reach that name verbatim,
+  # MEASURED with git worktree add. Unchecked, each of those ran
+  # as root on the devbox instead of naming a file there.
+  require_safe_name "WORKTREE" "$WORKTREE" "$GIT_COMMON/worktrees"
+  echo "==> sync git common dir for worktree $WORKTREE"
+  # A peer removed its worktree during a cold upload, aborting
+  # the gate with rsync exit 24. Only this checkout needs a private index;
+  # hide the others from the sender and delete any old remote copies.
+  devbox_sync_push .git-common -a --delete "${rsync_args[@]}" --exclude='devbox-runpod/' --exclude='devbox-hetzner/' \
+    --filter="+ /worktrees/$WORKTREE/***" --filter='H /worktrees/*' \
+    "$GIT_COMMON/"
+fi
+# The two gitdir pointers, the common dir's info/exclude, and the repair of a
+# `.venv` or `node_modules` symlink, all in one round trip. The script and the
+# incidents behind each step are devbox_sync_finish_script's, in
+# lib/devbox-lib.sh. Excluding a path also PROTECTS it from `--delete`, so the
+# exclude rule above stops a new bad symlink arriving and cannot remove one
+# already there; the script removes it.
+devbox_sync_finish "$WORKTREE"
+}

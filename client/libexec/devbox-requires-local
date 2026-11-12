@@ -1,0 +1,131 @@
+#!/bin/bash
+# Does THIS machine carry what a project's gate needs?
+#
+# devbox-runner check-requires asks the same question of the workspace IMAGE,
+# and only the host can answer that one. This asks it of the laptop, because a
+# run that falls back to a local gate can be quietly weaker than the remote
+# one, and that is the failure this whole project exists to prevent:
+# a project's first remote run reported green after a set of its tests errored
+# on an image that lacked a required system tool, and the skip count changed
+# with no warning. A fallback onto a laptop without that tool
+# reproduces that exactly. The only difference is what triggered it.
+#
+# Tokens such as `jq=1.7`, `shellcheck` or `/usr/share/zoneinfo` come from no
+# project manifest. They are system packages, which is why DEVBOX_REQUIRES
+# exists at all rather than a line in pyproject.toml, and why "the developer will have installed it" is not
+# a safe assumption to build a fallback on.
+#
+# No `set -e`. Every probe below is EXPECTED to fail for an unmet requirement,
+# and the exit status of the whole run is the verdict.
+set -uo pipefail
+
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox requires-local: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+
+# A check of nothing reports a pass over nothing, which is the same silent
+# green as the incident above. devbox-runner check-requires refuses this on its
+# own side for the same reason, and a profile whose DEVBOX_REQUIRES was emptied
+# by a bad edit is exactly what sends it.
+[ "$#" -gt 0 ] || { echo "devbox requires-local: refusing to run with no requirement tokens: a check of nothing would report a pass over nothing" >&2; exit 2; }
+
+# The same character class lib/devbox-lib.sh's require_safe_token applies, applied
+# again here because this program is also reachable by name. A token becomes
+# the command run below, so a value carrying a semicolon, a backquote or a
+# dollar would run something this program was never asked to run.
+require_safe_token() {
+  local value="$1"
+  case "$value" in
+    ""|-*|*[!A-Za-z0-9._:/+~=-]*) ;;
+    *) [ -z "${value//./}" ] || return 0 ;;
+  esac
+  echo "devbox requires-local: refusing '$value' as a requirement: allowed characters are A-Za-z0-9._:/+~=-, and it may not be all dots or start with a dash" >&2
+  exit 2
+}
+# The SHAPE, on top of the character class above, and it is the shape
+# devbox-runner's assert_requires_token applies on the host.
+#
+# The two programs answer the SAME question about the SAME token, one of this
+# laptop and one of the workspace image, and they agreed on which arm a token
+# lands in without agreeing on whether it is a question at all. `/opt/x=1`
+# holds only characters the class above allows, lands in the path arm here,
+# and was probed with `[ -e ]` and reported `ok`, while
+# `devbox-runner check-requires` refuses the same token and exits 2. One
+# command blessing a requirement the other rejects is how a project commits a
+# DEVBOX_REQUIRES the remote gate will never accept, and then reads a local
+# answer as if it settled the question. Unreachable through `devbox verify`,
+# which runs check-requires first and exits 6 on a token the server refuses;
+# reachable through `devbox requires-local` typed by hand.
+#
+# Three arms, in the same order and with the same patterns as
+# assert_requires_token. Changing one without the other puts the disagreement
+# back, and a test runs both programs over the same tokens for that reason.
+require_wellformed_token() {
+  local value="$1"
+  case "$value" in
+    /*)  [[ "$value" =~ ^/[A-Za-z0-9._/-]+$ ]] && return 0 ;;
+    # A Debian version carries an epoch and a revision, as in 2:1.4.0-1, so : +
+    # and ~ are legal on the right of the = and on neither side of the name.
+    *=*) [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*=[A-Za-z0-9][A-Za-z0-9._:+~-]*$ ]] && return 0 ;;
+    *)   [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && return 0 ;;
+  esac
+  echo "devbox requires-local: refusing '$value' as a requirement: write an absolute path, a name, or name=version" >&2
+  exit 2
+}
+# The whole list is validated before ANY token is used. The name=version arm
+# below RUNS the program the token names, so checking token 3 only after
+# probing token 1 and 2 would still have run whatever token 1 named by the time
+# a bad token 3 was found.
+#
+# The character class runs first on each token, so a token carrying a
+# semicolon is still refused with the message that names the characters, which
+# is the one a person can act on for that mistake.
+for t in "$@"; do require_safe_token "$t"; require_wellformed_token "$t"; done
+
+rc=0
+for t in "$@"; do
+  case "$t" in
+    /*)
+      if [ -e "$t" ]; then echo "  ok   $t"; else echo "  FAIL $t: no such path on this machine"; rc=1; fi ;;
+    *=*)
+      name="${t%%=*}"
+      # The ONE rule for what a pin compares against, from the shared library.
+      # The server's image check and devbox-runner check-requires once compared
+      # this token format with two hand-written rules, one of which dropped a Debian
+      # epoch and one of which did not, so tool=2:1.4.0 passed one and failed
+      # the other against the very same image.
+      want="$(devbox_version_match_text "${t#*=}")" || {
+        echo "devbox requires-local: refusing '$t' as a requirement: it names no version once its epoch is removed, and an empty pin is contained in every version banner there is" >&2
+        exit 2
+      }
+      # Both streams, because a version banner is not reliably on stdout:
+      # some tools write their --version banner to STDERR and leave stdout empty. A tool that
+      # is absent puts its shell's "command not found" here instead, which
+      # contains no version and fails the comparison below with no stray output.
+      #
+      # The status is ignored on purpose: a tool may print its whole banner and
+      # then exit non-zero, which some tools do for an unrecognised option.
+      got="$("$name" --version 2>&1)" || true
+      # grep -qF, so a version full of dots is matched as literal text. As a
+      # regular expression 1.4.0 also matches 1440, and a pin that can silently
+      # stop pinning is worse than no pin at all.
+      if printf '%s' "$got" | grep -qF -- "$want"; then
+        echo "  ok   $t"
+      else
+        echo "  FAIL $t: $name is absent here, or its --version output does not contain $want"
+        rc=1
+      fi ;;
+    *)
+      # command -v rather than test -x, because PATH is what a gate uses.
+      if command -v "$t" >/dev/null 2>&1; then echo "  ok   $t"; else echo "  FAIL $t: not on PATH on this machine"; rc=1; fi ;;
+  esac
+done
+exit "$rc"

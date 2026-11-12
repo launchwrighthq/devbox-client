@@ -1,0 +1,94 @@
+#!/bin/bash
+# The idle clock of a rented host, sourced by devbox-runpod-runtime on a RunPod pod,
+# and by devbox-hetzner-runtime and gate-root on a rented Hetzner server.
+# shellcheck shell=bash
+#
+# A session interruption killed the laptop's nohup watchdog of a RunPod pod, and a
+# separate session still depended on that laptop staying awake. A rented host
+# therefore deletes itself, and this file is the rule it uses. Every piece of work
+# holds a SHARED lock on activity.lock, and the watcher deletes the host only when it
+# can take that lock EXCLUSIVELY and the clock in idle-since is older than
+# idle-seconds. The watcher touches the clock while work holds the lock, and work
+# touches it when it starts and when it ends, so the idle time counts from the end of
+# the last work and never from the creation of the host.
+#
+# The caller sets RENTED_STATE, the directory that holds activity.lock, idle-since,
+# idle-seconds and deleting, and defines two functions:
+#   rented_identity    0 when the provider confirms that this host is the one rented
+#   rented_terminate   0 when the provider accepted the delete request
+# and may define rented_pass, which the watcher runs before each idle check.
+# RENTED_WHAT names the host in messages, such as "RunPod pod".
+
+rented_touch() {
+  local temporary="$RENTED_STATE/idle.$BASHPID.tmp"
+  date +%s > "$temporary"
+  mv "$temporary" "$RENTED_STATE/idle-since"
+}
+
+# Join the work on this host. $1 is a descriptor already open on activity.lock.
+# Returns 75 when the host is being deleted: a lost DELETE response must not allow
+# another gate onto a host that the provider is already removing.
+#
+# The wait is bounded, not `flock -n`. The watcher holds the lock exclusively on
+# every pass while it reads the clock, and past the idle time for its identity
+# read and its delete request, two API calls of at most 30s each. With -n, a verb
+# that arrived in that window exited 75 and nothing was being deleted. On a
+# Hetzner server every gate verb comes here, and the client read that false 75 as
+# a deletion: it waited for a not-found read that never came, then deleted a
+# healthy server and its warm workspace. So the lock is awaited, and only the
+# `deleting` marker, which the watcher writes after the API confirmed the host,
+# means 75. RENTED_ENTER_SECONDS shortens that wait in a test; sudo drops it
+# from the gate account's environment.
+rented_enter() {
+  local wait="${RENTED_ENTER_SECONDS:-90}"
+  if ! flock -w "$wait" -s "$1"; then
+    # The words "is being deleted" are what devbox-hetzner reads on the probe's
+    # stderr to replace the server. A watcher that holds the lock this long is
+    # stuck in its own deletion, so the client replaces this host too.
+    echo "devbox: this ${RENTED_WHAT:-rented host} is being deleted, or its idle watcher held the activity lock for ${wait}s; retry the command to rent another" >&2
+    return 75
+  fi
+  if [ -e "$RENTED_STATE/deleting" ]; then
+    echo "devbox: this ${RENTED_WHAT:-rented host} is being deleted; retry the command to rent another" >&2
+    return 75
+  fi
+  rented_touch
+}
+
+rented_activity() (
+  exec 9>"$RENTED_STATE/activity.lock"
+  rented_enter 9 || return 75
+  trap rented_touch EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  # Children inherit the lock, so an orphaned test still protects its own runtime.
+  "$@"
+)
+
+rented_idle_check() (
+  exec 9>"$RENTED_STATE/activity.lock"
+  if ! flock -n -x 9; then
+    rented_touch
+    return 0
+  fi
+  local since seconds
+  read -r since < "$RENTED_STATE/idle-since"
+  read -r seconds < "$RENTED_STATE/idle-seconds"
+  [ "$(( $(date +%s) - since ))" -ge "$seconds" ] || return 0
+  rented_identity || return 1
+  # A lost DELETE response must not allow another gate onto a host already being removed.
+  touch "$RENTED_STATE/deleting"
+  echo "==> ${RENTED_WHAT:-rented host} idle timeout reached; deleting this host"
+  rented_terminate
+)
+
+rented_watch() {
+  local interval
+  read -r interval < "$RENTED_STATE/idle-seconds"
+  [ "$interval" -le 30 ] || interval=30
+  while :; do
+    if declare -F rented_pass >/dev/null; then rented_pass || true; fi
+    rented_idle_check || true
+    sleep "$interval"
+  done
+}

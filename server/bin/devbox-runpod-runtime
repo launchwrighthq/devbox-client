@@ -1,0 +1,116 @@
+#!/bin/bash
+# A session interruption killed the laptop's nohup watchdog; a separate session still
+# depended on that laptop staying awake. The pod's entrypoint now supervises its watcher.
+#
+# The idle clock and the activity lock are devbox-rented-idle's, beside this file
+# here and on the pod, because a rented Hetzner server applies the same rule.
+# shellcheck source=server/bin/devbox-rented-idle
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-rented-idle"
+RENTED_WHAT="RunPod pod"
+
+rpr_request() {
+  local query="$1" response code
+  response="$RPR_STATE/response.$BASHPID"
+  code=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+    --request POST --header "@$RPR_STATE/headers" --header 'Content-Type: application/json' \
+    --data-binary @<(printf '{"query":"%s","variables":{"podId":"%s"}}' "$query" "$(cat "$RPR_STATE/pod-id")") \
+    --output "$response" --write-out '%{http_code}' https://api.runpod.io/graphql) || { rm -f "$response"; return 1; }
+  if [ "$code" != 200 ] || ! jq -e '(.errors // [] | length) == 0 and .data != null' "$response" >/dev/null 2>&1; then
+    echo "devbox runpod: self-management request failed (HTTP $code); will retry" >&2
+    rm -f "$response"
+    return 1
+  fi
+  cat "$response"
+  rm -f "$response"
+}
+
+rpr_identity() {
+  local response
+  # GraphQL accepts the injected pod-scoped key; REST self-read returned HTTP 403.
+  # The GraphQL variable is literal, not a shell variable.
+  # shellcheck disable=SC2016
+  response=$(rpr_request 'query Self($podId: String!) { pod(input: {podId: $podId}) { id name } }') || return 1
+  jq -e --arg id "$(cat "$RPR_STATE/pod-id")" --arg owner "$(cat "$RPR_STATE/owner")" \
+    '.data.pod.id == $id and .data.pod.name == $owner' <<<"$response" >/dev/null
+}
+
+rpr_terminate() {
+  # The key is scoped to this pod and the ID was captured from RunPod at boot.
+  # shellcheck disable=SC2016
+  rpr_request 'mutation SelfTerminate($podId: String!) { podTerminate(input: {podId: $podId}) }' >/dev/null
+}
+
+# The two calls devbox-rented-idle asks its caller for.
+rented_identity() { rpr_identity; }
+rented_terminate() { rpr_terminate; }
+
+rpr_status() {
+  local watcher
+  read -r watcher < "$RPR_STATE/watcher-pid"
+  kill -0 "$watcher" 2>/dev/null || { echo 'devbox runpod: pod watchdog is not running' >&2; return 1; }
+  [ ! -e "$RPR_STATE/deleting" ] || return 75
+  rpr_identity || return 1
+  jq -n --arg id "$(cat "$RPR_STATE/pod-id")" --arg owner "$(cat "$RPR_STATE/owner")" \
+    --argjson idleSeconds "$(cat "$RPR_STATE/idle-seconds")" --argjson idleSince "$(cat "$RPR_STATE/idle-since")" \
+    '{id:$id,name:$owner,idleSeconds:$idleSeconds,idleSince:$idleSince,watchdog:true}'
+}
+
+rpr_boot() {
+  umask 077
+  mkdir -p "$RPR_STATE"
+  if ! [[ "${RUNPOD_POD_ID:-}" =~ ^[A-Za-z0-9_-]+$ ]] || [ -z "${RUNPOD_API_KEY:-}" ]; then
+    echo 'devbox runpod: RunPod did not inject a pod ID and scoped API key' >&2; return 2;
+  fi
+  [[ "${DEVBOX_RUNPOD_OWNER:-}" =~ ^devbox-cpu-[a-z0-9-]+$ ]] || return 2
+  [[ "${DEVBOX_RUNPOD_IDLE_SECONDS:-}" =~ ^[1-9][0-9]*$ ]] || return 2
+  printf '%s\n' "$RUNPOD_POD_ID" > "$RPR_STATE/pod-id"
+  printf '%s\n' "$DEVBOX_RUNPOD_OWNER" > "$RPR_STATE/owner"
+  printf '%s\n' "$DEVBOX_RUNPOD_IDLE_SECONDS" > "$RPR_STATE/idle-seconds"
+  printf 'Authorization: Bearer %s\n' "$RUNPOD_API_KEY" > "$RPR_STATE/headers"
+  unset RUNPOD_API_KEY RUNPOD_KEY
+  # Inheriting 077 into sshd made /workspace root-only and the first unprivileged gate fail.
+  umask 022
+  export DEBIAN_FRONTEND=noninteractive
+  # A broken package mirror must not leave a rented machine waiting forever for SSH.
+  if ! timeout 600 bash -c 'apt-get update && apt-get install -y --no-install-recommends openssh-server rsync ca-certificates curl jq procps'; then
+    while :; do rpr_terminate || true; sleep 30; done
+  fi
+  mkdir -p /run/sshd /root/.ssh
+  chmod 700 /root/.ssh
+  printf '%s\n' "$PUBLIC_KEY" > /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+  id dev >/dev/null 2>&1 || useradd --create-home --shell /bin/bash dev
+  rented_touch
+  local watcher sshd
+  while :; do
+    bash "$RPR_RUNTIME" watch &
+    watcher=$!
+    printf '%s\n' "$watcher" > "$RPR_STATE/watcher-pid"
+    /usr/sbin/sshd -D -e &
+    sshd=$!
+    wait -n "$watcher" "$sshd" || true
+    kill "$watcher" "$sshd" 2>/dev/null || true
+    wait "$watcher" "$sshd" 2>/dev/null || true
+    sleep 1
+  done
+}
+
+rpr_main() {
+  RPR_STATE=/run/devbox-runpod
+  RENTED_STATE="$RPR_STATE"
+  RPR_RUNTIME="$(readlink -f "${BASH_SOURCE[0]}")"
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    boot) rpr_boot ;;
+    watch) rented_watch ;;
+    activity) [ "$#" -gt 0 ] || return 2; rented_activity "$@" ;;
+    status) rpr_status ;;
+    *) echo 'devbox runpod runtime: use boot, watch, activity or status' >&2; return 2 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  rpr_main "$@"
+fi

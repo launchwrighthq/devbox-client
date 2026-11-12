@@ -1,0 +1,633 @@
+#!/bin/bash
+# Prove every prerequisite of a remote gate, and name each one that fails.
+#
+# Doctor changes nothing it was not asked to. ~/.ssh/config in particular is
+# global, mutable, shared with every other tool and hard to reverse safely, and
+# a client no longer needs it: it reaches the host as the gate account, with the
+# gate password from .devbox.env. The one file doctor can add to is
+# ~/.config/devbox/known_hosts, where the transport writes a host's key on the
+# first contact, and only when ssh-keyscan returned the key the target's
+# DEVBOX_TARGET_<NAME>_HOSTKEY pins. Doctor prints the pin, the recorded key and
+# whether they match, so a stale entry is named before a run refuses it.
+#
+# Every check that CAN run does run, even after an earlier one failed. A doctor
+# that stopped at the first failure needs as many runs as the developer has
+# problems, and naming them all in one run is the whole point of the command.
+# A check that cannot run (no host means no remote checks) is reported as
+# skipped, never as ok.
+set -euo pipefail
+
+[ "$#" -eq 0 ] || { echo "usage: devbox doctor" >&2; exit 2; }
+
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox doctor: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-config
+source "$_here/devbox-config"
+# shellcheck source=client/libexec/devbox-transport
+source "$_here/devbox-transport"
+# shellcheck source=client/libexec/devbox-targets
+source "$_here/devbox-targets"
+DEVBOX_GUARD_WHO="devbox doctor"
+
+fail=0
+skipped=0
+ok()   { printf '  ok   %s\n' "$*"; }
+bad()  { printf '  FAIL %s\n' "$*"; fail=$((fail + 1)); }
+# An ok on a check nobody ran would claim the remote half is proven when
+# nothing was asked of it, so an unrunnable check says why instead.
+skip() { printf '  skip %s\n' "$*"; skipped=$((skipped + 1)); }
+# Continuation line for a FAIL that has to print a fix, or for an ok that has a
+# caution to add, indented past the status column so the ok/FAIL list stays
+# scannable. The indent is what keeps it a continuation: a status line starts at
+# column 3, and every check must report ok, FAIL or skip and nothing else.
+say()  { printf '       %s\n' "$*"; }
+
+# ── the checkout ─────────────────────────────────────────────────────────────
+ROOT=""
+if ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$ROOT" ]; then
+  ok "git checkout: $ROOT"
+  cd "$ROOT"
+else
+  ROOT=""
+  bad "not inside a git checkout; devbox reads .devbox/ and .devbox.env from the checkout root"
+fi
+
+PROJECT="" WANT_TOKENS="" REQUIRES=""
+EXCLUDE=.devbox/exclude
+if [ -z "$ROOT" ]; then
+  skip ".devbox/config.env (no checkout root)"
+elif [ -f .devbox/config.env ]; then
+  # Parsed as data, so doctor runs none of the project's commands.
+  if devbox_config_parse .devbox/config.env 2>/dev/null; then
+    PROJECT="$DEVBOX_PROJECT" WANT_TOKENS="${DEVBOX_WANT_TOKENS:-}" REQUIRES="${DEVBOX_REQUIRES:-}"
+    ok ".devbox/config.env sets DEVBOX_PROJECT=$PROJECT"
+  else
+    bad "$(devbox_config_parse .devbox/config.env 2>&1)"
+  fi
+elif [ -f .devbox/profile.sh ]; then
+  bad ".devbox/profile.sh is an older format this client does not read; convert it to .devbox/config.env"
+else
+  bad "no .devbox/config.env; the project declares its setup, its gate and its token budget there"
+fi
+
+if [ -z "$ROOT" ]; then
+  skip "$EXCLUDE (no checkout root)"
+elif [ -f "$EXCLUDE" ]; then
+  ok "$EXCLUDE is present"
+else
+  bad "no $EXCLUDE; the project decides what reaches the workspace and what must not"
+fi
+
+# `.devbox.env` names one developer's machine, so every project that has one
+# gitignores it, and a git worktree holds no gitignored file. Looking in $ROOT
+# alone therefore sent every worktree down run_local while the main checkout of
+# the same project used the devbox: concurrent gate runs put more test
+# workers on one laptop than it had cores, and the load average went far
+# above the core count, MEASURED. A linked
+# worktree borrows the main checkout's file, which names the same machine.
+#
+# Doctor looks in both places because devbox-verify does, so what it reports is
+# what verify will find.
+DEVBOX_ENV=""
+if [ -n "$ROOT" ]; then
+  DEVBOX_ENV="$(devbox_env_find "$ROOT")" || DEVBOX_ENV=""
+fi
+if [ -z "$ROOT" ]; then
+  skip ".devbox.env (no checkout root)"
+elif [ -n "$DEVBOX_ENV" ]; then
+  ok ".devbox.env: $DEVBOX_ENV"
+else
+  bad "no .devbox.env in $ROOT or beside the git common dir; without it verify runs the gate locally"
+  say "Write DEVBOX_TARGETS=<name>, DEVBOX_TARGET_<NAME>=<address>, and DEVBOX_GATE_PASSWORD=<the gate password>"
+fi
+
+# ── the settings ─────────────────────────────────────────────────────────────
+#
+# Parsed as data with the loader verify uses, so a key doctor accepts is a key
+# verify accepts. The loader unsets every key first, so a value exported by an
+# earlier shell is not reported as configured.
+DEVBOX_DEPLOYED=()
+DEVBOX_RENTED=()
+env_ok=0
+if [ -n "$DEVBOX_ENV" ]; then
+  if env_err="$(devbox_env_load "$DEVBOX_ENV" 2>&1)"; then
+    # Called a second time outside the substitution, because the first ran in a
+    # subshell and its variables did not survive it. It already passed once.
+    devbox_env_load "$DEVBOX_ENV"
+    env_ok=1
+  else
+    bad "${env_err#devbox: }"
+  fi
+fi
+if [ "$env_ok" -eq 1 ]; then
+  if [ "${#DEVBOX_DEPLOYED[@]}" -eq 0 ] && [ "${#DEVBOX_RENTED[@]}" -eq 0 ]; then
+    # Off is a deliberate choice, not a broken prerequisite, so it is reported
+    # and not failed. A developer who uses no target still wants the rest.
+    ok "neither DEVBOX_TARGETS nor DEVBOX_RENT is set: verify runs the gate here"
+  fi
+  if [ "${#DEVBOX_DEPLOYED[@]}" -gt 0 ]; then
+    ok "DEVBOX_TARGETS=${DEVBOX_TARGETS}: verify chooses among ${#DEVBOX_DEPLOYED[@]} deployed target(s)"
+    # Presence only. The value is never printed, here or anywhere: this report
+    # is read from terminals that a screen share can see.
+    ok "DEVBOX_GATE_PASSWORD is set (${#DEVBOX_GATE_PASSWORD} characters)"
+  fi
+  for rented in ${DEVBOX_RENTED[@]+"${DEVBOX_RENTED[@]}"}; do
+    case "$rented" in
+      runpod) ok "DEVBOX_RENT names runpod: verify rents it when no deployed target can take the gate (RUNPOD_KEY is set, ${#RUNPOD_KEY} characters)" ;;
+      hetzner)
+        ok "DEVBOX_RENT names hetzner: verify rents it when no deployed target can take the gate (HCLOUD_TOKEN is set, ${#HCLOUD_TOKEN} characters)"
+        # The server is created from a snapshot and reached as devbox-gate, and its
+        # API calls need jq and curl. ssh-keygen makes the host key the client pins.
+        for tool in jq curl ssh-keygen; do
+          if command -v "$tool" >/dev/null 2>&1; then
+            ok "$tool is installed, which a Hetzner rental needs"
+          else
+            bad "$tool is not installed, and a Hetzner rental needs it"
+          fi
+        done
+        # The record of this worktree's server, never its gate password.
+        hz_record="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)/devbox-hetzner/server.json"
+        # Three answers, and only `true` reads as deleted. A record that does not
+        # parse first printed what a deleted one prints, while its server could
+        # still run and bill.
+        if [ -e "$hz_record" ] && command -v jq >/dev/null 2>&1; then
+          case "$(jq -r 'if type == "object" and (.deleted == null or (.deleted | type) == "boolean") then (.deleted // false | tostring) else "invalid" end' "$hz_record" 2>/dev/null)" in
+            false) ok "this worktree rents Hetzner server $(jq -r '.id // "with no confirmed id"' "$hz_record") at $(jq -r '.ip // "no address"' "$hz_record"); 'devbox hetzner status' asks the API, 'devbox hetzner down' deletes it" ;;
+            true) ok "this worktree's last Hetzner server is deleted" ;;
+            *) bad "the Hetzner record $hz_record does not parse; run devbox hetzner status" ;;
+          esac
+        fi ;;
+    esac
+  done
+  last="$(devbox_affinity_read)"
+  if [ -n "$last" ]; then
+    ok "this worktree last ran on $last, so verify prefers it while it can take the gate now"
+  elif [ "${#DEVBOX_DEPLOYED[@]}" -gt 0 ]; then
+    ok "this worktree has not run on a deployed target yet"
+  fi
+fi
+
+# ── this laptop ──────────────────────────────────────────────────────────────
+# timeout bounds each ssh of verify's probe, so one stalled target
+# cannot hold every run.
+for tool in git rsync ssh flock timeout; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    ok "$tool is installed"
+  else
+    bad "$tool is not installed"
+  fi
+done
+# SSH_ASKPASS_REQUIRE arrived in OpenSSH 8.4. An older ssh ignores it and asks
+# for the gate password on a terminal, which an agent's shell does not have, so
+# every remote call would fail as a refused password.
+if ! command -v ssh >/dev/null 2>&1; then
+  skip "OpenSSH 8.4 or later (no ssh)"
+elif devbox_ssh_version_ok; then
+  ok "OpenSSH $(devbox_ssh_version) is 8.4 or later, so ssh reads the gate password through SSH_ASKPASS"
+else
+  bad "OpenSSH $(devbox_ssh_version || echo unknown) is older than 8.4, which has no SSH_ASKPASS_REQUIRE, so ssh cannot read the gate password"
+  say "fix: update the openssh client on this machine"
+fi
+
+# ── each deployed target ─────────────────────────────────────────────────────
+#
+# One block per target in DEVBOX_TARGETS: reachable, password
+# accepted, recorded host key, protocol, health and pool, and what the project
+# asks of its image. A target that fails does not stop the next one, because
+# naming every problem in one run is what this command is for.
+doctor_target() {
+  local reachable runner pool remote_state no_remote doctor_err doctor_rc doctor_first
+  local verdict verdict_rc have_verdict server_answer recorded pool_rc pool_out cap cap_from
+  local cap_mb per_worker_mb req_send req_out req_rc tok state reason line probe_line
+  printf '\n%s\n' "target $TARGET ($TARGET_ADDR)"
+  # ── reachable, and the gate password ─────────────────────────────────────────
+  reachable=0
+  if [ "$target_ok" -eq 0 ]; then
+    bad "${target_err#devbox doctor: }"
+    skip "ssh to $TARGET (its address is not usable)"
+  else
+    open_rc=0
+    devbox_gate_open || open_rc=$?
+    case "$open_rc" in
+      0)
+        ok "ssh $DEVBOX_GATE_USER@$TARGET_ADDR succeeds, and the gate password was accepted"
+        reachable=1 ;;
+      3)
+        bad "ssh $TARGET ($TARGET_ADDR) fails: the gate password was refused"
+        say "fix: set the current DEVBOX_GATE_PASSWORD in $DEVBOX_ENV" ;;
+      4)
+        bad "ssh $TARGET ($TARGET_ADDR) fails, and no password was sent: $GATE_OPEN_ERROR"
+        say "fix: ask the operator whether $TARGET was reinstalled. If it was not, this network may be under attack: do not change the pin" ;;
+      *)
+        # ssh exits 255 for a name it cannot resolve and a port that refuses
+        # alike, so the cause has to be read out of its message. Naming the wrong
+        # cause sends the developer to the wrong fix.
+        case "$GATE_OPEN_ERROR" in
+          *"Could not resolve"*|*"Name or service not known"*|*"nodename nor servname"*|*"No address associated"*)
+            bad "ssh $TARGET ($TARGET_ADDR) fails: DNS, the name does not resolve" ;;
+          *"Connection refused"*|*"Connection timed out"*|*"No route to host"*|*"Network is unreachable"*|*"Operation timed out"*)
+            bad "ssh $TARGET ($TARGET_ADDR) fails: network, the name resolves but nothing answers" ;;
+          *)
+            bad "ssh $TARGET ($TARGET_ADDR) fails for a cause this check does not name; ssh's first line is below" ;;
+        esac
+        say "ssh said: $GATE_OPEN_ERROR" ;;
+    esac
+  fi
+
+  # The pin, the key recorded for the target, and whether they match. The
+  # transport refuses a recorded key that is not the pin before it sends the
+  # password, and this names that state on its own line, with both values: the
+  # first build printed only the recorded key and asked a person to compare it
+  # with the deploy output once, which nobody did.
+  if [ "$target_ok" -eq 0 ]; then
+    skip "host key pin (the address of $TARGET is not usable)"
+  else
+    say "host key pin: $GATE_PIN ($GATE_PIN_ORIGIN)"
+    recorded="$(devbox_gate_recorded_pins)"
+    if [ -z "$recorded" ]; then
+      skip "recorded host key (none in $GATE_KNOWN_HOSTS yet; the first contact records it when ssh-keyscan returns the pin)"
+    else
+      while IFS= read -r line; do
+        if [ "$line" = "$GATE_PIN" ]; then
+          ok "recorded host key for $(devbox_gate_known_name): $line, which matches the pin"
+        else
+          bad "recorded host key for $(devbox_gate_known_name): $line, which does NOT match the pin $GATE_PIN"
+          say "fix: $(devbox_gate_hostkey_repair)"
+        fi
+      done <<<"$recorded"
+    fi
+  fi
+
+  # Each remote check below is one gate verb. `doctor` answers one line per
+  # component, `<name> ok` or `<name> missing`, so the three checks it feeds cost
+  # one round trip.
+  #
+  # The verb's own failure is a finding of its own. sudo refuses when the sudoers
+  # line is missing, gate-root may not be installed, and a host on protocol 4
+  # answers "unknown verb". Each of those leaves the answer empty, and reading an
+  # empty answer as "docker does not respond" and "devbox-runner is not on PATH"
+  # names the wrong repair. That is the same kind of wrong diagnosis the gc
+  # handshake once gave on every run, when it read a correct version answer as
+  # no version at all. So a failed verb is reported with its first stderr line,
+  # and every later remote check is skipped with that reason.
+  remote_state=""
+  no_remote="$TARGET is not reachable"
+  if [ "$reachable" -eq 1 ]; then
+    doctor_err="$(mktemp)"
+    doctor_rc=0
+    remote_state="$(devbox_gate doctor 2>"$doctor_err")" || doctor_rc=$?
+    doctor_first="$(head -n1 "$doctor_err" 2>/dev/null || true)"
+    rm -f "$doctor_err"
+    if [ "$doctor_rc" -ne 0 ]; then
+      bad "the gate verb 'doctor' failed on $TARGET with exit $doctor_rc: ${doctor_first:-it printed nothing on stderr}"
+      say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+      reachable=0
+      no_remote="the gate verb 'doctor' failed"
+    fi
+  fi
+  remote_has() { printf '%s\n' "$remote_state" | grep -qx "$1 ok"; }
+
+  if [ "$reachable" -eq 0 ]; then
+    skip "docker on $TARGET ($no_remote)"
+  elif remote_has docker; then
+    ok "docker responds on $TARGET"
+  else
+    bad "docker does not respond on $TARGET; the workspace, its volume and Postgres all live in it"
+    say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+  fi
+
+  runner=0
+  pool=0
+  for tool in devbox-runner devbox-pool; do
+    if [ "$reachable" -eq 0 ]; then
+      skip "$tool on $TARGET ($no_remote)"
+    elif remote_has "$tool"; then
+      ok "$tool is on PATH on $TARGET"
+      case "$tool" in
+        devbox-runner) runner=1 ;;
+        devbox-pool)   pool=1 ;;
+      esac
+    else
+      bad "$tool is not on PATH on $TARGET"
+      say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+    fi
+  done
+
+  # ── the handshake ────────────────────────────────────────────────────────────
+  #
+  # Client and server each read DEVBOX_PROTOCOL_VERSION from their OWN copy of
+  # the shared library, so a library that drifted between this laptop and that
+  # host answers with a different number here. The damage a mismatch does is
+  # silent: devbox_slug names the container, the volume, the Postgres role and
+  # the database, and two halves that disagree about it put two checkouts on ONE
+  # Postgres role while their container names stay distinct. devbox_pg_ident's
+  # own comment records that collision as already having happened once.
+  #
+  # The answer carries TWO fields, and both are reported: the protocol integer on
+  # this line, and the sha256 of the library the server actually loaded on the
+  # next one. The fingerprint has its own line because it sees the one case the
+  # integer cannot, and a check that shares a line with another check cannot be
+  # skipped on its own.
+  #
+  # The parse and the comparison are devbox_handshake_verdict's, in the shared
+  # library. This file used to carry a second, independent implementation of them,
+  # and devbox-gc a third; gc's was never updated when the answer gained its
+  # second field, so it read every current server as one that reports no version
+  # at all. Both lines below now read ONE verdict, and each states it in doctor's
+  # own voice.
+  verdict=""
+  verdict_rc=0
+  have_verdict=0
+  if [ "$reachable" -eq 0 ]; then
+    skip "protocol handshake ($no_remote)"
+  elif [ "$runner" -eq 0 ]; then
+    skip "protocol handshake (no devbox-runner on $TARGET)"
+  elif ! declare -F devbox_handshake_verdict >/dev/null 2>&1; then
+    # The library on THIS laptop predates the handshake, so it carries neither the
+    # function nor DEVBOX_PROTOCOL_VERSION, and calling it would report "command
+    # not found" instead of the state the client is in.
+    bad "protocol handshake: $DEVBOX_LIB carries no devbox_handshake_verdict, so this client predates the handshake"
+    say "fix: reinstall or update the devbox client on this machine"
+  else
+    have_verdict=1
+    server_answer="$(devbox_gate version 2>/dev/null || true)"
+    # `|| verdict_rc=$?` rather than a bare assignment: under `set -e` the failing
+    # substitution would end the whole run, and doctor reports every check it can.
+    verdict="$(devbox_handshake_verdict "$server_answer" "$DEVBOX_LIB")" || verdict_rc=$?
+    case "$verdict_rc" in
+      # This client's library, not the host's, so no server repair is offered.
+      1)
+        bad "protocol handshake: $verdict"
+        say "fix: reinstall or update the devbox client on this machine"
+        ;;
+      # Nothing, or an answer that is not a version at all: a devbox-runner with
+      # no version verb prints its usage to stderr and exits 2.
+      3|5)
+        bad "protocol handshake: $TARGET reports no usable version; $verdict"
+        say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+        ;;
+      6)
+        bad "protocol handshake: $verdict"
+        say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+        ;;
+      *)
+        ok "protocol handshake: both halves speak protocol $DEVBOX_PROTOCOL_VERSION"
+        ;;
+    esac
+  fi
+
+  # ── the library fingerprint ──────────────────────────────────────────────────
+  #
+  # A report, never a FAIL. One protocol is one release major, and a host on
+  # another minor release loads other bytes of the same protocol by design, so
+  # this line says which case it is and the integer above is the verdict.
+  #
+  # The fingerprint covers "$DEVBOX_LIB", the candidate the resolver at the top of
+  # this file accepted, so it describes the library this process SOURCED rather
+  # than one it might have found somewhere else.
+  if [ "$reachable" -eq 0 ]; then
+    skip "library fingerprint ($no_remote)"
+  elif [ "$runner" -eq 0 ]; then
+    skip "library fingerprint (no devbox-runner on $TARGET)"
+  elif [ "$have_verdict" -eq 0 ]; then
+    # A skip and not a FAIL of the server: the missing function is in the library
+    # on THIS laptop, and says nothing at all about the host's copy.
+    skip "library fingerprint ($DEVBOX_LIB carries no devbox_handshake_verdict, so this client predates it)"
+  elif [ "$verdict_rc" -eq 0 ]; then
+    ok "library fingerprint: $verdict"
+  else
+    # 1, 3, 5 and 6 are all reported by the line above, and none of them leaves
+    # two fingerprints to compare.
+    skip "library fingerprint (the line above reports why there is nothing to compare)"
+  fi
+
+  # ── the health record ────────────────────────────────────────────────────────
+  #
+  # The watchdog on each target writes /run/devbox/health every 30 seconds,
+  # and verify skips a target whose record is not `ok`, or is more than 90
+  # seconds old. The `probe` verb carries it, so this check asks what verify
+  # asks, and a target doctor calls unhealthy is one verify skips.
+  if [ "$reachable" -eq 0 ]; then
+    skip "health record ($no_remote)"
+  else
+    probe_line="$(devbox_gate probe "${WANT_TOKENS:-1}" 1 2>/dev/null)" || probe_line=""
+    if ! devbox_probe_parse "$probe_line"; then
+      bad "health record: $TARGET gave no probe answer, so it predates protocol $DEVBOX_PROTOCOL_VERSION"
+      say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+    elif [ "$PROBE_HEALTH" = ok ] && [ "$PROBE_HEALTH_AGE" -ge 0 ] && [ "$PROBE_HEALTH_AGE" -le "$DEVBOX_HEALTH_STALE_SECONDS" ]; then
+      ok "health record: ok, ${PROBE_HEALTH_AGE}s old"
+    elif [ "$PROBE_HEALTH" = ok ]; then
+      bad "health record: ok, but ${PROBE_HEALTH_AGE}s old, so the watchdog on $TARGET is not running; verify skips this target"
+    elif [ "$PROBE_HEALTH" = missing ] || [ "$PROBE_HEALTH" = invalid ]; then
+      bad "health record: $PROBE_HEALTH on $TARGET, so no watchdog is running there; verify skips this target"
+    else
+      bad "health record: $PROBE_HEALTH${PROBE_REASON:+ ($PROBE_REASON)}; verify skips this target"
+    fi
+  fi
+
+  # ── the pool ─────────────────────────────────────────────────────────────────
+  if [ "$reachable" -eq 0 ]; then
+    skip "devbox-pool status ($no_remote)"
+  elif [ "$pool" -eq 0 ]; then
+    skip "devbox-pool status (no devbox-pool on $TARGET)"
+  else
+    pool_rc=0
+    pool_out="$(devbox_gate pool-status 2>&1)" || pool_rc=$?
+    # Passed through as the pool printed it. devbox-pool exits 2 on a corrupt
+    # grant file, which its own comments call the case most worth surfacing
+    # loudly, so the output is worth more here than any summary of it.
+    if [ "$pool_rc" -eq 0 ]; then
+      ok "devbox-pool status: $pool_out"
+    else
+      bad "devbox-pool status exited $pool_rc: $pool_out"
+    fi
+  fi
+
+  # ── the memory budget ────────────────────────────────────────────────────────
+  #
+  # The two numbers nothing ever compared. DEVBOX_WANT_TOKENS decides how many
+  # workers the gate forks, and it is tuned from a CPU curve; the workspace's
+  # memory cap decides how much RAM those workers share, and it is set by the
+  # deployment. The pool bounds CPU, the cgroup bounds memory, and neither one
+  # knows about the other: a gate asked for more tokens than its cap could feed,
+  # and the kernel OOM-killed its test workers mid-gate, MEASURED.
+  #
+  # So this is a RATIO with its evidence beside it, and never a verdict. Doctor
+  # cannot know how much memory one of THIS project's workers needs, so a project
+  # whose workers are light is entitled to a high token count. It reports, and the
+  # developer decides: an ok line, with the caution under it when the budget is at
+  # or below the one that is already known to die.
+
+  if [ -z "$ROOT" ]; then
+    skip "memory budget (no checkout root)"
+  elif [ -z "$WANT_TOKENS" ]; then
+    skip "memory budget (the config declares no DEVBOX_WANT_TOKENS)"
+  elif ! [[ "$WANT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    # Zero is here as well as the non-numbers: a ratio is a division by this
+    # value, and doctor reports rather than dividing by nothing.
+    skip "memory budget (DEVBOX_WANT_TOKENS=$WANT_TOKENS does not read as a worker count)"
+  elif [ "$reachable" -eq 0 ]; then
+    # The cap lives on the host, so without one there is nothing to compare the
+    # token count against. Named anyway, because a developer whose host is down
+    # still wants to know what this project will ask of it.
+    skip "memory budget ($no_remote): DEVBOX_WANT_TOKENS=$WANT_TOKENS"
+  else
+    # The gate verb reads it out of /etc/devbox/config on the host.
+    cap="$(devbox_gate memory-cap)" || cap=""
+    cap_from="DEVBOX_WORKSPACE_MEMORY in /etc/devbox/config on $TARGET"
+    if [ -z "$cap" ]; then
+      # A host that records no key runs the workspace under devbox-runner's own
+      # default, which is this value. The number is written here because the ratio
+      # has to divide by something, and the line below always says WHICH of the
+      # two values it read, so nobody has to guess where the ratio came from.
+      cap="16g"
+      cap_from="devbox-runner's default, because $TARGET records no DEVBOX_WORKSPACE_MEMORY in /etc/devbox/config"
+    fi
+    if ! [[ "$cap" =~ ^[0-9]+[kKmMgG]?$ ]]; then
+      bad "memory budget: $TARGET records DEVBOX_WORKSPACE_MEMORY=$cap, which is not a docker memory size"
+      say "fix: set it to a size such as 16g in the deployment config for $TARGET, then redeploy the host with the server's deploy.sh"
+    else
+      # docker reads a bare number as bytes, and k, m and g as the three units.
+      case "$cap" in
+        *[gG]) cap_mb=$(( ${cap%[gG]} * 1024 )) ;;
+        *[mM]) cap_mb=$(( ${cap%[mM]} )) ;;
+        *[kK]) cap_mb=$(( ${cap%[kK]} / 1024 )) ;;
+        *)     cap_mb=$(( cap / 1048576 )) ;;
+      esac
+      # Rounded to the nearest MB rather than truncated, so a ratio that sits on
+      # the threshold below prints as that number. Truncation printed one MB less,
+      # and one number that disagrees with itself is a number nobody trusts.
+      per_worker_mb=$(( (2 * cap_mb + WANT_TOKENS) / (2 * WANT_TOKENS) ))
+      ok "memory budget: $WANT_TOKENS tokens against a $cap workspace cap is about $per_worker_mb MB per worker"
+      say "the cap is $cap_from"
+      # About 700 MB is a general floor for one parallel test worker: below it,
+      # OOM kills are common. A budget at or below that line is worth a word, and
+      # one above it is this project's own business.
+      oom_known_mb=700
+      if [ "$per_worker_mb" -le "$oom_known_mb" ]; then
+        say "caution: at about $oom_known_mb MB or less per worker, parallel test workers are commonly OOM-killed"
+        say "that gate dies with a partial test summary or none at all; lower DEVBOX_WANT_TOKENS in .devbox/config.env, or raise DEVBOX_WORKSPACE_MEMORY in the deployment config for $TARGET"
+      fi
+    fi
+  fi
+
+  # ── what this project needs from the workspace image ─────────────────────────
+  #
+  # A project's first remote run reported green after a set of its tests errored
+  # on an image that lacked a required system tool, and the skip count changed
+  # with no warning. A gate that is quietly weaker
+  # than the local one is worse than no remote gate. devbox verify refuses such a
+  # run; doctor names the same gap without running a gate.
+  req_tokens=()
+  if [ -n "$REQUIRES" ]; then
+    read -r -a req_tokens <<<"$REQUIRES" || true
+  fi
+
+  if [ -z "$ROOT" ]; then
+    skip "DEVBOX_REQUIRES (no checkout root)"
+  elif [ "${#req_tokens[@]}" -eq 0 ]; then
+    # Declaring nothing is a valid project and not a broken one, so this is an ok
+    # and not a skip. It is printed rather than left out, because "this project
+    # asks the image for nothing" and "doctor never looked" must not read alike.
+    ok "DEVBOX_REQUIRES: this project declares no image requirement"
+  elif [ "$reachable" -eq 0 ]; then
+    skip "DEVBOX_REQUIRES ($no_remote): ${req_tokens[*]}"
+  elif [ "$runner" -eq 0 ]; then
+    skip "DEVBOX_REQUIRES (no devbox-runner on $TARGET): ${req_tokens[*]}"
+  else
+    # ONE call for every token, never one per token: devbox-runner renders all of
+    # them into a single probe script and starts ONE container, and a call per
+    # token would start one container each, in series, for a report.
+    #
+    # Every token is checked before any of them is sent, on devbox-verify's rule
+    # and for its reason: the list is committed, so any contributor edits it, and
+    # each token crosses to the host as a word of a verb that runs as root on the
+    # shared devbox. devbox_gate would refuse the whole call for one bad word. A refused token is reported and dropped rather than sent, and doctor
+    # keeps going, because naming every problem in one run is what this command is
+    # for.
+    req_send=()
+    for tok in "${req_tokens[@]}"; do
+      case "$tok" in
+        ""|-*|*[!A-Za-z0-9._:/+~=-]*)
+          bad "DEVBOX_REQUIRES token '$tok': allowed characters are A-Za-z0-9._:/+~=- and it may not start with a dash, so it was not sent to $TARGET" ;;
+        *) req_send+=("$tok") ;;
+      esac
+    done
+    # Guarded, and the report below is guarded with it: `devbox-runner
+    # check-requires` refuses an empty token list rather than answering that
+    # everything is satisfied, and a run whose every token was refused above has
+    # already said so once per token.
+    req_out=""
+    req_rc=0
+    if [ "${#req_send[@]}" -gt 0 ]; then
+      req_out="$(devbox_gate check-requires "${req_send[@]}" 2>&1)" || req_rc=$?
+      # devbox-runner prints one `  ok   <token>` or `  FAIL <token>: <reason>` line
+      # per token, in doctor's own two-column shape, and each is matched here as a
+      # whole literal line. A token that matches NEITHER is a FAIL and never an ok:
+      # if that output format ever changes, this turns into a loud failure of every
+      # token rather than a silent pass over all of them, which is the exact shape
+      # of failure this whole check exists to stop.
+      for tok in "${req_send[@]}"; do
+        state="none"
+        reason=""
+        while IFS= read -r line; do
+          case "$line" in
+            "  ok   $tok")    state="ok" ;;
+            "  FAIL $tok: "*) state="missing"; reason="${line#"  FAIL $tok: "}" ;;
+          esac
+        done <<<"$req_out"
+        case "$state" in
+          ok)
+            ok "DEVBOX_REQUIRES $tok: the workspace image on $TARGET carries it" ;;
+          missing)
+            bad "DEVBOX_REQUIRES $tok: the workspace image on $TARGET does not carry it ($reason)"
+            say "fix: add the feature to the deployment config for $TARGET, then redeploy the host with the server's deploy.sh" ;;
+          *)
+            bad "DEVBOX_REQUIRES $tok: $TARGET reported no verdict for this token; check-requires exited $req_rc"
+            say "run it by hand on the host: devbox-runner check-requires $tok" ;;
+        esac
+      done
+    fi
+  fi
+}
+
+if [ -z "$ROOT" ]; then
+  skip "deployed targets (no checkout root)"
+  skip "DEVBOX_REQUIRES (no checkout root)"
+elif [ "$env_ok" -eq 0 ]; then
+  skip "deployed targets (no .devbox.env that parses)"
+elif [ "${#DEVBOX_DEPLOYED[@]}" -eq 0 ]; then
+  skip "deployed targets (DEVBOX_TARGETS is not set)"
+else
+  # Every target's master ends with this run, not 60 seconds after it.
+  trap devbox_targets_close_all EXIT
+  for name in "${DEVBOX_DEPLOYED[@]}"; do
+    target_ok=0
+    if target_err="$(devbox_target_use "$name" 2>&1)"; then
+      # Called a second time outside the substitution, because the first ran in
+      # a subshell and its variables did not survive it. It already passed once.
+      devbox_target_use "$name"
+      target_ok=1
+    else
+      TARGET="$name"; TARGET_ADDR="$(v="DEVBOX_TARGET_${name^^}"; printf '%s' "${!v}")"
+    fi
+    doctor_target
+  done
+fi
+
+printf '\n'
+if [ "$fail" -eq 0 ]; then
+  echo "doctor: every check passed"
+  exit 0
+fi
+printf 'doctor: %d failed, %d skipped\n' "$fail" "$skipped"
+exit 1

@@ -1,0 +1,231 @@
+#!/bin/bash
+# The runtime of a rented Hetzner server. The client ships this file and
+# devbox-rented-idle in the server's cloud-init user data, to
+# /usr/local/libexec/devbox/, and cloud-init runs `boot` once. The server is a
+# snapshot of a deployed devbox, so it already runs the gate account, the pool and
+# the watchdog. This file adds what a rental needs: the gate password, a block that
+# keeps workspaces away from the metadata service, and deletion after the idle time.
+#
+# Hetzner has no token scoped to one server. RunPod injects a key that can delete
+# only its own pod; a Hetzner token can delete every server in its project. So the
+# token lives in a root-only file, the runtime removes the copies cloud-init keeps,
+# and the workspace containers cannot reach 169.254.169.254, where the user data
+# stays readable for the life of the server. A gate runs any code as `dev` in a
+# workspace, and without the block that code could read the token and
+# the gate password with one curl. The README tells the user to keep a dedicated
+# Hetzner project for devbox, so the worst a leaked token can delete is devbox.
+#
+# The idle rule is devbox-rented-idle's. gate-root takes its shared lock for every
+# gate verb, so a gate in progress, and the `lock` verb that a run holds from its
+# start to its end, keep this server alive.
+# shellcheck source=server/bin/devbox-rented-idle
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-rented-idle"
+RENTED_WHAT="rented Hetzner server"
+
+HZR_API=https://api.hetzner.cloud/v1
+HZR_METADATA=http://169.254.169.254/hetzner/v1/metadata
+# Every path below sits under HZR_ROOT, so tests/test-hetzner-runtime.sh runs the
+# real steps in a directory. It is empty on a server.
+HZR_ROOT="${HZR_ROOT:-}"
+
+hzr_log() { echo "devbox-hetzner-runtime: $*" >&2; }
+
+# One API request with the token's header file, which only root can read. Prints
+# the body, or `null` for 404.
+hzr_request() {
+  local method="$1" path="$2" response code
+  response="$RENTED_STATE/response.$BASHPID"
+  code=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+    --request "$method" --header "@$RENTED_STATE/headers" \
+    --output "$response" --write-out '%{http_code}' "$HZR_API$path") || { rm -f "$response"; return 1; }
+  case "$code" in
+    200|201|202|204) cat "$response" ;;
+    404) printf 'null\n' ;;
+    *) hzr_log "$method $path: HTTP $code; will retry"; rm -f "$response"; return 1 ;;
+  esac
+  rm -f "$response"
+}
+
+# The server the API knows by this id has the name this client gave it and the
+# label it set. A token of another project, or a server id the metadata service
+# did not give, deletes nothing.
+rented_identity() {
+  local response
+  response=$(hzr_request GET "/servers/$(cat "$RENTED_STATE/server-id")") || return 1
+  jq -e --argjson id "$(cat "$RENTED_STATE/server-id")" --arg owner "$(cat "$RENTED_STATE/owner")" \
+    '.server.id == $id and .server.name == $owner and .server.labels.devbox == "rented"' <<<"$response" >/dev/null || {
+      hzr_log "the API does not confirm this server as $(cat "$RENTED_STATE/owner"); nothing deleted"; return 1;
+    }
+}
+
+rented_terminate() {
+  hzr_request DELETE "/servers/$(cat "$RENTED_STATE/server-id")" >/dev/null
+}
+
+# Docker evaluates DOCKER-USER first for every packet it forwards from a container,
+# and a workspace runs on the devbox bridge network, so this one rule is the block.
+# dockerd keeps the rules in DOCKER-USER when it starts, and creates the chain only
+# when it is missing, so the chain is made here when docker is not up yet. Each
+# watch pass checks the rule again: a firewall reload that flushes it would
+# otherwise open the metadata service for the rest of the rental with no message.
+#
+# The rule lives only in the kernel, so a reboot (Hetzner maintenance, a kernel
+# update) removes it. Workspaces run with `--restart unless-stopped`, and dockerd
+# starts them during its own startup. Code planted in a workspace's writable layer
+# then ran before the watcher's first pass, which waits for docker.service, and one
+# curl read the token, the gate password and the host key from the user data.
+# devbox-hetzner-block.service therefore runs `block` before docker.service, and
+# docker.service requires it, so dockerd does not start without the rule.
+hzr_block_metadata() {
+  iptables -w -n -L DOCKER-USER >/dev/null 2>&1 || iptables -w -N DOCKER-USER || return 1
+  iptables -w -C DOCKER-USER -d 169.254.169.254/32 -j DROP 2>/dev/null \
+    || iptables -w -I DOCKER-USER 1 -d 169.254.169.254/32 -j DROP
+}
+
+# cloud-init keeps the user data, and the cloud-config parsed from it, in files
+# that root reads and nothing on this server needs again. Each one holds the
+# token, the gate password and the host's private key. The runtime keeps the one
+# copy it needs, $HZR_ROOT/etc/devbox/hetzner/token, and removes the rest, then
+# every other file under the two cloud-init directories that still holds the token,
+# the password or a line of the private host key. grep reads the patterns from the
+# files, so no value becomes an argument. The host key is the client's pin for
+# this server: a copy left in /var/lib/cloud lets whoever reads it later answer as
+# this server, at this address, with the key the client trusts.
+hzr_scrub() {
+  local conf="$HZR_ROOT/etc/devbox/hetzner" f patterns=()
+  local -a known=()
+  for f in "$HZR_ROOT"/var/lib/cloud/instances/*/ "$HZR_ROOT/var/lib/cloud/instance/"; do
+    [ -d "$f" ] || continue
+    known+=("${f}user-data.txt" "${f}user-data.txt.i" "${f}cloud-config.txt" "${f}obj.pkl" "${f}vendor-data.txt" "${f}vendor-data.txt.i")
+  done
+  known+=("$HZR_ROOT/run/cloud-init/instance-data-sensitive.json")
+  rm -f "${known[@]}"
+  [ -s "$conf/token" ] && patterns+=(-f "$conf/token")
+  # The password alone, without the "devbox-gate:" that chpasswd reads: a copy that
+  # cloud-init escaped or split keeps the value and not that prefix.
+  if [ -s "$conf/gate-password" ]; then
+    cut -d: -f2- "$conf/gate-password" >"$RENTED_STATE/password.pattern"
+    patterns+=(-f "$RENTED_STATE/password.pattern")
+  fi
+  # The base64 lines of the key, without its BEGIN and END lines, which every
+  # OpenSSH key shares: a copy that cloud-init stored as JSON joins the lines with
+  # a literal \n, and keeps each line whole.
+  if [ -s "$HZR_ROOT/etc/ssh/ssh_host_ed25519_key" ]; then
+    grep -v -e '^-----' -e '^$' "$HZR_ROOT/etc/ssh/ssh_host_ed25519_key" >"$RENTED_STATE/hostkey.pattern" || true
+    [ ! -s "$RENTED_STATE/hostkey.pattern" ] || patterns+=(-f "$RENTED_STATE/hostkey.pattern")
+  fi
+  [ "${#patterns[@]}" -gt 0 ] || return 0
+  grep -rlF "${patterns[@]}" "$HZR_ROOT/var/lib/cloud" "$HZR_ROOT/run/cloud-init" 2>/dev/null \
+    | while IFS= read -r f; do rm -f "$f"; hzr_log "removed $f, which held the rental's secrets"; done \
+    || true
+  rm -f "$RENTED_STATE/password.pattern" "$RENTED_STATE/hostkey.pattern"
+}
+
+# Write the two units, enable both, and start the watcher. Restart=always is what
+# keeps the idle deletion alive: a watcher that died with nobody to restart it
+# would leave the server running, and billed, until a person noticed. The block
+# unit is enabled and not started: boot inserts the rule itself, and the unit is
+# for every later boot (see hzr_block_metadata).
+hzr_unit() {
+  local runtime="$1" units="$HZR_ROOT/etc/systemd/system" unit
+  unit="$units/devbox-hetzner-block.service"
+  cat >"$unit.tmp" <<EOF
+[Unit]
+Description=devbox: block workspaces from the metadata service before docker starts
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $runtime block
+
+[Install]
+RequiredBy=docker.service
+WantedBy=multi-user.target
+EOF
+  mv "$unit.tmp" "$unit"
+  unit="$units/devbox-hetzner-idle.service"
+  cat >"$unit.tmp" <<EOF
+[Unit]
+Description=devbox: delete this rented Hetzner server when it has been idle
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/bin/bash $runtime watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  mv "$unit.tmp" "$unit"
+  systemctl daemon-reload \
+    && systemctl enable devbox-hetzner-block.service \
+    && systemctl enable --now devbox-hetzner-idle.service
+}
+
+# Run once by cloud-init. The order is the security: the idle watcher first, so a
+# server that fails a later step still deletes itself; the metadata block and the
+# scrub next; the gate password LAST. The client reads an accepted password as
+# "ready", so no gate reaches a workspace before the block is in place. The
+# cloud-config chpasswd module would have set the password before runcmd ran.
+hzr_boot() {
+  local conf="$HZR_ROOT/etc/devbox/hetzner" id="" owner idle token tries
+  umask 077
+  mkdir -p "$RENTED_STATE"
+  read -r owner <"$conf/owner" || true
+  read -r idle <"$conf/idle-seconds" || true
+  [[ "${owner:-}" =~ ^devbox-hz-[a-z0-9-]+$ ]] || { hzr_log "no valid owner name in $conf/owner"; return 2; }
+  if ! [[ "${idle:-}" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$idle" -gt 28800 ]; then
+    hzr_log "no valid idle time in $conf/idle-seconds"; return 2
+  fi
+  [ -s "$conf/token" ] || { hzr_log "no token in $conf/token"; return 2; }
+  for tries in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    id=$(curl --silent --fail --max-time 5 "$HZR_METADATA/instance-id") && [[ "$id" =~ ^[0-9]+$ ]] && break
+    id=""
+    [ "$tries" = 12 ] || sleep 5
+  done
+  [ -n "$id" ] || { hzr_log "the metadata service gave no server id"; return 1; }
+  printf '%s\n' "$id" >"$RENTED_STATE/server-id"
+  printf '%s\n' "$owner" >"$RENTED_STATE/owner"
+  printf '%s\n' "$idle" >"$RENTED_STATE/idle-seconds"
+  read -r token <"$conf/token"
+  printf 'Authorization: Bearer %s\n' "$token" >"$RENTED_STATE/headers"
+  unset token
+  # A restart of this step must not reset the clock of a server that sat idle.
+  [ -s "$RENTED_STATE/idle-since" ] || rented_touch
+  hzr_unit "$(readlink -f "${BASH_SOURCE[0]}")" || { hzr_log "could not start devbox-hetzner-idle.service"; return 1; }
+  hzr_block_metadata || { hzr_log "could not block the metadata service for workspaces; the gate password stays locked"; return 1; }
+  hzr_scrub
+  if [ -f "$conf/gate-password" ]; then
+    chpasswd <"$conf/gate-password" || { hzr_log "chpasswd failed for devbox-gate"; return 1; }
+    rm -f "$conf/gate-password"
+  fi
+  echo "==> devbox: rented server $id ready; it deletes itself after ${idle}s with no gate"
+}
+
+# The watcher's pass before each idle check.
+rented_pass() {
+  hzr_block_metadata || hzr_log "could not restore the metadata block for workspaces"
+}
+
+hzr_main() {
+  # Not under /run, a tmpfs: a server that rebooted would lose its clock and its
+  # id, and a watcher that cannot read them never deletes the server.
+  # gate-root reads the same directory.
+  RENTED_STATE="$HZR_ROOT/var/lib/devbox-rented"
+  local action="${1:-}"
+  case "$action" in
+    boot) hzr_boot ;;
+    watch) rented_watch ;;
+    block)
+      hzr_block_metadata || { hzr_log "could not block the metadata service for workspaces; docker.service does not start"; return 1; } ;;
+    *) echo 'devbox-hetzner-runtime: use boot, watch or block' >&2; return 2 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  hzr_main "$@"
+fi

@@ -1,0 +1,44 @@
+{
+  "name": "@launchwrighthq/devbox-client",
+  "version": "1.1.0",
+  "description": "Run a project's verify gate in a workspace on a remote host.",
+  "//": [
+    "The version must equal VERSION; tests/test-version-agreement.sh checks it.",
+    "The package name is scoped because `devbox` on npm is the Nix tool from",
+    "Jetify; the installed command is still `devbox`. No install hook: the",
+    "package writes nothing outside its own directory."
+  ],
+  "keywords": [
+    "devbox",
+    "remote",
+    "verify",
+    "gate",
+    "ssh",
+    "rsync"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/launchwrighthq/devbox-client.git"
+  },
+  "homepage": "https://github.com/launchwrighthq/devbox-client#readme",
+  "bugs": {
+    "url": "https://github.com/launchwrighthq/devbox-client/issues"
+  },
+  "bin": {
+    "devbox": "client/bin/devbox"
+  },
+  "files": [
+    "client/",
+    "server/bin/devbox-runpod-runtime",
+    "server/bin/devbox-hetzner-runtime",
+    "server/bin/devbox-rented-idle",
+    "lib/devbox-lib.sh",
+    "VERSION",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "tests/run-tests.sh"
+  }
+}

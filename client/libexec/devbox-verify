@@ -1,0 +1,1324 @@
+#!/bin/bash
+# Run this checkout's gate on a devbox and return its exit code.
+#
+# The agent-facing command does not change: `make verify` and `npm run verify`
+# reach this as `devbox verify`, through a guard that takes the vendored client
+# first (.venv/bin, node_modules/.bin, vendor/devbox/client/bin) and PATH second, and
+# read 0 or non-zero exactly as before. A machine that has neither, every CI
+# runner included, keeps running the gate locally.
+#
+# Output is streamed, never buffered. Both gates take minutes and print
+# progress, and an agent watching a silent terminal assumes a hang.
+set -euo pipefail
+
+# ── DEVBOX_STRICT=1: for a caller that trusts the exit code ─────────────────
+#
+# A caller that reads this code as "the remote gate ran" was misled in three
+# cases. A missing .devbox.env, DEVBOX_ENABLED=0 and a full
+# queue with DEVBOX_QUEUE_FULL_ACTION=local ran the gate on the LAPTOP and
+# returned its code. The file's DEVBOX_HOST replaced the host the caller named.
+# And devbox's own codes shared one space with the gate's, so a gate that exits
+# 7 read as an OOM kill. Strict mode refuses every local fallback with 64, lets
+# the environment win over .devbox.env, and moves devbox's own codes to 64 to 79.
+# Without it nothing changes, because other projects pin this client and read
+# the plain codes. The fallbacks are a missing .devbox.env, a file that
+# names no target, and rule 5 of the target choice (DEVBOX_QUEUE_FULL_ACTION=local).
+#
+# Read from the environment once, here, before anything can exit: .devbox.env
+# cannot switch it, because the caller that needs it is not the developer.
+STRICT=0
+[ "${DEVBOX_STRICT:-}" = 1 ] && STRICT=1
+# 1 from the moment the gate's own process runs: from then on the exit status is
+# the gate's, and strict mode passes it through unmapped.
+GATE_OWNS_EXIT=0
+# 1 when devbox chose the exit code itself. Every deliberate `exit N` goes through
+# devbox_die, which sets it, and so does every argument guard in the library
+# (devbox_guard_exit). A step that dies under set -e leaves it 0, and that
+# is the only way the trap can tell the two apart: rsync exits 1 to 6 on its
+# own, and DEVBOX_SETUP exits with whatever the project's command returns. A
+# reviewer probe read rsync's 3 as 67 (unreachable), its 5 as 69
+# (handshake), and its 7 as 71 with a false ::devbox-infra::oom.
+OWN_EXIT=0
+# What kind of 3 or 8 this is, for the strict map alone. The plain codes keep
+# one number for several causes, and strict mode splits two of them: a refused
+# gate password or a changed host key (`auth`) is a repair for a person, while
+# an unreachable target is a wait; and an 8 caused by the queue (`queue`) is
+# named as that event.
+EXIT_KIND=""
+devbox_die() { OWN_EXIT=1; EXIT_KIND="${2:-}"; exit "$1"; }
+# The one map from a plain code to its strict code. It prints the code to exit
+# with, and names an oom, queue, watchdog, pool-ticket or pool-deadline event on stderr as
+# ::devbox-infra::<name>, which a driver reads beside the code. A non-zero code
+# that devbox did not choose is a step that died under set -e (a sync, the
+# project's setup, an ssh): that is not the gate's result, so it is 65 with no
+# infra line, whatever its number.
+# Called only from the EXIT traps here and in devbox-runpod, so the linter reads
+# its body as unreachable.
+# shellcheck disable=SC2317
+devbox_exit_code() {
+  local code="$1"
+  if [ "$STRICT" != 1 ] || [ "$GATE_OWNS_EXIT" = 1 ] || [ "$code" = 0 ]; then
+    printf '%s' "$code"; return 0
+  fi
+  if [ "$OWN_EXIT" != 1 ]; then
+    echo "devbox verify: a step before the gate stopped with status $code" >&2
+    printf 65; return 0
+  fi
+  case "$code" in
+    64) ;;
+    1) code=65 ;;
+    2) code=66 ;;
+    # 3 is every target unreachable, or the gate password refused (or a host
+    # key changed) on every target. A driver retries the first and must stop
+    # for a person on the second, so the second has its own code.
+    3) if [ "$EXIT_KIND" = auth ]; then code=75; else code=67; fi ;;
+    4) code=68 ;;
+    5) code=69 ;;
+    6) code=70 ;;
+    7) code=71; echo '::devbox-infra::oom' >&2 ;;
+    # 8 is "no target can take this gate". The queue line comes only when the
+    # queue is the cause: a ceiling that ran out, or a pool that can never
+    # grant. A target that is down or degraded is not a queue event.
+    8) code=72; [ "$EXIT_KIND" != queue ] || echo '::devbox-infra::queue' >&2 ;;
+    9) code=73 ;;
+    # The watchdog on the target stopped the gate. Like an OOM kill,
+    # the gate did not run to its end, so this is devbox's report, never the
+    # gate's result. 74 and 75 were taken, so it is 76.
+    10) code=76; echo '::devbox-infra::watchdog' >&2 ;;
+    # The pool lost this gate's queue ticket and could not put it back. The
+    # gate never ran, so this is devbox's report too.
+    11) code=77; echo '::devbox-infra::pool-ticket' >&2 ;;
+    75) code=74; echo '::devbox-infra::pool-deadline' >&2 ;;
+    *) echo "devbox verify: a step before the gate stopped with status $code" >&2; code=65 ;;
+  esac
+  printf '%s' "$code"
+}
+# The map is applied in the EXIT trap, so it covers every devbox_die below and
+# every set -e death with one call site. Without strict it returns, and bash keeps the
+# original status. $1 is the cleanup armed further down, once there is one.
+# The map runs BEFORE that cleanup: release_worktree_lock runs `exec 8>&-
+# 2>/dev/null`, which sends this shell's stderr to /dev/null for good. MEASURED:
+# with the map after the cleanup, the ::devbox-infra:: line of every
+# run that reached the lock never reached the caller.
+# shellcheck disable=SC2317
+devbox_on_exit() {
+  local rc=$? code
+  code="$(devbox_exit_code "$rc")"
+  # The run file of `devbox status` goes with the run. Guarded, because a run
+  # that ends before devbox-transport is sourced has no such function.
+  ! declare -F devbox_runfile_remove >/dev/null || devbox_runfile_remove
+  [ -z "${1:-}" ] || "$1"
+  [ "$STRICT" = 1 ] || return 0
+  exit "$code"
+}
+trap devbox_on_exit EXIT
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox verify: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; devbox_die 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-config
+source "$_here/devbox-config"
+# Sourced here, and not beside devbox-targets below, because the run file of
+# `devbox status` lives in its private dir, and a run forced to RunPod writes
+# its `rent` phase before this script reaches the targets.
+# shellcheck source=client/libexec/devbox-transport
+source "$_here/devbox-transport"
+
+# ── the arguments ────────────────────────────────────────────────────────────
+#
+# `devbox run -- <command>` arrives here as `--run <command>`. The command crosses
+# as one line on stdin, quoted with %q, so no word of it is parsed by the laptop
+# shell, the ssh login shell or devbox-pool before the workspace bash reads it.
+#
+# `--target <name>` forces one target: a deployed one from DEVBOX_TARGETS,
+# `runpod` or `hetzner`. `devbox runpod up|status|down` arrives as
+# `--runpod-action <action>`, which manages the rental and forces the runpod
+# target, and `devbox hetzner up|status|down` arrives as `--hetzner-action
+# <action>` in the same way. `--runpod` was an older
+# spelling of that target, and it is refused by name rather than read as an
+# unknown word, so a script that still passes it is told what replaced it.
+RUNPOD_ACTION=""
+HETZNER_ACTION=""
+RUN_MODE=0
+RUN_SCRIPT=""
+LOCAL_ONLY=0
+FORCE_TARGET=""
+refuse_args() { echo "devbox verify: $*" >&2; devbox_die 2; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --run) RUN_MODE=1; shift ;;
+    --runpod-action)
+      RUNPOD_ACTION="${2:-status}"
+      FORCE_TARGET=runpod
+      shift; [ "$#" -eq 0 ] || shift ;;
+    --hetzner-action)
+      HETZNER_ACTION="${2:-status}"
+      case "$HETZNER_ACTION" in up|status|down) ;; *) refuse_args "devbox hetzner: use up, status or down" ;; esac
+      FORCE_TARGET=hetzner
+      shift; [ "$#" -eq 0 ] || shift ;;
+    --runpod)
+      refuse_args "--runpod is no longer read. Run 'devbox verify --target runpod', or 'devbox runpod up|status|down' to manage the rental." ;;
+    --local) LOCAL_ONLY=1; shift ;;
+    --target)
+      [ -n "${2:-}" ] || refuse_args "--target needs a name: a target in DEVBOX_TARGETS, runpod or hetzner"
+      FORCE_TARGET="$2"; shift 2 ;;
+    --target=*)
+      FORCE_TARGET="${1#--target=}"
+      [ -n "$FORCE_TARGET" ] || refuse_args "--target needs a name: a target in DEVBOX_TARGETS, runpod or hetzner"
+      shift ;;
+    --) shift; break ;;
+    *)
+      [ "$RUN_MODE" = "1" ] && break
+      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>]" ;;
+  esac
+done
+if [ "$RUN_MODE" = "1" ]; then
+  [ "$#" -gt 0 ] || { echo "devbox run: name a command: devbox run [--target <name>] -- <command> [args]" >&2; devbox_die 2; }
+  [ "$LOCAL_ONLY" = "0" ] || { echo "devbox run: a run never runs on this machine, so it takes no --local" >&2; devbox_die 2; }
+  RUN_SCRIPT="$(printf '%q ' "$@")"
+fi
+[ "$LOCAL_ONLY" = "0" ] || [ -z "$FORCE_TARGET" ] || refuse_args "--local and --target name two places; pass one"
+# `devbox runpod|hetzner up|status|down` manage a rental and run no gate, so
+# they keep no run file for devbox status.
+[ -z "$RUNPOD_ACTION$HETZNER_ACTION" ] || DEVBOX_RUNFILE_OFF=1
+RUNFILE_MODE=verify
+[ "$RUN_MODE" = "0" ] || RUNFILE_MODE=run
+
+# A run has no local fallback: the laptop load it exists to remove is what a
+# fallback would put back. Every path below that would run here refuses instead.
+run_local() {
+  if [ "$RUN_MODE" = "1" ]; then
+    echo "devbox run: NOT running '$RUN_SCRIPT' on this machine: no target is configured for $ROOT (.devbox.env missing, or it sets neither DEVBOX_TARGETS nor DEVBOX_RENT)." >&2
+    devbox_die 2
+  fi
+  # A gate on this laptop is not a run on a target, and its own output is in
+  # the developer's terminal: the run file of a fallback goes now.
+  devbox_runfile_remove
+  OWN_EXIT=1
+  devbox_config_load
+  OWN_EXIT=0
+  GATE_OWNS_EXIT=1
+  bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_verify'
+}
+# The one guard every FALLBACK passes before it calls run_local. `--local` is a
+# person's choice and does not pass here. In strict mode a fallback exits 64 and
+# nothing runs, because the caller would read a laptop result as a remote one.
+local_fallback_guard() {
+  [ "$STRICT" = 1 ] || return 0
+  echo "devbox verify: DEVBOX_STRICT=1 refuses to run the gate on this machine: $1. Nothing ran." >&2
+  devbox_die 64
+}
+
+[ "$LOCAL_ONLY" = "1" ] && { run_local; exit $?; }
+
+# ── the developer's .devbox.env ──────────────────────────────────────────────
+#
+# devbox_env_find holds the lookup and its incident: a linked worktree borrows
+# the main checkout's file, because a worktree holds no gitignored file.
+#
+# The file is DATA, read by devbox_env_load, and never sourced. An older client
+# sourced it, so a gate password that held `$`, a quote or a backtick broke the
+# run, or ran as code on this laptop. The loader also unsets every key before it
+# reads the file: a value exported by some earlier shell must not stand in for a
+# line the file is missing, and an exported RUNPOD_KEY once did.
+DEVBOX_ENV="$(devbox_env_find "$ROOT")" || DEVBOX_ENV=""
+if [ -z "$DEVBOX_ENV" ]; then
+  if [ -n "$FORCE_TARGET" ]; then
+    echo "devbox verify: --target $FORCE_TARGET needs a .devbox.env in $ROOT or beside its git common dir; nothing ran" >&2
+    devbox_die 2
+  fi
+  local_fallback_guard "no .devbox.env in $ROOT"
+  [ "$RUN_MODE" = "1" ] || echo "devbox verify: no .devbox.env in $ROOT, running the gate locally" >&2
+  run_local; exit $?
+fi
+# In strict mode the environment wins over .devbox.env, for each DEVBOX_* key
+# of the file's list and each DEVBOX_TARGET_<NAME>. devbox_env_load reads the
+# pairs after the file and checks them like its lines. A key only the file sets
+# still comes from the file. RUNPOD_KEY and HCLOUD_TOKEN are not DEVBOX_* names,
+# so they come only from the file, in both modes.
+DEVBOX_ENV_KEEP=()
+if [ "$STRICT" = 1 ]; then
+  devbox_env_keep_from_environment
+fi
+devbox_env_load "$DEVBOX_ENV" || devbox_die 2
+if [ -z "$FORCE_TARGET" ] && [ "${#DEVBOX_DEPLOYED[@]}" -eq 0 ] && [ "${#DEVBOX_RENTED[@]}" -eq 0 ]; then
+  local_fallback_guard "$DEVBOX_ENV sets neither DEVBOX_TARGETS nor DEVBOX_RENT"
+  [ "$RUN_MODE" = "1" ] || echo "devbox verify: $DEVBOX_ENV sets neither DEVBOX_TARGETS nor DEVBOX_RENT, running the gate locally" >&2
+  run_local; exit $?
+fi
+case "$FORCE_TARGET" in
+  "") ;;
+  runpod)
+    [ -n "${RUNPOD_KEY:-}" ] || { echo "devbox runpod: RUNPOD_KEY is missing from $DEVBOX_ENV; nothing ran" >&2; devbox_die 2; } ;;
+  hetzner)
+    [ -n "${HCLOUD_TOKEN:-}" ] || { echo "devbox hetzner: HCLOUD_TOKEN is missing from $DEVBOX_ENV; nothing ran" >&2; devbox_die 2; } ;;
+  *)
+    case " ${DEVBOX_DEPLOYED[*]} " in *" $FORCE_TARGET "*) ;; *)
+      echo "devbox verify: --target $FORCE_TARGET: $DEVBOX_ENV lists no such target. Its DEVBOX_TARGETS are: ${DEVBOX_DEPLOYED[*]:-none}; runpod and hetzner are the rented ones; nothing ran" >&2
+      devbox_die 2 ;;
+    esac ;;
+esac
+if [ "$FORCE_TARGET" = runpod ] || [ "$FORCE_TARGET" = hetzner ] || [ "${#DEVBOX_RENTED[@]}" -gt 0 ]; then
+  # A rental key is read only from this file, and it reaches no child: the
+  # loader set it without export, and readonly keeps a later line from
+  # replacing it.
+  [ -z "${RUNPOD_KEY:-}" ] || readonly RUNPOD_KEY
+  [ -z "${HCLOUD_TOKEN:-}" ] || readonly HCLOUD_TOKEN
+fi
+# devbox_config_load refuses a bad config.env with `return 2`, which ends this
+# script through set -e. The flag makes that 2 devbox's own config code.
+OWN_EXIT=1
+devbox_config_load
+OWN_EXIT=0
+
+# ── one rule per value that crosses to the host ─────────────────────────────
+#
+# require_safe_name, require_env_name, is_uint, require_uint and
+# require_safe_token live in lib/devbox-lib.sh since protocol 6, beside the
+# incidents that shaped each rule, because devbox-gate and gate-root apply the
+# same rules on the host. This name starts every refusal they print here. Since
+# protocol 6 each refusal also sets OWN_EXIT, so strict mode maps its 2 to 66.
+DEVBOX_GUARD_WHO="devbox verify"
+
+if [ "$RUNPOD_ACTION" = down ] || [ "$RUNPOD_ACTION" = status ]; then
+  # shellcheck source=/dev/null
+  source "$_here/devbox-runpod"
+  devbox_die "$?"
+fi
+# The rented Hetzner server is a target this run reaches with the gate
+# transport, so devbox-hetzner defines functions and runs nothing when sourced.
+# `status` and `down` need only the API.
+if [ "$FORCE_TARGET" = hetzner ] || [[ " ${DEVBOX_RENTED[*]-} " == *" hetzner "* ]]; then
+  # shellcheck source=client/libexec/devbox-hetzner
+  source "$_here/devbox-hetzner"
+fi
+if [ "$HETZNER_ACTION" = down ] || [ "$HETZNER_ACTION" = status ]; then
+  hetzner_rc=0
+  hetzner_action "$HETZNER_ACTION" || hetzner_rc=$?
+  devbox_die "$hetzner_rc"
+fi
+
+require_safe_name "DEVBOX_PROJECT" "${DEVBOX_PROJECT:-}" "$DEVBOX_CONFIG"
+# DEVBOX_WANT_TOKENS and DEVBOX_MIN_TOKENS come from that same committed file,
+# and the last ssh in this script sends both to the `run` verb, which hands them
+# to `devbox-pool run` as root on the shared devbox. Before the gate account that
+# was one command string a root shell parsed. Read with a default, because
+# `set -u` kills an unguarded read: a profile that omits one died on the echo
+# below with "unbound variable" instead of naming the file to fix. devbox-gate,
+# gate-root and devbox-pool apply this same rule on their own side, and those
+# checks do not make this one redundant: a refusal here names the file to fix
+# before anything has crossed.
+require_uint "DEVBOX_WANT_TOKENS" "${DEVBOX_WANT_TOKENS:-}" "$DEVBOX_CONFIG"
+require_uint "DEVBOX_MIN_TOKENS" "${DEVBOX_MIN_TOKENS:-}" "$DEVBOX_CONFIG"
+# The gate's wall-clock limit. The watchdog on a deployed target stops
+# a gate that runs past it. MEASURED: pytest runs spun at 100% of one core in
+# an endless loop until a person noticed, and no rule bounded a gate's wall
+# clock. Checked here, by the rule devbox-gate and gate-root apply again, so a
+# refusal names the file to fix before anything has crossed.
+GATE_MAX_SECONDS="${DEVBOX_GATE_MAX_SECONDS:-3600}"
+require_gate_max_seconds "$GATE_MAX_SECONDS" "$DEVBOX_CONFIG"
+# A run is one test file or one scenario, so it asks for the floor and leaves
+# the rest of the shared pool to the gates queued behind it.
+GRANT_WANT="$DEVBOX_WANT_TOKENS"
+[ "$RUN_MODE" = "1" ] && GRANT_WANT="$DEVBOX_MIN_TOKENS"
+
+# ── Git LFS pointers, before anything reaches the host ──────────────────────
+#
+# The sync below is rsync of the WORKING TREE, so a checkout that never ran
+# `git lfs pull` ships each LFS file as its 130-byte pointer text. The gate on
+# the host then reads that text as the file, whatever the file claims to be.
+# A checkout that never ran `git lfs pull` ships pointer text, and the gate
+# reads that text as content. So this is refused here, while nothing on the
+# host has been created.
+#
+# Only a path a `.gitattributes` routes through `filter=lfs` is read, and only
+# its first 42 bytes: a pointer text outside such a path is ordinary content.
+lfs_pointers() {
+  local path _attr value head42
+  git grep -q 'filter=lfs' -- ':(glob).gitattributes' ':(glob)**/.gitattributes' || return 0
+  git ls-files -z | git check-attr -z --stdin filter |
+    while IFS= read -r -d '' path && IFS= read -r -d '' _attr && IFS= read -r -d '' value; do
+      if [ "$value" != "lfs" ] || [ ! -f "$path" ] || [ -L "$path" ]; then continue; fi
+      # NUL bytes are dropped before the substitution: a real binary has them in
+      # its first 42 bytes, and bash warned "ignored null byte in input" once per
+      # such file on every run. A pointer holds no NUL, so the test is unchanged.
+      head42="$(head -c 42 -- "$path" | tr -d '\000')"
+      if [ "$head42" = "version https://git-lfs.github.com/spec/v1" ]; then printf '%s\n' "$path"; fi
+    done
+}
+# A failed read is refused too: an empty answer from a broken git would pass
+# every pointer through as though the tree held none.
+pointers="$(lfs_pointers)" || {
+  echo "devbox verify: could not list the Git LFS paths in $ROOT (git ls-files or git check-attr failed), so this run cannot prove it ships no pointer file" >&2
+  devbox_die 9
+}
+if [ -n "$pointers" ]; then
+  {
+    echo "devbox verify: refusing to sync ${DEVBOX_PROJECT}: these files are Git LFS pointers, not their content, and rsync would ship the pointer text to the target:"
+    printf '%s\n' "$pointers" | head -n 20 | sed 's/^/  /'
+    echo "  $(printf '%s\n' "$pointers" | wc -l) file(s) in all. Run 'git lfs pull' in $ROOT, then verify again."
+    echo "  git-lfs missing? apt install git-lfs (Debian, Ubuntu) or brew install git-lfs (macOS), then 'git lfs install --local'."
+  } >&2
+  devbox_die 9
+fi
+
+# ── the developer's queue settings ───────────────────────────────────────────
+#
+# Both keys are validated even when the feature is off, because a typo in a
+# gitignored file is otherwise a preference that silently does nothing.
+QUEUE_WAIT="${DEVBOX_MAX_QUEUE_WAIT:-0}"
+# It lands in `devbox-pool run --max-wait $N`, one string that runs as root on
+# the shared devbox, and in a bash arithmetic context below. Same rule, and the
+# same reason, as DEVBOX_WANT_TOKENS above.
+require_uint "DEVBOX_MAX_QUEUE_WAIT" "$QUEUE_WAIT" "$DEVBOX_ENV"
+QUEUE_ACTION="${DEVBOX_QUEUE_FULL_ACTION:-fail}"
+case "$QUEUE_ACTION" in
+  local|fail) ;;
+  *) echo "devbox verify: refusing DEVBOX_QUEUE_FULL_ACTION '$QUEUE_ACTION' from $DEVBOX_ENV: write local, or fail, which is the default" >&2; devbox_die 2 ;;
+esac
+# A run waits for its tokens with no ceiling: the ceiling's only purpose is the
+# local fallback, and a run has none.
+[ "$RUN_MODE" = "1" ] && QUEUE_WAIT=0
+
+# ── what this project needs from the workspace image ─────────────────────────
+#
+# A project's first remote run reported green after a set of its tests errored
+# on an image that lacked a required system tool, and the skip count changed
+# with no warning. A gate that is quietly weaker
+# than the local one is worse than no remote gate, so the image is proven before
+# the sync rather than assumed.
+#
+# Space separated, which is the format the profile commits. The array is read
+# first and checked second, so no token reaches a host before every token has
+# passed: this list is committed, so any contributor edits it, and each token
+# was once part of one command string that another machine's shell parsed as
+# root. Each one now crosses as one word of the `check-requires` verb, which
+# devbox-gate and gate-root check again.
+#
+# Unset means the project declares nothing, and then the probe asks nothing. A
+# project that has not adopted the key must not start paying an ssh for it.
+REQUIRES=()
+if [ -n "${DEVBOX_REQUIRES:-}" ]; then
+  read -r -a REQUIRES <<<"$DEVBOX_REQUIRES" || true
+  for tok in ${REQUIRES[@]+"${REQUIRES[@]}"}; do
+    require_safe_token "a DEVBOX_REQUIRES token" "$tok" "$DEVBOX_CONFIG"
+  done
+fi
+
+# Run the gate HERE instead, but only when this machine can really run it.
+#
+# This is the one local path a BUSY MACHINE chooses on the developer's behalf.
+# `verify --local` and a .devbox.env that names no target are paths a PERSON
+# chose, and they are deliberately left alone. A fallback that ran here
+# without checking would reproduce the incident this project exists to prevent,
+# tests ERRORING under a green gate, reached through queue depth
+# instead of through a missing image.
+#
+# It returns 1 when the fallback is REFUSED, and never returns at all when it
+# is taken. A caller reading that 1 keeps waiting on a target, because a slow
+# gate is a cost and a weak gate is a wrong answer.
+#
+# FALLBACK_FROM names what this run would have used instead: one target, or
+# "the targets" when none could take the gate. FALLBACK_STAY is the line a
+# refused fallback ends with, and it never promises a wait that will not happen:
+# with no target to wait on, the run exits 8 after it.
+FALLBACK_FROM="the targets"
+FALLBACK_STAY="so the gate does not run here, and no target can take it either."
+queue_fallback() {
+  local why="$1" out="" rc=0 checked_requires=0
+  # DEVBOX_REQUIRES cannot express this. Its three token forms are a path, a
+  # name on PATH and a version pin, and none of them can say "a provisioned
+  # Postgres role with its DSN exported". The remote path is the only one that
+  # provisions that, further down this file where ensure-workspace runs, so a
+  # fallback here used to call run_local with no $DEVBOX_DB_URL_VAR set at
+  # all. MEASURED: a project skipped its database tests and still exited 0
+  # that way. This machine cannot provision what the
+  # workspace provisions, and there is no way to ask a laptop whether it
+  # already has one configured by hand, so this is refused the same way an
+  # unmet DEVBOX_REQUIRES token is refused below: never probe for one, just
+  # stay remote and say what is missing. `devbox verify --local` is the
+  # escape hatch for a developer who knows their own machine is fine.
+  if [ "${DEVBOX_NEEDS_POSTGRES:-0}" = "1" ]; then
+    {
+      echo "devbox verify: NOT running $DEVBOX_PROJECT's gate on this machine."
+      echo "  $why"
+      # Defaulted to the KEY'S OWN NAME rather than read bare. A profile that
+      # sets DEVBOX_NEEDS_POSTGRES=1 and no DEVBOX_DB_URL_VAR is one somebody
+      # half-edited, and under `set -u` a bare read ends the run with a raw
+      # "unbound variable" in the middle of the sentence explaining why the
+      # gate stayed remote. The developer then loses the refusal that names
+      # the file to fix, which is the same failure the DEVBOX_WANT_TOKENS read
+      # above records against itself.
+      echo "  DEVBOX_NEEDS_POSTGRES=1 in $DEVBOX_CONFIG: a gate here would run with \$${DEVBOX_DB_URL_VAR:-DEVBOX_DB_URL_VAR} unset, because only a target provisions the Postgres role and database behind it."
+      echo "  MEASURED: a project skipped its database tests and still exited 0 that way."
+      echo "  $FALLBACK_STAY"
+      echo "  run 'devbox verify --local' if you know this machine already has one configured, or raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV."
+    } >&2
+    return 1
+  fi
+  if [ "${#REQUIRES[@]}" -gt 0 ]; then
+    checked_requires=1
+    # Reached through bash and its real path, not through the CLI on PATH: a
+    # wheel install carries no exec bit, and a PATH lookup would find
+    # whichever client another project vendored.
+    out="$(bash "$_here/devbox-requires-local" "${REQUIRES[@]}" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      {
+        echo "devbox verify: NOT running $DEVBOX_PROJECT's gate on this machine."
+        echo "  $why"
+        printf '%s\n' "$out"
+        echo "  a gate here would skip or ERROR the tests those requirements cover, and could still report green: that is what DEVBOX_REQUIRES exists to stop."
+        echo "  $FALLBACK_STAY"
+        echo "  install what is missing here, or raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV."
+      } >&2
+      return 1
+    fi
+  fi
+  # Here and not at the top: a fallback refused above keeps waiting on a target,
+  # which is what strict mode wants, so only the run_local below is refused.
+  local_fallback_guard "$why, and DEVBOX_QUEUE_FULL_ACTION=local would run it here"
+  {
+    echo "devbox verify: running $DEVBOX_PROJECT's gate on THIS machine instead of $FALLBACK_FROM."
+    echo "  $why"
+    # States what was actually checked, never "covers the same code as the
+    # remote one": that equivalence claim is exactly what DEVBOX_NEEDS_POSTGRES
+    # disproves above, and an empty or all-whitespace DEVBOX_REQUIRES used to
+    # reach this line having checked nothing at all while it was still
+    # reported as "every token is satisfied here".
+    if [ "$checked_requires" -eq 1 ]; then
+      echo "  every DEVBOX_REQUIRES token is satisfied here: $DEVBOX_REQUIRES. DEVBOX_NEEDS_POSTGRES is not set, so nothing else about this machine was checked."
+    else
+      echo "  DEVBOX_REQUIRES names nothing to check here, and DEVBOX_NEEDS_POSTGRES is not set, so nothing about this machine was checked before running its gate."
+    fi
+  } >&2
+  run_local
+  exit $?
+}
+
+if [ "$FORCE_TARGET" = runpod ]; then
+  devbox_runfile_phase rent runpod - "$ROOT" "$RUNFILE_MODE"
+  # shellcheck source=/dev/null
+  source "$_here/devbox-runpod"
+  devbox_die "$?"
+fi
+
+MACHINE_ID="$(devbox_machine_id)"
+MACHINE="$(devbox_machine_label)"
+SLUG="$(devbox_slug "$MACHINE" "$MACHINE_ID" "$DEVBOX_PROJECT" "$ROOT")"
+
+# Every call below goes to the gate account through devbox-transport, sourced
+# at the top: one verb and its words, never a command string for a remote
+# shell. devbox-targets probes every deployed target and chooses one.
+# shellcheck source=client/libexec/devbox-targets
+source "$_here/devbox-targets"
+devbox_targets_check || devbox_die 2
+
+# ── the handshake, this laptop's half ────────────────────────────────────────
+#
+# Asked of every deployed target, before anything is synced or created, as the
+# first two words of its probe line. Client and server each read
+# DEVBOX_PROTOCOL_VERSION from their OWN copy of the shared library, and the
+# release major moves with it, so a host of another major answers with a
+# different number here. The second field, the library's sha256, is a report:
+# a laptop on one minor release and a host on another load different bytes of
+# one protocol, and that is how releases are meant to roll out.
+#
+# A protocol mismatch refuses that target rather than warns, because the damage
+# is silent and shared. devbox_slug names the container, the volume, the Postgres role and
+# the database, and devbox_pg_ident truncates that slug from the left to fit
+# Postgres's 63-byte limit, keeping the last seven characters because they are
+# the only part that tells two worktrees apart. A client and a server that
+# disagree about either algorithm put two checkouts on ONE Postgres role while
+# their container names stay distinct, which is the collision devbox_pg_ident's
+# own comment records as already having happened once. A warning would be read
+# after both gates had written to the same database.
+#
+# The parse and the comparison are devbox_handshake_verdict's, in the shared
+# library, called by devbox_select. Three hand-written copies of one protocol
+# rule is what left devbox-gc's copy a field behind, so that it read a correct
+# two-field answer as no version at all and exited 5 on every run.
+#
+# The function is guarded rather than called blind, because a library copy on
+# THIS laptop that predates the handshake carries neither DEVBOX_PROTOCOL_VERSION
+# nor this function. An unguarded read of that variable died with a raw "unbound
+# variable" under `set -u`, and an unguarded call reports "command not found":
+# either way the one case the handshake exists to explain was the one case it
+# could not report. A stale library here is a client-side repair, which no
+# `devbox server install` can make, so this names that fix.
+if ! declare -F devbox_handshake_verdict >/dev/null 2>&1; then
+  echo "devbox verify: $DEVBOX_LIB carries no devbox_handshake_verdict, so this client predates the handshake. Reinstall or update the devbox client on this machine." >&2
+  devbox_die 5
+fi
+
+# ── choose the target ────────────────────────────────────────────────────────
+#
+# Every deployed target is probed at once, with a 3-second connect timeout and
+# a limit on each ssh after it (DEVBOX_PROBE_ANSWER_SECONDS), and
+# devbox_select takes the first selection rule that matches. A forced target
+# is probed alone, and the unreachable cache is not read for it: a person who
+# names a target wants that target asked.
+#
+# The question is asked while nothing has been spent. A developer who met a long
+# queue only at the acquire had already paid for a container, a Postgres role, a
+# full rsync and an `npm ci`, and abandoning to a local gate threw all of it
+# away. The answer is an ESTIMATE and never a reservation. Minutes pass between
+# this probe and the acquire while the sync and the setup run, and the queue
+# moves in them, which is why --max-wait goes into the acquire as well. Neither
+# mechanism replaces the other.
+PROBE_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed; refusing to probe without a directory for the answers" >&2; devbox_die 1; }
+# A Hetzner server this run created and never saw ready is deleted here too.
+# shellcheck disable=SC2317  # reached through the EXIT trap below, never by name
+cleanup_probe() {
+  devbox_targets_close_all
+  rm -rf "$PROBE_DIR"
+  if declare -F hetzner_cleanup >/dev/null; then hetzner_cleanup || true; fi
+}
+# Through devbox_on_exit, because a second `trap ... EXIT` replaces the first,
+# and the strict map at the top must still run beside this cleanup.
+trap 'devbox_on_exit cleanup_probe' EXIT
+SELECT_TARGETS=("${DEVBOX_DEPLOYED[@]}")
+SELECT_RENT=(${DEVBOX_RENTED[@]+"${DEVBOX_RENTED[@]}"})
+SELECT_AFFINITY="$(devbox_affinity_read)"
+use_cache=1
+if [ -n "$FORCE_TARGET" ]; then
+  SELECT_TARGETS=("$FORCE_TARGET"); SELECT_RENT=(); SELECT_AFFINITY=""; use_cache=0
+fi
+SELECT_MAX_WAIT="$QUEUE_WAIT"
+SELECT_ACTION="$QUEUE_ACTION"
+# A run has no local fallback, so rule 5 never applies to it.
+[ "$RUN_MODE" = "0" ] || SELECT_ACTION=fail
+SELECT_LIB="$DEVBOX_LIB"
+SELECT_MIN="$DEVBOX_MIN_TOKENS"
+DEVBOX_PROBE_REQUIRES=(${REQUIRES[@]+"${REQUIRES[@]}"})
+[ "${#REQUIRES[@]}" -eq 0 ] || echo "==> image requirements: ${REQUIRES[*]}"
+choose_target() {
+  # The target is named in the run file once the probe asks one target alone.
+  local probe_target=-
+  [ "${#SELECT_TARGETS[@]}" -ne 1 ] || [ "${#SELECT_RENT[@]}" -ne 0 ] || probe_target="${SELECT_TARGETS[0]}"
+  devbox_runfile_phase probe "$probe_target" "$SLUG" "$ROOT" "$RUNFILE_MODE"
+  FACTS=""
+  if [ "${#SELECT_TARGETS[@]}" -gt 0 ]; then
+    FACTS="$(devbox_targets_probe "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$PROBE_DIR" "$use_cache" "${SELECT_TARGETS[@]}")" || devbox_die 2
+  fi
+  # The first contact records a host key, and only the one its pin names
+  # (devbox_gate_pin), so the line says which key a later run will hold the
+  # host to.
+  while read -r f_name f_kind f_key; do
+    [ "$f_kind" = newkey ] || continue
+    devbox_target_use "$f_name"
+    echo "==> recorded the pinned host key of $f_name ($TARGET_ADDR): $f_key"
+  done <<<"$FACTS"
+  SELECTION="$(printf '%s\n' "$FACTS" | sed '/^$/d' | devbox_select)"
+  DECISION="${SELECTION##*$'\n'}"
+  read -r d_kind d_name d_rule d_verdict d_secs d_tokens d_jobs d_queued <<<"$DECISION"
+}
+# The rented Hetzner server becomes a target once it answers, and the choice then
+# runs on it alone: rules 1, 2, 3, 5 and 6, as for any forced target. The probe
+# proves its handshake, its health, DEVBOX_REQUIRES and its queue, like a deployed
+# target's. A rented target is never recorded for affinity.
+hetzner_target() {
+  devbox_runfile_phase rent hetzner "$SLUG" "$ROOT" "$RUNFILE_MODE"
+  hetzner_ready || devbox_die "$?"
+  if [ "$HETZNER_ACTION" = up ]; then
+    echo "==> devbox: the Hetzner server of this checkout is up; no gate ran"
+    devbox_die 0
+  fi
+  SELECT_TARGETS=(hetzner); SELECT_RENT=(); SELECT_AFFINITY=""; use_cache=0
+}
+
+# One line per skipped target, never a silent skip. The same lines
+# name each target in the refusal when no target can take the gate.
+skip_lines() {
+  local prefix="$1" kind name _class text
+  while read -r kind name _class text; do
+    [ "$kind" = skip ] || continue
+    printf '%s%s %s\n' "$prefix" "$name" "$text"
+  done <<<"$SELECTION"
+}
+target_addr() { local var="DEVBOX_TARGET_${1^^}"; printf '%s' "${!var-}"; }
+# How the server half of one target is brought up to this client. A rented
+# Hetzner server is a snapshot, so its repair is a new snapshot and a new server.
+repair_hint() {
+  if [ "$1" = hetzner ]; then
+    printf "The Hetzner snapshot is older than this client: the operator of the server half rebuilds it, then 'devbox hetzner down' deletes this checkout's server so that the next run creates one from it."
+  else
+    printf "Run 'devbox server install' for %s (%s)." "$1" "$(target_addr "$1")"
+  fi
+}
+
+# The refusals a person must act on, with the code each had when a client knew
+# one host. They name every target, because each one needs the same repair.
+refuse_handshake() {
+  local name kind line verdict vrc
+  while read -r name kind line; do
+    [ "$kind" = probe ] || continue
+    devbox_probe_parse "$line" || true
+    vrc=0
+    verdict="$(devbox_handshake_verdict "$PROBE_PROTOCOL${PROBE_LIB:+ $PROBE_LIB}" "$DEVBOX_LIB")" || vrc=$?
+    case "$vrc" in
+      # A stale library on THIS laptop, which no `devbox server install` repairs.
+      1) echo "devbox verify: $verdict. Reinstall or update the devbox client on this machine." ;;
+      # Nothing, or an answer that is not a version at all: a host whose
+      # devbox-gate predates the probe verb refuses it as an unknown verb, and
+      # an older devbox-runner prints its usage to stderr and exits 2, so both
+      # shapes reach this client. An older host has no devbox-gate account, so it
+      # fails at the login with exit 3 and never reaches this line.
+      3|5) echo "devbox verify: $name: $verdict. $name's devbox-runner is missing, or it predates the handshake or the probe. $(repair_hint "$name")" ;;
+      # A server on another protocol. The library's line names both integers.
+      0) echo "devbox verify: $name: its probe answer is not a line this client reads. $(repair_hint "$name")" ;;
+      *) echo "devbox verify: $name: $verdict. $(repair_hint "$name")" ;;
+    esac
+  done <<<"$FACTS"
+}
+refuse_requires() {
+  local name kind _rc
+  while read -r name kind _rc; do
+    [ "$kind" = requires ] || continue
+    # The verb's exit status is the verdict and its output is the evidence,
+    # relayed verbatim rather than parsed: it names the image and each unmet
+    # token, and only the server knows which image it runs. Parsing a format the
+    # server owns would break this refusal every time that format gained a line,
+    # and a refusal that lost its detail is a refusal nobody can act on.
+    echo "devbox verify: refusing to run $DEVBOX_PROJECT's gate on $name: its workspace image does not satisfy the DEVBOX_REQUIRES in $DEVBOX_CONFIG."
+    if [ -s "$PROBE_DIR/$name.requires" ]; then
+      cat "$PROBE_DIR/$name.requires"
+    else
+      # A verb that fails without a word would otherwise produce a refusal that
+      # names no token and no image. Say what was asked instead, so the reader
+      # can run the same check by hand.
+      echo "devbox-runner check-requires exited $_rc and printed nothing; it was asked about: ${REQUIRES[*]}"
+    fi
+  done <<<"$FACTS"
+  echo "devbox verify: the fix is in the DEPLOYMENT and not in this project. Add the missing feature to the deployment config of each target and redeploy it with the server's deploy.sh."
+}
+# The strict kind of an 8 (see EXIT_KIND): `queue` when every skipped target
+# was skipped for its pool alone, over the ceiling or never able to grant, and
+# nothing when one was down, degraded or unreachable.
+queue_kind() {
+  local kind _name class _text n=0
+  while read -r kind _name class _text; do
+    [ "$kind" = skip ] || continue
+    case "$class" in over|never) n=$((n + 1)) ;; *) return 0 ;; esac
+  done <<<"$SELECTION"
+  [ "$n" -eq 0 ] || printf queue
+}
+refuse_none() {
+  echo "devbox verify: no target can take this gate:"
+  skip_lines "  "
+  echo "  the gate did not run, here or there."
+}
+
+[ "$FORCE_TARGET" != hetzner ] || hetzner_target
+choose_target
+if [ "$d_kind" = rent ] && [ "$d_name" = hetzner ]; then
+  skip_lines "==> devbox: "
+  echo "==> devbox: renting hetzner: no deployed target can take this gate"
+  hetzner_target
+  choose_target
+fi
+
+case "$d_kind" in
+  pick|rent|local) skip_lines "==> devbox: " ;;
+esac
+case "$d_kind" in
+  pick)
+    devbox_target_use "$d_name"
+    case "$d_rule" in
+      1) why="the last run of this worktree was here" ;;
+      2) why="the first target in DEVBOX_TARGETS that can take it now" ;;
+      *) why="the shortest queue" ;;
+    esac
+    [ -z "$FORCE_TARGET" ] || why="--target $FORCE_TARGET"
+    [ "$d_name" != hetzner ] || why="the rented Hetzner server of this checkout"
+    echo "==> devbox: running on $TARGET ($why)"
+    # The pool's state is printed as it was answered, so the reader sees the
+    # numbers the decision rested on.
+    case "$d_verdict" in
+      now) echo "==> devbox: $d_tokens tokens, $d_jobs jobs, $d_queued waiting: this ask fits now" ;;
+      wait) echo "==> devbox: $d_tokens tokens, $d_jobs jobs, $d_queued waiting: about ${d_secs}s of queuing" ;;
+      # unknown: the pool would not put a number on the wait. --max-wait still
+      # goes into the acquire, so the ceiling the developer asked for still
+      # holds, and the only thing lost is the chance to skip the setup.
+      *) if [ "$QUEUE_WAIT" -gt 0 ]; then
+           echo "==> devbox: no usable queue estimate, so this run continues on $TARGET under a ${QUEUE_WAIT}s ceiling"
+         else
+           echo "==> devbox: no usable queue estimate, so this run waits on $TARGET's queue"
+         fi ;;
+    esac ;;
+  rent)
+    # The rented target owns its own transport and its own EXIT trap, so the
+    # deployed targets' masters are closed first.
+    # The strict map stays armed until devbox-runpod arms its own trap, which
+    # applies the same map.
+    cleanup_probe
+    trap devbox_on_exit EXIT
+    devbox_runfile_phase rent "$d_name"
+    echo "==> devbox: renting $d_name: no deployed target can take this gate"
+    # shellcheck source=/dev/null
+    source "$_here/devbox-runpod"
+    devbox_die "$?" ;;
+  local)
+    if [ -n "$d_name" ]; then
+      FALLBACK_FROM="$d_name"
+      FALLBACK_STAY="so this run keeps waiting on $d_name instead."
+      fb_secs="$(sed -n "s/^skip $d_name over skipped: busy, about \([0-9]*\)s.*/\1/p" <<<"$SELECTION")"
+      fb_why="$d_name estimates ${fb_secs}s of queuing, over your DEVBOX_MAX_QUEUE_WAIT of ${QUEUE_WAIT}s"
+    else
+      fb_why="no target can take this gate now, and DEVBOX_QUEUE_FULL_ACTION is local"
+    fi
+    # Returns only when this machine cannot run the gate. A target over the
+    # ceiling is then still the honest answer, under that same ceiling: the
+    # acquire gives up on it, and the 75 below asks again without one.
+    queue_fallback "$fb_why" || true
+    if [ -z "$d_name" ]; then
+      refuse_none >&2
+      devbox_die 8 "$(queue_kind)"
+    fi
+    devbox_target_use "$d_name"
+    echo "==> devbox: running on $TARGET, the shortest queue, because this machine cannot run the gate" ;;
+  fail)
+    case "$d_rule" in
+      auth)
+        while read -r f_name f_kind f_rest; do
+          case "$f_kind" in
+            refused) echo "devbox verify: the gate password was refused by $f_name ($(target_addr "$f_name")). Set the current DEVBOX_GATE_PASSWORD in $DEVBOX_ENV." >&2 ;;
+            hostkey) echo "devbox verify: $f_name: $f_rest" >&2 ;;
+          esac
+        done <<<"$FACTS" ;;
+      handshake) refuse_handshake >&2 ;;
+      requires) refuse_requires >&2 ;;
+      never)
+        # A permanent misconfiguration and not a busy afternoon, so it is refused
+        # whatever the action says. Routing around it would send every future run
+        # to a laptop and leave the targets unused with nobody told why.
+        {
+          echo "devbox verify: every target can NEVER grant this gate's tokens:"
+          skip_lines "  "
+          echo "  DEVBOX_MIN_TOKENS is $DEVBOX_MIN_TOKENS in $DEVBOX_CONFIG."
+          echo "  lower DEVBOX_MIN_TOKENS there, or raise DEVBOX_TOTAL_TOKENS in the deployment config of each target and redeploy it with the server's deploy.sh."
+          echo "  without this check the acquire would have waited out DEVBOX_POOL_DEADLINE, an hour, and then failed."
+        } >&2 ;;
+      unreachable)
+        {
+          echo "devbox verify: no target answered:"
+          skip_lines "  "
+          echo "  use 'devbox verify --local' to run here, or set DEVBOX_RENT to rent a target."
+        } >&2 ;;
+      *)
+        {
+          refuse_none
+          echo "  raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV, set DEVBOX_QUEUE_FULL_ACTION=local to run it here when this machine can, or DEVBOX_RENT=runpod to rent a target."
+        } >&2 ;;
+    esac
+    # A fail decision reads `fail <code> <class>`, so the code is the second word.
+    case "$d_rule" in
+      auth) devbox_die "$d_name" auth ;;
+      never) devbox_die "$d_name" queue ;;
+      none) devbox_die "$d_name" "$(queue_kind)" ;;
+      *) devbox_die "$d_name" ;;
+    esac ;;
+  *)
+    echo "devbox verify: the target choice ended without a decision: $DECISION" >&2
+    devbox_die 1 ;;
+esac
+
+# From here on a fallback is a fallback from this one target.
+FALLBACK_FROM="$TARGET"
+FALLBACK_STAY="so this run keeps waiting on $TARGET instead."
+
+# The sync phase of the run file starts here: the workspace,
+# the worktree lock and the rsync all prepare the tree before the setup.
+devbox_runfile_phase sync "$TARGET"
+echo "==> workspace $SLUG on $TARGET"
+# ensure-workspace's contract is that stdout carries only the DSN; it enforces
+# that on its own side by routing every diagnostic line (container id, ALTER/
+# CREATE ROLE, CREATE DATABASE) to stderr. `tail -n1` is defense in depth on
+# top of that, not a substitute for it. The shape check below is what actually
+# refuses to trust a violation of that contract instead of writing garbage
+# into --env-file.
+DSN="$(devbox_gate ensure-workspace "$SLUG" "$MACHINE_ID" | tail -n1)"
+case "$DSN" in
+  postgresql*) ;;
+  *) echo "devbox verify: ensure-workspace on $TARGET did not return a DSN as its last output line; refusing to trust it" >&2; devbox_die 1 ;;
+esac
+# Affinity: this worktree now has a workspace on this target, so the
+# next run prefers it, and pays an incremental sync there instead of a full one
+# somewhere else. Written once the workspace exists, so a run that fails in the
+# gate still records where its warm workspace is.
+# A rented target is never recorded: it is gone after its idle time.
+if [ "$TARGET" != hetzner ]; then
+  devbox_affinity_write "$TARGET" || echo "devbox verify: could not record $TARGET as this worktree's last target; the next run may choose another" >&2
+fi
+
+# ── the workspace's OOM counter, before the gate ─────────────────────────────
+#
+# The workspace runs under a memory cap, and the kernel enforces that cap by
+# KILLING a process. pytest dies mid-run, prints no summary, and this script
+# returns a bare non-zero status with no cause, and a developer chased wrong
+# theories until dmesg named it. The
+# container's own cgroup counts every such kill, so the number is asked for
+# rather than inferred, and the tail of this file turns it into a sentence.
+#
+# ── the per-worktree lock ────────────────────────────────────────────────────
+#
+# One workspace serves one (machine, project, worktree), deliberately, because
+# that is what keeps node_modules and the mypy cache warm between runs. The
+# consequence is that two runs from the SAME checkout share one tree, and until
+# this lock existed they mutated it concurrently: the token pool serialises the
+# GATE, but the sync and `devbox_setup` ran before any token was held.
+#
+# That is not theoretical. A second run from one checkout reached
+# `devbox_setup` while the first was mid-gate, reinstalled the dependencies
+# under it, and the first run died, MEASURED.
+#
+# The lock is held by a backgrounded ssh whose gate verb `lock` takes a
+# `flock` on the host and then reads this fifo with `cat`. Closing the fd ends that `cat`, which ends `flock`, which
+# releases. Crash safety is free: if this laptop or the network dies the
+# connection drops, the remote `cat` sees EOF, and the lock releases with no
+# stale state to reap. Different worktrees take different locks, so the
+# concurrency the pool is there to allow is untouched.
+#
+# The fifo and its answer file live in a private `mktemp -d` directory. In the
+# shared /tmp the answer file was the fifo's public name plus `.out`, opened
+# with `>`, so another local user could plant a symlink there and have this
+# client truncate the file it named. macOS /tmp has no fs.protected_symlinks.
+LOCK_DIR=""
+LOCK_PID=""
+release_worktree_lock() {
+  if [ -n "$LOCK_PID" ]; then
+    exec 8>&- 2>/dev/null || true
+    wait "$LOCK_PID" 2>/dev/null || true
+  fi
+  [ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"
+  return 0
+}
+
+LOCK_WAIT="${DEVBOX_LOCK_WAIT:-3600}"
+# The same rule as the profile values, applied where this one is read. It lands
+# in two places that both take more than a number: `flock -w $LOCK_WAIT` on
+# the host, through the gate verb below, and `$(( SECONDS + LOCK_WAIT + 30 ))`
+# further down, a bash arithmetic context that evaluates whatever text it is
+# given. An operator exporting it by hand is one typo away from either.
+require_uint "DEVBOX_LOCK_WAIT" "$LOCK_WAIT" "the environment"
+LOCK_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed; refusing to take the lock without a private directory for the fifo" >&2; devbox_die 1; }
+mkfifo -m 600 "$LOCK_DIR/fifo"
+devbox_gate lock "$SLUG" "$LOCK_WAIT" < "$LOCK_DIR/fifo" > "$LOCK_DIR/out" &
+LOCK_PID=$!
+exec 8> "$LOCK_DIR/fifo"
+
+# Arm the cleanup here, where the fifo starts existing. It used to be armed 117
+# lines below, after the DSN file was written, so every abort in between -- a
+# refused rsync, a docker exec that fails, a Ctrl-C -- left one more fifo
+# directory in the temp directory.
+#
+# The DSN file and the forwarded-env file are no longer this client's to remove.
+# The client named them, created them over ssh and removed them on exit with one
+# more ssh, and a Ctrl-C at the wrong moment left a Postgres password in /run
+# on the host. gate-root now writes both values into one file of its own for the
+# length of the `run` verb and removes it when that verb ends, on the host,
+# whatever the laptop does.
+#
+# cleanup_all is reached only through the trap on the line below and is never
+# called by name, so the linter reads its body as unreachable. Without this
+# directive `shellcheck -x` fails on SC2317 here.
+# shellcheck disable=SC2317
+cleanup_all() { release_worktree_lock; cleanup_probe; }
+trap 'devbox_on_exit cleanup_all' EXIT
+
+# Wait for the remote to report it actually holds the lock. Bounded, because a
+# wait that never ends is the failure mode this whole runner keeps rediscovering.
+lock_deadline=$(( SECONDS + LOCK_WAIT + 30 ))
+until [ -s "$LOCK_DIR/out" ]; do
+  if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+    echo "devbox verify: could not take the lock for $SLUG on $TARGET" >&2
+    rm -rf "$LOCK_DIR"; devbox_die 4
+  fi
+  if [ "$SECONDS" -ge "$lock_deadline" ]; then
+    echo "devbox verify: gave up after ${LOCK_WAIT}s waiting for another run of $SLUG to finish" >&2
+    release_worktree_lock; devbox_die 4
+  fi
+  sleep 1
+done
+rm -f "$LOCK_DIR/out"
+echo "==> holding the $SLUG lock"
+
+echo "==> sync"
+# rsync straight into the workspace volume, NOT into a temp dir followed by
+# `docker cp`. docker cp MERGES, so with that shape a file deleted locally
+# survives in the workspace and can keep a stale test green. That is the same
+# class of fault as the silently-skipped Postgres tests this whole runner
+# exists to prevent, so --delete has to act on the real target.
+#
+# The client only names sync/<slug>/<project>/. gate-root maps that to
+# /home/dev/<project>/ in ws-<slug>, where the volume is mounted, and runs the
+# rsync receiver there with docker exec. A symlink that workspace code plants
+# then resolves inside the container and never on the host.
+#
+# The two remote steps devbox-sync asks its caller for. `sync-finish` also does
+# the `chown -R dev:dev` that followed the sync, before the finish script runs
+# as dev in the workspace.
+devbox_sync_push() {
+  local sub="$1"; shift
+  devbox_gate_rsync "$@" "sync/$SLUG/$DEVBOX_PROJECT/${sub:+$sub/}"
+}
+devbox_sync_finish() {
+  devbox_gate sync-finish "$SLUG" "$DEVBOX_PROJECT" ${1:+"$1"}
+}
+# shellcheck source=client/libexec/devbox-sync
+source "$_here/devbox-sync"
+devbox_sync
+
+# The hooks cross on stdin; the workspace bash expands each entry after reading
+# them. gate-root holds the entry, `eval "$(cat)" && devbox_environment &&
+# devbox_setup`, as a fixed string, so nothing on this line reaches a shell as
+# code except through the workspace bash that reads stdin.
+HOOKS="$(devbox_hooks_script)"
+devbox_runfile_phase setup
+echo "==> setup"
+devbox_gate setup "$SLUG" "$DEVBOX_PROJECT" <<< "$HOOKS"
+
+echo "==> waiting for $GRANT_WANT tokens (min $DEVBOX_MIN_TOKENS)"
+
+# ONE ssh invocation holds the grant and runs the gate. devbox-pool run is what
+# keeps the two together: the grant is keyed to a PID, so the process that holds
+# it must be the process doing the work. Splitting this into an acquire call and
+# a separate exec would key the grant to a shell that exits at once, and the
+# reaper would give the tokens away mid-run.
+#
+# DEVBOX_TOKENS and PYTEST_WORKERS are exported by devbox-pool run itself, so
+# only the DSN has to cross from here. It must not cross as `docker exec -e
+# VAR=value`: that string sits verbatim in the argv of the ssh-spawned shell,
+# of devbox-pool's own process, AND of the final docker exec, for the whole
+# multi-minute run of the gate, readable by anyone on the devbox via `ps`.
+# Route it through `docker exec --env-file` instead: that flag takes only a
+# PATH (never secret), and Docker resolves the file itself rather than handing
+# its contents to any process as an argument. Same reasoning devbox-runner
+# already applies to the admin and workspace Postgres passwords, just for a
+# value that has to cross a host boundary instead of staying local to one exec.
+#
+# The value travels as the first lines of the `run` verb's stdin: a count, then
+# that many NAME=value lines, then the gate's own stdin. gate-root reads the
+# header, writes the lines to a 0600 file of its own under /run, passes that
+# path with --env-file, and removes the file when the verb ends. The lines are
+# built with `printf`, a shell builtin with no process and no argv of its own,
+# and cross ssh's data channel, never its command line, so the DSN (a password
+# included) never becomes an argument anywhere on either host.
+GATE_ENV=()
+if [ "${DEVBOX_NEEDS_POSTGRES:-0}" = "1" ]; then
+  GATE_ENV+=("$DEVBOX_DB_URL_VAR=$DSN")
+fi
+
+# ── the switches a project asks to carry over ────────────────────────────────
+#
+# DEVBOX_FORWARD_ENV is a committed list of NAMES in .devbox/config.env, never
+# values. The project says which of its own switches make sense on a devbox; the
+# developer's environment says what they are on this run.
+#
+# Before this, the gate ran with `-e DEVBOX_TOKENS -e PYTEST_WORKERS` and
+# nothing else, so `EXAMPLE_SLOW_TIER=1 make verify` set a variable on the LAPTOP that
+# never arrived. The run looked ordinary and the tier it asked for stayed off,
+# which is worse than a refusal: the only way to use such a switch was to run
+# the gate locally, and a local gate is what this tool exists to remove.
+#
+# NAMES are checked and values are not, and that asymmetry is the point. A name
+# becomes the left side of a line in an env file on the host, so it is refused
+# unless it is an environment variable name and nothing else; gate-root checks
+# it again. A value never becomes an argument anywhere: it travels the way the
+# DSN does, on stdin into a file the gate reads with --env-file, so no shell on
+# either host ever parses it.
+#
+# A value holding a newline is refused rather than escaped. An env file is one
+# NAME=value per line, so a newline forges a second assignment, and no project
+# switch is worth carrying that.
+#
+# An unset name is skipped in silence. The list is what a project CAN forward,
+# not what this run must have, so a developer who sets none of them pays one
+# loop and nothing else. devbox_forward_name in devbox-config holds the rest of
+# the rule: a .devbox.env key is refused by name, and only an EXPORTED variable
+# crosses, because the loader keeps the gate password as a shell variable.
+if [ -n "${DEVBOX_FORWARD_ENV:-}" ]; then
+  fwd_names=()
+  read -r -a fwd_names <<<"$DEVBOX_FORWARD_ENV" || true
+  fwd_crossed=""
+  for fwd_name in "${fwd_names[@]}"; do
+    devbox_forward_name "$fwd_name" || continue
+    case "${!fwd_name}" in
+      *$'\n'*)
+        echo "devbox verify: refusing to forward $fwd_name: its value holds a newline, and an env file is one NAME=value per line" >&2
+        devbox_die 2 ;;
+    esac
+    GATE_ENV+=("$fwd_name=${!fwd_name}")
+    fwd_crossed="$fwd_crossed $fwd_name"
+  done
+  if [ -n "$fwd_crossed" ]; then
+    # Names only. A value may be a switch today and a token tomorrow, and this
+    # line is read from a terminal a screen share can see.
+    echo "==> forwarding to the gate:$fwd_crossed"
+  fi
+fi
+
+# ── the workspace's OOM counter, read as late as possible ───────────────────
+#
+# The counter is CUMULATIVE for the life of the container, so the two reads
+# around it define the interval a kill is charged to. That interval must be the
+# gate and nothing else, which is why this read sits here rather than beside
+# ensure-workspace where it is cheaper.
+#
+# Two long stretches would otherwise fall inside it, and both are real. The
+# worktree lock above waits up to DEVBOX_LOCK_WAIT, one hour by default, and
+# ANOTHER run of this same slug holds that lock and uses this same container: its
+# kill would be charged here, and a genuinely failing test in this run would be
+# reported as a memory kill. That is not hypothetical, and the lock's own comment
+# records why: two runs from one checkout happen from two terminals or a
+# re-triggered job. devbox_setup is the other stretch, and `npm ci` or a tsc
+# build is the memory-heaviest step of many gates; a setup that swallows a killed
+# child would poison the reading before a single test ran.
+#
+# A counter that cannot be read is kept as the empty string and never as 0. A
+# zero baseline against a second read that also failed would report a real test
+# failure as a memory kill, which is the opposite of this file's job.
+OOM_BEFORE="$(devbox_gate oom-count "$SLUG" 2>/dev/null || true)"
+is_uint "$OOM_BEFORE" || OOM_BEFORE=""
+
+# ONE ssh invocation holds the grant and runs the gate, and this is a function
+# only so the max-wait path below can ask for the same thing again without a
+# ceiling. The verb and its words are identical on both calls, deliberately: two
+# copies of it is the drift this repository keeps finding in its own history.
+#
+# A run swaps devbox_verify for its own command after the hooks on stdin. The
+# mode word says which, and gate-root holds both entries as fixed strings: the
+# command itself never enters this argv.
+GATE_MODE=verify
+GATE_STDIN="$HOOKS"
+if [ "$RUN_MODE" = "1" ]; then
+  GATE_MODE="command"
+  GATE_STDIN="$HOOKS"$'\n'"devbox_environment && $RUN_SCRIPT"
+fi
+GATE_HEADER="${#GATE_ENV[@]}"
+if [ "${#GATE_ENV[@]}" -gt 0 ]; then
+  GATE_HEADER="$GATE_HEADER"$'\n'"$(printf '%s\n' "${GATE_ENV[@]}")"
+fi
+# The gate's stderr is copied to GATE_ERR as it streams, because the watchdog's
+# reason reaches this laptop as one line of it, and exit 10 names that reason.
+# tee passes every byte on at once, so a gate's progress output streams as
+# before.
+GATE_ERR="$PROBE_DIR/gate.err"
+run_remote_gate() {
+  local s=0
+  set +e
+  devbox_runfile_phase queued
+  # A mock SSH that exits immediately raced printf and returned 141 for a successful gate.
+  # A here-string has no producer process whose SIGPIPE can replace the remote exit code.
+  # The third copy of the stderr moves the run file to its gate phase at the
+  # pool's grant line.
+  devbox_gate run "$SLUG" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "${1:-0}" "$GATE_MAX_SECONDS" "$GATE_MODE" \
+    <<< "$GATE_HEADER"$'\n'"$GATE_STDIN" 2> >(tee "$GATE_ERR" >(devbox_runfile_watch_grant) >&2)
+  s=$?
+  # The tee must have written its last line before the file is read below.
+  # Since bash 4.4, $! names the last process substitution. On a shell where it
+  # still named the lock's ssh, this wait would block until that lock was
+  # released at exit, so that one pid is never waited for here.
+  [ "$!" = "$LOCK_PID" ] || wait "$!" 2>/dev/null
+  set -e
+  return "$s"
+}
+
+status=0
+queued_past_ceiling=0
+run_remote_gate "$QUEUE_WAIT" || status=$?
+
+# 75 from devbox-pool means it gave up queuing and ran NOTHING, on the ceiling
+# this client sent or on its own DEVBOX_POOL_DEADLINE. That is not a gate
+# result, so where this run asked for a ceiling it is intercepted here: it must
+# never reach the OOM comparison below, and it must never be passed through as
+# a gate's own status.
+#
+# The QUEUE_WAIT guard is therefore not "did OUR ceiling cause this". A 75 can
+# arrive with the feature off too, because DEADLINE fires whether or not
+# --max-wait was ever sent, and this client cannot tell that 75 from a gate
+# that happens to exit 75 itself. The guard is "is there a ceiling and a
+# fallback to talk about at all". With the feature off there is neither, so
+# every 75 falls straight through to this script's own exit at the bottom,
+# exactly as any other status does and exactly as it did before this feature
+# existed. Intercepting one there, with no ceiling to name, would invent a
+# local fallback the developer never asked for, or report a gate that ran and
+# failed as one that never ran.
+#
+# The residual is a known collision: under a ceiling, a gate of its own that
+# exits exactly 75 is read here as a queue that gave up.
+if [ "$status" -eq 75 ] && [ "$QUEUE_WAIT" -gt 0 ]; then
+  if [ "$QUEUE_ACTION" = "local" ]; then
+    # Returns only when this machine cannot satisfy DEVBOX_REQUIRES.
+    queue_fallback "the queue on $TARGET did not free up within your DEVBOX_MAX_QUEUE_WAIT of ${QUEUE_WAIT}s" || {
+      # The fallback is refused, so the only honest thing left is the wait this
+      # run was trying to avoid. Nothing is thrown away by asking again: the
+      # workspace is warm, the lock is still held, and the sync and the setup
+      # are already done. The ceiling is dropped, so this second attempt is
+      # bounded by DEVBOX_POOL_DEADLINE like every run before this feature.
+      echo "devbox verify: waiting on $TARGET without a ceiling, because this machine cannot run this gate." >&2
+      queued_past_ceiling=1
+      status=0
+      run_remote_gate 0 || status=$?
+    }
+  else
+    {
+      echo "devbox verify: gave up waiting for tokens on $TARGET after ${QUEUE_WAIT}s. The gate did not run, here or there."
+      echo "  raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV, or set DEVBOX_QUEUE_FULL_ACTION=local to run it here when this machine can."
+    } >&2
+    devbox_die 8 queue
+  fi
+fi
+
+# ── did the run's own connection fail? ───────────────────────────────────────
+#
+# The run verb opens a NEW connection with a fresh password login (devbox_gate
+# gives it no master), after the probe, the lock, the sync and the setup. When
+# that login is refused (the gate password was rotated during the run) or the
+# connect fails (sshd MaxStartups, a network drop), ssh exits 255 before
+# anything runs on the host. That 255 fell through as the gate's own status:
+# exit 255 with a line about the OOM counter, and under strict mode 255
+# unmapped, where a refused password must give 3 (75). ssh's
+# own line in GATE_ERR tells it apart from a gate that exits 255 itself.
+if [ "$status" -eq 255 ]; then
+  ssh_line="$(grep -m1 -E "^devbox-gate@.*: Permission denied|Too many authentication failures|REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed" "$GATE_ERR" 2>/dev/null || true)"
+  if [ -n "$ssh_line" ]; then
+    case "$ssh_line" in
+      *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
+        echo "devbox verify: the host key of $TARGET is not its pin at the run step; the gate did not run, and no password was sent ($ssh_line)" >&2 ;;
+      *) echo "devbox verify: the gate password was refused by $TARGET at the run step; the gate did not run ($ssh_line)" >&2 ;;
+    esac
+    devbox_die 3 auth
+  fi
+  ssh_line="$(grep -m1 -E "^ssh: connect to host |^ssh: Could not resolve hostname |^kex_exchange_identification: |Connection closed by |Connection reset by " "$GATE_ERR" 2>/dev/null || true)"
+  if [ -n "$ssh_line" ]; then
+    echo "devbox verify: the run step could not reach $TARGET, so the gate's result is unknown ($ssh_line)" >&2
+    devbox_die 3
+  fi
+fi
+
+# ── did the watchdog stop it? ────────────────────────────────────────────────
+#
+# 79 from devbox-pool means the watchdog on the target stopped this gate: past
+# its DEVBOX_GATE_MAX_SECONDS, or with no CPU used for DEVBOX_GATE_STALL_SECONDS.
+# That is not a test result, and an agent that read it as one would
+# rerun the same gate into the same stop. So it is exit 10, with the reason the
+# pool printed. A gate that exits 79 of its own prints no such line, and its
+# status passes through below as any other gate status does.
+WATCHDOG_LINE="devbox-pool: the watchdog stopped this gate: "
+if [ "$status" -eq 79 ] && stop_reason="$(grep -m1 -F "$WATCHDOG_LINE" "$GATE_ERR" 2>/dev/null)"; then
+  {
+    echo "devbox verify: the watchdog on $TARGET stopped this gate: ${stop_reason#*"$WATCHDOG_LINE"}"
+    echo "  this is not a test result. Do not rerun the gate unchanged: find the test that hangs or spins, or raise DEVBOX_GATE_MAX_SECONDS in $DEVBOX_CONFIG when the gate is really that long."
+  } >&2
+  devbox_die 10
+fi
+
+# ── did the pool lose this gate's place in line? ─────────────────────────────
+#
+# 78 from devbox-pool means its queue ticket was gone and could not be written
+# again, so the gate never ran. MEASURED on a live host: runs showed "queued"
+# for over an hour while the host's queue was empty. A waiter is granted only
+# at the head of the queue, so one without a ticket never is. The pool now
+# restores a lost ticket, and when it cannot, it stops with 78 rather than wait
+# for a turn that cannot come. A gate that exits 78 of its own prints no such
+# line, and its status passes through below as any other gate status does.
+TICKET_LINE="devbox-pool: lost its queue ticket "
+if [ "$status" -eq 78 ] && ticket_line="$(grep -m1 -F "$TICKET_LINE" "$GATE_ERR" 2>/dev/null)"; then
+  {
+    echo "devbox verify: the pool on $TARGET lost this gate's queue ticket and could not restore it, so the gate did not run (${ticket_line#devbox-pool: })"
+    echo "  this is not a test result. The pool's state directory on $TARGET is not writable or not there: run devbox doctor, and redeploy the host when it names the pool."
+  } >&2
+  devbox_die 11
+fi
+
+# Strict mode reads every 75 that is left as the pool's: DEVBOX_POOL_DEADLINE,
+# with no ceiling asked for, or on the ceiling-free second wait above. It exits
+# 74 through the map at the top. A gate of its own that exits exactly 75 is read
+# the same way, the same known collision, and a strict caller still
+# takes that gate's result from its own output rather than from this code.
+if [ "$STRICT" = 1 ] && [ "$status" -eq 75 ]; then
+  echo "devbox verify: the pool on $TARGET gave up waiting for tokens and ran nothing (devbox-pool exit 75)." >&2
+  devbox_die 75
+fi
+
+# ── did the gate fail, or was it killed? ─────────────────────────────────────
+#
+# A non-zero status is not proof of a failing test. When memory runs out the
+# kernel kills the process, and the partial test summary, or the missing one, is
+# the SYMPTOM of that rather than the cause. Read the counter a second time and
+# compare: a count that GREW means this run was killed.
+#
+# What the counter proves, and what it does not. memory.events oom_kill counts
+# processes in this cgroup killed by ANY OOM killer, not only by this cgroup
+# hitting its own limit. The host running short and the kernel choosing a process
+# in here increments the same field. So the message below reports the KILL as
+# fact and keeps both causes open, because telling somebody to raise the cap when
+# the box is already oversubscribed makes the next kill more likely.
+#
+# Only on a non-zero status, and only with a baseline to compare against. A
+# green gate pays nothing for this, and a red gate has already lost minutes.
+#
+# Strict mode reads the counter after a green gate too. A kill inside a gate
+# that still ran to its end is an event its caller must see, so it is named on
+# stderr while the code stays the gate's. A status of 128 or more is a gate
+# that was killed and did not run to its end: that one keeps the plain exit 7,
+# which the map turns into 71.
+oom_keeps_gate_status=0
+[ "$STRICT" = 1 ] && [ "$status" -lt 128 ] && oom_keeps_gate_status=1
+if [ "$status" -ne 0 ] || [ "$STRICT" = 1 ]; then
+  oom_after=""
+  if [ -n "$OOM_BEFORE" ]; then
+    oom_after="$(devbox_gate oom-count "$SLUG" 2>/dev/null || true)"
+  fi
+  if ! is_uint "$oom_after"; then
+    # Say so, and pass the gate's own status through unchanged. An unreadable
+    # counter must never turn a real test failure into a reported OOM.
+    [ "$status" -eq 0 ] || echo "devbox verify: could not read the workspace's OOM counter on $TARGET, so this run cannot tell a memory kill from a test failure. The status below is the gate's own." >&2
+  elif [ "$oom_after" -gt "$OOM_BEFORE" ]; then
+    # The cap is read from the file the fix edits, so the message names a value
+    # the reader can go and change. The gate verb reads it out of
+    # /etc/devbox/config on the host.
+    cap="$(devbox_gate memory-cap 2>/dev/null || true)"
+    if [ -n "$cap" ]; then
+      cap_text="a $cap cap: DEVBOX_WORKSPACE_MEMORY in /etc/devbox/config on $TARGET"
+    else
+      # Never a number this laptop invented. A host that records no key runs the
+      # workspace under devbox-runner's own default, and only that host knows it.
+      cap_text="devbox-runner's default cap, because $TARGET records no DEVBOX_WORKSPACE_MEMORY in /etc/devbox/config"
+    fi
+    {
+      if [ "$oom_keeps_gate_status" = 1 ]; then
+        echo "devbox verify: a process in $DEVBOX_PROJECT's gate on $TARGET was OOM-KILLED. The gate ran to its end, so the status below is the gate's own ($status)."
+      else
+        echo "devbox verify: $DEVBOX_PROJECT's gate on $TARGET was OOM-KILLED. It did not fail."
+      fi
+      echo "  the cgroup for ws-$SLUG counted $(( oom_after - OOM_BEFORE )) new OOM kill(s) while the gate ran"
+      echo "  a partial test summary, or none at all, is the SYMPTOM: the kernel kills the process before it can print one"
+      echo "  the counter does not say WHICH killer, so both causes are live:"
+      echo "    this workspace crossed its own cap, which is $cap_text"
+      echo "      then lower DEVBOX_WANT_TOKENS, now $DEVBOX_WANT_TOKENS, in $DEVBOX_CONFIG: every token is one more worker sharing that cap"
+      echo "      or raise DEVBOX_WORKSPACE_MEMORY in the deployment config for $TARGET, then redeploy the host with the server's deploy.sh"
+      echo "    or $TARGET ran out of memory host-wide and the kernel chose a process in here"
+      echo "      then RAISING the cap makes the next one more likely: cap times DEVBOX_MAX_JOBS is a budget against the box's RAM"
+      echo "      check with: free -g on $TARGET, and devbox doctor reports the ratio"
+    } >&2
+    # 7 and not the gate's own status: this run says nothing about the tests.
+    [ "$oom_keeps_gate_status" = 1 ] || devbox_die 7
+    echo '::devbox-infra::oom' >&2
+  fi
+fi
+if [ "$STRICT" = 1 ] && [ "$queued_past_ceiling" = 1 ]; then
+  echo '::devbox-infra::queue' >&2
+fi
+GATE_OWNS_EXIT=1
+exit "$status"

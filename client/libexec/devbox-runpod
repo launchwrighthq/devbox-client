@@ -1,0 +1,406 @@
+#!/bin/bash
+# Sourced by verify after its local validation. The provider owns only a temporary CPU pod;
+# the project's config still owns provision, setup, requirements and the gate.
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec bash "$(dirname "$(readlink -f "$0")")/devbox-verify" --runpod-action "$@"
+fi
+
+# The HTTP request, the record write and the rental name are devbox-rented's,
+# because devbox-hetzner applies the same rules.
+# shellcheck source=client/libexec/devbox-rented
+declare -F rented_http >/dev/null || source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-rented"
+
+runpod_api() {
+  local method="$1" path="$2" body="${3:-}" url="$RENTED_RUNPOD_API$2"
+  [ "$path" != /graphql ] || url=https://api.runpod.io/graphql
+  RENTED_HTTP_WHO="devbox runpod" RENTED_HTTP_DIR="$RP_STATE" rented_http "$RUNPOD_KEY" "$method" "$url" "$path" "$body"
+}
+
+runpod_save() { rented_save "$RP_STATE/pod.json" "$@"; }
+
+runpod_name() { rented_name devbox-cpu 16; }
+
+runpod_down() (
+  # A deadline and a Ctrl-C can arrive together. Serialize deletion, then re-read ownership.
+  flock -w 60 8 || return 1
+  [ -f "$RP_STATE/pod.json" ] || return 0
+  local name id pod found terminated
+  terminated=$(jq -er 'if type == "object" and (.terminated == null or (.terminated | type) == "boolean") then (.terminated // false | tostring) else error("invalid rental record") end' "$RP_STATE/pod.json") || return 1
+  [ "$terminated" = false ] || return 0
+  name=$(jq -r '.name' "$RP_STATE/pod.json")
+  runpod_owner_name "$name" || { echo 'devbox runpod: invalid rental owner' >&2; return 1; }
+  id=$(jq -r '.id // empty' "$RP_STATE/pod.json")
+  if [ -z "$id" ]; then
+    found=$(runpod_api GET "/pods?name=$name") || return 1
+    found=$(jq --arg name "$name" '[.[] | select(.name == $name)]' <<<"$found") || return 1
+    [ "$(jq length <<<"$found")" -le 1 ] || { echo 'devbox runpod: ambiguous rental recovery' >&2; return 1; }
+    id=$(jq -r '.[0].id // empty' <<<"$found")
+    # A lost create response is not proof that creation failed. The pod carries its own
+    # watcher; keep recovery material while an eventually visible create can still appear.
+    if [ -z "$id" ] && [ "$(jq -r '.createUncertain // false' "$RP_STATE/pod.json")" = true ] &&
+       [ "$(date +%s)" -lt "$(jq -r '(.createdAt // now) + 600 | floor' "$RP_STATE/pod.json")" ]; then
+      echo 'devbox runpod: creation outcome unknown; retry runpod down to confirm recovery' >&2
+      return 1
+    fi
+  fi
+  if [ -n "$id" ]; then
+    [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    pod=$(runpod_api GET "/pods/$id") || return 1
+    if [ "$pod" != null ]; then
+      jq -e --arg name "$name" '.name == $name and (.computeType == "CPU" or ((.cpuFlavorId // "") | test("^cpu[0-9]+[cgm]$")))' <<<"$pod" >/dev/null || {
+        echo 'devbox runpod: rental ownership or CPU check failed; nothing deleted' >&2; return 1;
+      }
+      runpod_api DELETE "/pods/$id" >/dev/null || return 1
+      [ "$(runpod_api GET "/pods/$id")" = null ] || { echo 'devbox runpod: deletion not yet confirmed' >&2; return 1; }
+    fi
+  fi
+  # jq owns $id; shell expansion would change the JSON program.
+  # shellcheck disable=SC2016
+  runpod_save --arg id "$id" '.id = $id | .terminated = true'
+  rm -f "$RP_STATE/key" "$RP_STATE/key.pub" "$RP_STATE/request.json"
+  echo "==> RunPod deleted: ${id:-no pod created}"
+) 8>"$RP_STATE/delete.lock"
+
+runpod_connection() {
+  local pod endpoint ip port deadline
+  deadline=$((SECONDS + 600))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    pod=$(runpod_api GET "/pods/$(jq -r .id "$RP_STATE/pod.json")") || return 1
+    [ "$pod" != null ] || { echo 'devbox runpod: pod is gone' >&2; return 1; }
+    endpoint=$(jq -r 'select(.publicIp and .portMappings["22"]) | [.publicIp, .portMappings["22"]] | @tsv' <<<"$pod")
+    if [ -z "$endpoint" ]; then
+      jq -n --arg id "$(jq -r .id "$RP_STATE/pod.json")" \
+        '{query:"query DevboxSsh($input: PodFilter) { pod(input:$input) { runtime { ports { ip isIpPublic privatePort publicPort } } } }", variables:{input:{podId:$id}}}' > "$RP_STATE/ports.json"
+      pod=$(runpod_api POST /graphql "$RP_STATE/ports.json") || return 1
+      endpoint=$(jq -r '[.data.pod.runtime.ports[]? | select(.privatePort == 22 and .isIpPublic)][0] | select(.) | [.ip, .publicPort] | @tsv' <<<"$pod")
+    fi
+    if [ -n "$endpoint" ]; then
+      read -r ip port <<<"$endpoint"
+      [[ "$ip" =~ ^[0-9.]+$ && "$port" =~ ^[0-9]+$ ]] || return 1
+      cat > "$RP_STATE/ssh_config" <<EOF
+Host devbox-runpod
+  HostName $ip
+  Port $port
+  User root
+  IdentityFile "$RP_STATE/key"
+  UserKnownHostsFile "$RP_STATE/known_hosts"
+  IdentitiesOnly yes
+  BatchMode yes
+  ConnectTimeout 10
+  ServerAliveInterval 15
+  ServerAliveCountMax 4
+  StrictHostKeyChecking accept-new
+EOF
+      SSH=(ssh -F "$RP_STATE/ssh_config" devbox-runpod)
+      if "${SSH[@]}" true 2>/dev/null; then return 0; fi
+    fi
+    sleep 10
+  done
+  echo 'devbox runpod: SSH did not become ready within ten minutes' >&2
+  return 1
+}
+
+runpod_health() {
+  local remote
+  remote=$("${SSH[@]}" 'bash /opt/devbox/runpod-runtime status') || return 1
+  jq -e --arg id "$(jq -r .id "$RP_STATE/pod.json")" --arg name "$(jq -r .name "$RP_STATE/pod.json")" \
+    '.id == $id and .name == $name and .watchdog == true' <<<"$remote" >/dev/null || {
+      echo 'devbox runpod: pod identity or idle watchdog check failed' >&2; return 1;
+    }
+}
+
+runpod_up() {
+  local name pod price startup
+  name=$(runpod_name) || return 1
+  # Authenticate before allocation, so an invalid key cannot leave an uncertain create.
+  runpod_api GET "/pods?name=$name" >/dev/null || return 1
+  rm -f "$RP_STATE/key" "$RP_STATE/key.pub" "$RP_STATE/known_hosts"
+  ssh-keygen -q -t ed25519 -N '' -f "$RP_STATE/key" || return 1
+  jq -n --arg name "$name" --argjson createdAt "$(date +%s)" --argjson cpus "$DEVBOX_RUNPOD_CPUS" \
+    --argjson idleSeconds "$DEVBOX_RUNPOD_IDLE_SECONDS" \
+    '{name:$name,createdAt:$createdAt,cpus:$cpus,idleSeconds:$idleSeconds,watchdog:"pod",createUncertain:true}' > "$RP_STATE/pod.json" || return 1
+  # The runtime sources devbox-rented-idle from its own directory, so both land in
+  # /opt/devbox.
+  printf -v startup '%s\n' 'set -eu' 'mkdir -p /opt/devbox' \
+    "cat > /opt/devbox/devbox-rented-idle <<'DEVBOX_RENTED_IDLE'" \
+    "$(cat "$RP_CLIENT/../../server/bin/devbox-rented-idle")" 'DEVBOX_RENTED_IDLE' \
+    "cat > /opt/devbox/runpod-runtime <<'DEVBOX_RUNTIME_SCRIPT'" \
+    "$(cat "$RP_CLIENT/../../server/bin/devbox-runpod-runtime")" 'DEVBOX_RUNTIME_SCRIPT' \
+    'exec bash /opt/devbox/runpod-runtime boot'
+  jq -n --arg name "$name" --arg image "$DEVBOX_RUNPOD_IMAGE" --arg startup "$startup" \
+    --rawfile key "$RP_STATE/key.pub" --arg idle "$DEVBOX_RUNPOD_IDLE_SECONDS" \
+    --argjson cpus "$DEVBOX_RUNPOD_CPUS" --arg regions "${DEVBOX_RUNPOD_REGIONS:-}" \
+    '{name:$name,computeType:"CPU",cloudType:"SECURE",vcpuCount:$cpus,imageName:$image,
+      cpuFlavorIds:["cpu5g","cpu3g","cpu5c","cpu3c","cpu5m","cpu3m"],cpuFlavorPriority:"custom",
+      containerDiskInGb:100,volumeInGb:0,supportPublicIp:true,ports:["22/tcp"],
+      env:{PUBLIC_KEY:$key,DEVBOX_RUNPOD_OWNER:$name,DEVBOX_RUNPOD_IDLE_SECONDS:$idle},
+      dockerEntrypoint:["/bin/bash","-c",$startup],dockerStartCmd:[]} +
+      (if $regions == "" then {} else {dataCenterIds:($regions | split(",")),dataCenterPriority:"custom"} end)' > "$RP_STATE/request.json" || return 1
+  pod=$(runpod_api POST /pods "$RP_STATE/request.json") || return 1
+  jq -e '.id | strings | test("^[A-Za-z0-9_-]+$")' <<<"$pod" >/dev/null || return 1
+  # jq owns $pod; shell expansion would change the JSON program.
+  # shellcheck disable=SC2016
+  runpod_save --argjson pod "$pod" '.id=$pod.id | .hourly=($pod.adjustedCostPerHr // $pod.costPerHr) | .createUncertain=false' || return 1
+  price=$(jq -r '.hourly' "$RP_STATE/pod.json")
+  jq -en --argjson price "$price" --argjson limit "$DEVBOX_RUNPOD_MAX_HOURLY" '$price > 0 and $price <= $limit' >/dev/null || {
+    echo 'devbox runpod: hourly price is unknown or exceeds the configured limit' >&2; return 1;
+  }
+  echo "==> RunPod $(jq -r .id "$RP_STATE/pod.json"): $DEVBOX_RUNPOD_CPUS vCPU, \$$price/hour"
+  runpod_connection && runpod_health
+}
+
+runpod_ssh() {
+  local command
+  # OpenSSH joins its command arguments with spaces. Quote that whole command once for
+  # the activity wrapper, including scripts whose first word is a variable assignment.
+  printf -v command '%q' "$*"
+  ssh -F "$RP_STATE/ssh_config" devbox-runpod "bash /opt/devbox/runpod-runtime activity bash -c $command"
+}
+
+# The project's DEVBOX_REQUIRES, checked on the pod as dev, the user the gate runs as. A
+# deployed target answers the same question with check-requires and exits 6 on an unmet
+# token. A pod never got the list: run.sh tested a DEVBOX_REQUIRES that nothing exported to
+# it, so a pod image without a required tool ran the gate anyway. devbox-requires-local has
+# the server's three token forms and is already on the pod, so this calls it, not a copy.
+# The tokens passed require_safe_token in devbox-verify, and %q quotes each one again for
+# the pod's shell.
+runpod_requires() {
+  local quoted out rc=0
+  [ "${#REQUIRES[@]}" -gt 0 ] || return 0
+  echo "==> pod requirements: ${REQUIRES[*]}"
+  printf -v quoted ' %q' "${REQUIRES[@]}"
+  out="$("${SSH[@]}" "runuser -u dev -- bash /opt/devbox/client/libexec/devbox-requires-local$quoted" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  printf '%s\n' "$out" >&2
+  # 1 is an unmet token and 2 a token the check refuses, as check-requires answers on a
+  # deployed target. Any other status is the ssh or the pod failing, which is not a verdict.
+  case "$rc" in 1|2) ;; *) return "$rc" ;; esac
+  {
+    echo "devbox verify: refusing to run $DEVBOX_PROJECT's gate on runpod: the pod does not satisfy the DEVBOX_REQUIRES in $DEVBOX_CONFIG."
+    echo "devbox verify: the fix is in the PROJECT: name an image that carries it in DEVBOX_RUNPOD_IMAGE, or install it in DEVBOX_PROVISION."
+  } >&2
+  OWN_EXIT=1
+  return 6
+}
+
+runpod_execute() {
+  local tokens entry name value logdir remote_results pg_provision='' status=0
+  # Where devbox-runpod-postgres writes the URL that run.sh exports, readable by dev only.
+  local dsn_file=/home/dev/.devbox-dsn
+  tokens=$(jq -r .cpus "$RP_STATE/pod.json")
+  tokens=$((tokens - 1))
+  [ "$tokens" -le "$DEVBOX_WANT_TOKENS" ] || tokens=$DEVBOX_WANT_TOKENS
+  [ "$tokens" -ge "$DEVBOX_MIN_TOKENS" ] || { echo 'devbox runpod: CPU shape cannot satisfy DEVBOX_MIN_TOKENS' >&2; OWN_EXIT=1; return 2; }
+  SSH=(runpod_ssh)
+  SYNC_RSYNC_ARGS=(-z --rsync-path='bash /opt/devbox/runpod-runtime activity rsync')
+  # The ssh_config alias of this pod, which devbox_sync_push below names.
+  RP_HOST=devbox-runpod
+  SYNC_DEST="/home/dev/$DEVBOX_PROJECT"
+  # shellcheck disable=SC2034
+  SYNC_WORKSPACE="$SYNC_DEST"
+  printf -v RSYNC_SSH 'ssh -F %q' "$RP_STATE/ssh_config"
+  "${SSH[@]}" "mkdir -p $SYNC_DEST /opt/devbox/lib /opt/devbox/client/libexec /workspace/results"
+  # shellcheck source=/dev/null
+  source "$RP_CLIENT/devbox-sync"
+  # The two remote steps devbox-sync asks its caller for. A pod is a rented
+  # machine this client holds root on for one run, reached through runpod_ssh,
+  # so these keep the shape the pod always had.
+  devbox_sync_push() {
+    local sub="$1"; shift
+    rsync "$@" -e "$RSYNC_SSH" "$RP_HOST:$SYNC_DEST/${sub:+$sub/}"
+  }
+  devbox_sync_finish() {
+    "${SSH[@]}" bash -s -- "$SYNC_DEST" "$1" <<<"$(devbox_sync_finish_script)"
+  }
+  devbox_runfile_phase sync
+  echo '==> sync'
+  devbox_sync
+  rsync -a "${SYNC_RSYNC_ARGS[@]}" -e "$RSYNC_SSH" "$DEVBOX_LIB" "devbox-runpod:/opt/devbox/lib/devbox-lib.sh"
+  rsync -a "${SYNC_RSYNC_ARGS[@]}" -e "$RSYNC_SSH" "$RP_CLIENT/devbox-requires-local" "$RP_CLIENT/devbox-runpod-postgres" \
+    "devbox-runpod:/opt/devbox/client/libexec/"
+  # A deployed target's pool provides the database; a pod gets its own, before the project's hook.
+  [ "${DEVBOX_NEEDS_POSTGRES:-0}" != 1 ] ||
+    pg_provision="(exec 9>&-; DEVBOX_DSN_FILE=$dsn_file bash /opt/devbox/client/libexec/devbox-runpod-postgres)"
+  # The provision runs the project's hooks before the gate, as setup does on a
+  # deployed target, so the run file says setup.
+  devbox_runfile_phase setup
+  echo '==> provision'
+  "${SSH[@]}" bash -se <<EOF
+cd $SYNC_DEST
+$(devbox_hooks_script)
+# Daemons started during provisioning outlive it; inheriting its activity lock would
+# keep an otherwise idle pod alive forever. The outer runtime still locks this command.
+$pg_provision
+if declare -F devbox_provision >/dev/null; then (exec 9>&-; devbox_provision); fi
+chown -R dev:dev /home/dev /workspace/results
+EOF
+  # After the provision, which may install what a token names, and before setup and the gate.
+  runpod_requires
+  logdir="$ROOT/.build/devbox/runpod/$(date -u +%Y%m%dT%H%M%S)-$$"
+  remote_results="/workspace/results/$(basename "$logdir")"
+  mkdir -p "$logdir"
+  cp "$RP_STATE/pod.json" "$logdir/rental.json"
+  git rev-parse HEAD > "$logdir/commit"
+  git diff --binary HEAD > "$logdir/changes.patch"
+  entry=devbox_verify
+  [ "$RUN_MODE" != 1 ] || entry="$RUN_SCRIPT"
+  {
+    printf 'set -euo pipefail\ncd %q\n' "$SYNC_DEST"
+    # DEVBOX_TARGET names where the gate runs. An older client named it
+    # DEVBOX_BACKEND=runpod, a key .devbox.env no longer reads.
+    printf 'export DEVBOX_TARGET=runpod DEVBOX_TOKENS=%q PYTEST_WORKERS=%q DEVBOX_RESULTS=%q\n' "$tokens" "$tokens" "$remote_results"
+    for name in ${DEVBOX_FORWARD_ENV:-}; do
+      devbox_forward_name "$name" || continue
+      value=${!name}
+      printf 'export %s=%q\n' "$name" "$value"
+    done
+    # An assignment, then the export: `export X="$(cat f)"` would hide a failed read under set -e.
+    # The pod's bash expands the substitution, not this one.
+    # shellcheck disable=SC2016
+    [ "${DEVBOX_NEEDS_POSTGRES:-0}" != 1 ] ||
+      printf '%s="$(cat %s)"\nexport %s\n' "$DEVBOX_DB_URL_VAR" "$dsn_file" "$DEVBOX_DB_URL_VAR"
+    devbox_hooks_script
+    printf 'devbox_environment\n'
+    cat <<'REMOTE'
+mkdir -p "$DEVBOX_RESULTS"
+    # Tests that read git ls-files need untracked source in the remote index, and only there.
+git ls-files --others --exclude-standard -z | git add -N --pathspec-from-file=- --pathspec-file-nul
+devbox_setup
+REMOTE
+    printf '%s\n' "$entry"
+  } > "$RP_STATE/run.sh"
+  # A pod has no pool and no queue: the gate starts at once.
+  devbox_runfile_phase gate
+  echo "==> gate ($tokens tokens); log: $logdir/output.log"
+  # stdin carries the command and forwarded values; no secret becomes an ssh argv.
+  "${SSH[@]}" 'runuser -u dev -- bash -se' < "$RP_STATE/run.sh" 2>&1 | tee "$logdir/output.log" || status=$?
+  # From here the status is the gate's, and devbox-verify's strict map passes it through.
+  # devbox_exit_code in the sourcing shell reads it.
+  # shellcheck disable=SC2034
+  GATE_OWNS_EXIT=1
+  rm -f "$RP_STATE/run.sh"
+  # Strict mode never replaces a gate's code with devbox's own. Its caller reads
+  # the result from the gate's output, which is already in output.log.
+  rsync -a "${SYNC_RSYNC_ARGS[@]}" -e "$RSYNC_SSH" "devbox-runpod:$remote_results/" "$logdir/" || {
+    echo 'devbox runpod: could not download reports' >&2
+    [ "$status" -ne 0 ] || [ "$STRICT" = 1 ] || status=1
+  }
+  printf '%s\n' "$status" > "$logdir/exit-code"
+  return "$status"
+}
+
+runpod_finish() {
+  local status=$?
+  trap - EXIT INT TERM
+  rm -f "$RP_STATE/run.sh"
+  # This trap replaces devbox-verify's, so it removes the run file of
+  # `devbox status` itself.
+  devbox_runfile_remove
+  if [ "$RP_CLEANUP" = 1 ]; then
+    runpod_down || { echo 'devbox runpod: cleanup unconfirmed; retry runpod down' >&2; [ "$status" -ne 0 ] || status=1; }
+  fi
+  # This trap replaces devbox-verify's, so it applies the strict map itself.
+  exit "$(devbox_exit_code "$status")"
+}
+
+# Every refusal below sets OWN_EXIT=1 before its `return`. This body runs at
+# the end of a sourced file under set -e, so a non-zero return ends devbox-verify
+# right here, and its devbox_die never runs. Without the mark, strict mode read
+# each refusal as a dead step: DEVBOX_RUNPOD_CPUS=3 gave 65 instead of 66, and a
+# held lock gave 65 instead of 68 (review probe). The variable is
+# devbox-verify's; its strict map reads it.
+# shellcheck disable=SC2034
+runpod_main() {
+  local tool name id pod status
+  RP_CLIENT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+  for tool in jq curl ssh ssh-keygen rsync flock; do
+    command -v "$tool" >/dev/null || { echo "devbox runpod: install $tool" >&2; OWN_EXIT=1; return 2; }
+  done
+  RP_STATE="$(git rev-parse --path-format=absolute --git-dir)/devbox-runpod"
+  umask 077
+  mkdir -p "$RP_STATE"
+  case "$RUNPOD_ACTION" in
+    ''|up|down|status) ;;
+    *) echo 'devbox runpod: use up, status or down' >&2; OWN_EXIT=1; return 2 ;;
+  esac
+  if [ -z "${RUNPOD_KEY:-}" ] || [[ "$RUNPOD_KEY" == *$'\n'* || "$RUNPOD_KEY" == *$'\r'* ]]; then
+    echo 'devbox runpod: set a nonempty RUNPOD_KEY in .devbox.env' >&2; OWN_EXIT=1; return 2;
+  fi
+  case "$RUNPOD_ACTION" in
+    down) runpod_down; return $? ;;
+    status)
+      [ -f "$RP_STATE/pod.json" ] || { echo 'devbox runpod: no rental'; return 0; }
+      id=$(jq -r '.id // empty' "$RP_STATE/pod.json")
+      if [ -n "$id" ]; then
+        [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || { OWN_EXIT=1; return 2; }
+        pod=$(runpod_api GET "/pods/$id") || { OWN_EXIT=1; return 1; }
+        if [ "$pod" = null ]; then runpod_down || { OWN_EXIT=1; return 1; }; fi
+      fi
+      jq . "$RP_STATE/pod.json"; return 0 ;;
+  esac
+  exec 9>"$RP_STATE/run.lock"
+  flock -n 9 || { echo 'devbox runpod: another run owns this checkout' >&2; OWN_EXIT=1; return 4; }
+  : "${DEVBOX_RUNPOD_CPUS:=16}" "${DEVBOX_RUNPOD_IDLE_SECONDS:=7200}" "${DEVBOX_RUNPOD_MAX_HOURLY:=1}"
+  [ -n "${DEVBOX_RUNPOD_IMAGE:-}" ] || { echo 'devbox runpod: set DEVBOX_RUNPOD_IMAGE in .devbox/config.env or .devbox.env' >&2; OWN_EXIT=1; return 2; }
+  for name in devbox-runpod-runtime devbox-rented-idle; do
+    [ -r "$RP_CLIENT/../../server/bin/$name" ] || { echo "devbox runpod: the pod runtime file $name is missing; reinstall devbox" >&2; OWN_EXIT=1; return 2; }
+  done
+  case "$DEVBOX_RUNPOD_CPUS" in 4|8|16|32) ;; *) echo 'devbox runpod: use 4, 8, 16 or 32 CPUs' >&2; OWN_EXIT=1; return 2 ;; esac
+  if [ "$DEVBOX_MIN_TOKENS" -lt 1 ] || [ "$DEVBOX_WANT_TOKENS" -lt "$DEVBOX_MIN_TOKENS" ] || [ "$((DEVBOX_RUNPOD_CPUS - 1))" -lt "$DEVBOX_MIN_TOKENS" ]; then
+    echo 'devbox runpod: CPU shape cannot satisfy the profile token budget' >&2; OWN_EXIT=1; return 2
+  fi
+  require_uint DEVBOX_RUNPOD_IDLE_SECONDS "$DEVBOX_RUNPOD_IDLE_SECONDS" configuration
+  if ! [[ "$DEVBOX_RUNPOD_IDLE_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$DEVBOX_RUNPOD_IDLE_SECONDS" -gt 28800 ]; then
+    echo 'devbox runpod: DEVBOX_RUNPOD_IDLE_SECONDS must be between 1 and 28800' >&2; OWN_EXIT=1; return 2;
+  fi
+  [ -z "${DEVBOX_RUNPOD_SECONDS:-}" ] || { echo 'devbox runpod: replace DEVBOX_RUNPOD_SECONDS with DEVBOX_RUNPOD_IDLE_SECONDS' >&2; OWN_EXIT=1; return 2; }
+  [[ "$DEVBOX_RUNPOD_MAX_HOURLY" =~ ^[0-9]+([.][0-9]+)?$ ]] || { OWN_EXIT=1; return 2; }
+  jq -en --argjson n "$DEVBOX_RUNPOD_MAX_HOURLY" '$n > 0 and $n <= 5' >/dev/null || { OWN_EXIT=1; return 2; }
+  for name in ${DEVBOX_FORWARD_ENV:-}; do
+    devbox_forward_name "$name" || continue
+    case "${!name:-}" in *$'\n'*) echo "devbox runpod: refusing newline in $name" >&2; OWN_EXIT=1; return 2 ;; esac
+  done
+  if [ "${DEVBOX_NEEDS_POSTGRES:-0}" = 1 ] && ! [[ "${DEVBOX_DB_URL_VAR:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "devbox runpod: DEVBOX_NEEDS_POSTGRES=1 needs DEVBOX_DB_URL_VAR, an environment variable name, in $DEVBOX_CONFIG" >&2
+    OWN_EXIT=1; return 2
+  fi
+  RP_CLEANUP=0
+  trap runpod_finish EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -f "$RP_STATE/pod.json" ] && [ "$(jq -r '.terminated // false' "$RP_STATE/pod.json")" = false ]; then
+    id=$(jq -r '.id // empty' "$RP_STATE/pod.json")
+    if [ -z "$id" ]; then
+      name=$(jq -r .name "$RP_STATE/pod.json")
+      runpod_owner_name "$name" || { OWN_EXIT=1; return 2; }
+      pod=$(runpod_api GET "/pods?name=$name") || { OWN_EXIT=1; return 1; }
+      pod=$(jq --arg name "$name" '[.[] | select(.name == $name)]' <<<"$pod") || { OWN_EXIT=1; return 1; }
+      [ "$(jq length <<<"$pod")" = 1 ] || { echo 'devbox runpod: unresolved create; run runpod down before renting again' >&2; OWN_EXIT=1; return 2; }
+      id=$(jq -r '.[0].id' <<<"$pod")
+      # jq owns $id; it must not expand in the shell.
+      # shellcheck disable=SC2016
+      runpod_save --arg id "$id" '.id=$id | .createUncertain=false'
+    fi
+    [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || { OWN_EXIT=1; return 2; }
+    pod=$(runpod_api GET "/pods/$id") || { OWN_EXIT=1; return 1; }
+    if [ "$pod" = null ]; then
+      runpod_down || { OWN_EXIT=1; return 1; }
+    else
+      jq -e --arg name "$(jq -r .name "$RP_STATE/pod.json")" '.name == $name and (.computeType == "CPU" or ((.cpuFlavorId // "") | test("^cpu[0-9]+[cgm]$")))' <<<"$pod" >/dev/null || { OWN_EXIT=1; return 2; }
+      [ "$(jq -r '.watchdog // empty' "$RP_STATE/pod.json")" = pod ] || {
+        echo 'devbox runpod: this older rental needs runpod down before using pod-side idle cleanup' >&2; OWN_EXIT=1; return 2;
+      }
+      if ! { runpod_connection && runpod_health; }; then OWN_EXIT=1; return 1; fi
+    fi
+  fi
+  if [ ! -f "$RP_STATE/pod.json" ] || [ "$(jq -r '.terminated // false' "$RP_STATE/pod.json")" = true ]; then
+    RP_CLEANUP=1
+    runpod_up || { status=$?; OWN_EXIT=1; return "$status"; }
+    RP_CLEANUP=0
+  fi
+  [ "$RUNPOD_ACTION" != up ] || return 0
+  runpod_execute
+}
+
+runpod_main "$@"

@@ -1,0 +1,20 @@
+#!/bin/bash
+# ssh runs this as SSH_ASKPASS to read the gate password. It prints
+# $DEVBOX_GATE_PASSWORD and exits.
+#
+# devbox-transport sets that variable in the environment of the ssh process
+# alone, and ssh hands its environment to this child. The value never becomes
+# an argument: `printf` is a bash builtin, so no process starts with the
+# password in its argv. `ps aux` is readable by every user on a laptop, so an
+# argv is a public string, and a secret travels through stdin, a file or the
+# environment, never as an argument.
+#
+# ssh passes its prompt as $1. It is ignored: the one secret this helper knows
+# is the answer to every prompt the gate account can show.
+#
+# An unset or empty password exits 1 and prints nothing. ssh then reads no
+# answer and the login fails as a refused password, which devbox-transport
+# names. Printing an empty line instead would send an empty password to sshd,
+# and every such attempt counts toward the fail2ban jail on the host.
+[ -n "${DEVBOX_GATE_PASSWORD:-}" ] || exit 1
+printf '%s\n' "$DEVBOX_GATE_PASSWORD"

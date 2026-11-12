@@ -1,0 +1,48 @@
+# The version must equal VERSION; tests/test-version-agreement.sh checks it.
+# The distribution carries the client half only: client/, lib/, the RunPod
+# and Hetzner runtimes under server/bin/ and VERSION.
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devbox-client"
+version = "1.1.0"
+description = "Run a project's verify gate in a workspace on a remote host."
+readme = "README.md"
+license = "MIT"
+# The distribution name is `devbox-client` because `devbox` is Jetify's Nix tool. The
+# name of the INSTALLED COMMAND stays `devbox`, because that is what a project's gate
+# guard looks for in .venv/bin.
+keywords = ["devbox", "remote", "verify", "gate", "ssh", "rsync"]
+# This package contains no python logic beyond a six-line launcher, so the floor is the
+# oldest interpreter that launcher's syntax runs on rather than a claim about features.
+# The real dependency is bash, and no python version can express that.
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/launchwrighthq/devbox-client"
+Issues = "https://github.com/launchwrighthq/devbox-client/issues"
+
+# A bash program is not a python entry point, so the console script is the shim in
+# packaging/python/devbox_client. It is what puts an executable `devbox` in .venv/bin.
+[project.scripts]
+devbox = "devbox_client:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["packaging/python/devbox_client"]
+
+# The payload is mapped into the wheel from its one place in the tree. It is not copied
+# into packaging/python/ first, so there is no second copy in the repository to drift.
+# The paths put every executable two levels below the payload root, which is where each
+# of them resolves lib/devbox-lib.sh.
+[tool.hatch.build.targets.wheel.force-include]
+"client" = "devbox_client/client"
+"server" = "devbox_client/server"
+"lib" = "devbox_client/lib"
+"VERSION" = "devbox_client/VERSION"
+
+[tool.hatch.build.targets.sdist]
+include = ["client", "server", "lib", "tests", "packaging", "VERSION", "README.md", "LICENSE"]

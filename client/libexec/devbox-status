@@ -1,0 +1,1651 @@
+#!/bin/bash
+# Show what every deployed target is doing: its pool, every gate it runs, every
+# gate that waits, and which of them are this laptop's, then every rental of
+# this laptop and about what it has cost.
+#
+# Usage: devbox status [--watch] [--interval <seconds>] [--target <name>]
+#
+# A developer who waited on a gate had three sources, and none of them said
+# where their gate was: verify's own `==> waiting` line covers one run on one
+# target, `devbox doctor` prints the grants with no owner and no queue, and
+# nothing printed the queue at all. This command asks each target one `status`
+# verb, in parallel, and prints one block per target.
+#
+# Status is read-only. It takes no lock, creates no workspace, writes no
+# affinity record, starts no rental, deletes none and changes no rental
+# record. The one thing it writes is the
+# unreachable cache, because a target that did not answer is
+# a fact the next verify can use. It never reads that cache, so a target that
+# is back shows as back. The one thing it removes is the run file of a run on
+# this laptop that is gone: a run killed with SIGKILL runs no
+# EXIT trap, and its file would show a run that no longer exists.
+set -euo pipefail
+
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox status: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-config
+source "$_here/devbox-config"
+# shellcheck source=client/libexec/devbox-transport
+source "$_here/devbox-transport"
+# shellcheck source=client/libexec/devbox-targets
+source "$_here/devbox-targets"
+# The provider HTTP request and the RunPod name rule. Then
+# devbox-hetzner, which defines functions and runs nothing when sourced: the
+# Hetzner name rule, its API call, and hetzner_use, which points the transport
+# at the rented server as verify does.
+# shellcheck source=client/libexec/devbox-rented
+source "$_here/devbox-rented"
+# shellcheck source=client/libexec/devbox-hetzner
+source "$_here/devbox-hetzner"
+DEVBOX_GUARD_WHO="devbox status"
+
+USAGE="usage: devbox status [--watch] [--interval <seconds>] [--target <name>]"
+usage_error() {
+  echo "devbox status: $*" >&2
+  echo "$USAGE" >&2
+  exit 2
+}
+
+# ── the options ──────────────────────────────────────────────────────────────
+WATCH=0
+INTERVAL=""
+ONLY=""
+ONLY_GIVEN=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --watch) WATCH=1; shift ;;
+    --interval)
+      [ "$#" -ge 2 ] || usage_error "--interval needs a number of seconds"
+      INTERVAL="$2"; shift 2 ;;
+    --interval=*) INTERVAL="${1#--interval=}"; shift ;;
+    --target)
+      [ "$#" -ge 2 ] || usage_error "--target needs a target name"
+      ONLY="$2"; ONLY_GIVEN=1; shift 2 ;;
+    --target=*) ONLY="${1#--target=}"; ONLY_GIVEN=1; shift ;;
+    -h|--help) echo "$USAGE"; exit 0 ;;
+    *) usage_error "unknown option: $1" ;;
+  esac
+done
+if [ -n "$INTERVAL" ] || [ "$WATCH" = 1 ]; then
+  if [ -n "$INTERVAL" ] && [ "$WATCH" = 0 ]; then
+    usage_error "--interval needs --watch: the view without --watch is printed once"
+  fi
+  # The floor keeps a typo of `--interval 0` from turning every laptop in
+  # watch mode into a busy loop against the pool lock of every host. Four
+  # digits at most, so the number stays a number in bash.
+  if [ -n "$INTERVAL" ] && { ! [[ "$INTERVAL" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$INTERVAL" -lt 2 ]; }; then
+    usage_error "--interval is '$INTERVAL': write a whole number of seconds, at least 2"
+  fi
+  [ -t 1 ] || usage_error "--watch needs a terminal: without one, run devbox status once and read its output"
+  INTERVAL="${INTERVAL:-3}"
+  # The view redraws in place: cursor home, each line, clear to the end of the
+  # screen. A terminal with no cursor movement (TERM=dumb) would print every
+  # frame under the last one, four times a second.
+  T_HOME="$(tput home 2>/dev/null)" || T_HOME=""
+  T_EL="$(tput el 2>/dev/null)" || T_EL=""
+  T_ED="$(tput ed 2>/dev/null)" || T_ED=""
+  if [ -z "$T_HOME" ] || [ -z "$T_EL" ] || [ -z "$T_ED" ]; then
+    usage_error "--watch needs a terminal that can move its cursor, and TERM=${TERM:-} cannot: run devbox status once"
+  fi
+  # For tests: draw this many frames, then leave as q leaves.
+  FRAMES="${DEVBOX_STATUS_FRAMES:-}"
+  [ -z "$FRAMES" ] || [[ "$FRAMES" =~ ^[1-9][0-9]{0,5}$ ]] \
+    || usage_error "DEVBOX_STATUS_FRAMES is '$FRAMES': write a whole number of frames, at least 1"
+  # An unreachable target is asked again after this many seconds. The
+  # environment may set fewer, which is how the test proves the retry.
+  RETRY_SECONDS="${DEVBOX_STATUS_RETRY_SECONDS:-30}"
+  [[ "$RETRY_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] \
+    || usage_error "DEVBOX_STATUS_RETRY_SECONDS is '$RETRY_SECONDS': write a whole number of seconds, at least 1"
+  # One master per target for the whole session. It must
+  # outlive the gap between two refreshes, or the next refresh opens a new one
+  # and sends the gate password again.
+  # shellcheck disable=SC2034  # read by devbox_gate_target in devbox-transport
+  GATE_CONTROL_PERSIST=$((INTERVAL + 60))
+fi
+[ "$ONLY_GIVEN" = 0 ] || [ -n "$ONLY" ] || usage_error "--target needs a target name"
+
+# ── the checkout and its .devbox.env ─────────────────────────────────────────
+#
+# Read with the loader devbox verify uses: a linked worktree
+# borrows the main checkout's file, and DEVBOX_STRICT=1 lets the environment
+# win over it, so a strict caller sees the targets its verify would use.
+NO_TARGET="no target to show: set DEVBOX_TARGETS or DEVBOX_RENT in .devbox.env"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+[ -n "$ROOT" ] || {
+  echo "devbox status: not inside a git checkout. Run it in the checkout whose .devbox.env names the targets." >&2
+  exit 2
+}
+DEVBOX_ENV="$(devbox_env_find "$ROOT")" || {
+  echo "devbox status: $NO_TARGET (there is no .devbox.env in $ROOT or beside its main checkout)" >&2
+  exit 2
+}
+DEVBOX_ENV_KEEP=()
+[ "${DEVBOX_STRICT:-}" != 1 ] || devbox_env_keep_from_environment
+devbox_env_load "$DEVBOX_ENV" keyless-rent || exit 2
+
+# A provider shows when DEVBOX_RENT names it or when the file sets its key:
+# a rental costs money, so a provider the configuration knows
+# is never left out of the view in silence.
+PROVIDERS=()
+for p in ${DEVBOX_RENTED[@]+"${DEVBOX_RENTED[@]}"}; do PROVIDERS+=("$p"); done
+case " ${PROVIDERS[*]-} " in *" runpod "*) ;; *) [ -z "${RUNPOD_KEY:-}" ] || PROVIDERS+=(runpod) ;; esac
+case " ${PROVIDERS[*]-} " in *" hetzner "*) ;; *) [ -z "${HCLOUD_TOKEN:-}" ] || PROVIDERS+=(hetzner) ;; esac
+if [ "${#DEVBOX_DEPLOYED[@]}" -eq 0 ] && [ "${#PROVIDERS[@]}" -eq 0 ]; then
+  echo "devbox status: $NO_TARGET ($DEVBOX_ENV names neither)" >&2
+  exit 2
+fi
+
+SHOWN=(${DEVBOX_DEPLOYED[@]+"${DEVBOX_DEPLOYED[@]}"})
+if [ "$ONLY_GIVEN" = 1 ]; then
+  case "$ONLY" in
+    # A provider the file does not name still gets its block, which then says
+    # it has no key: the developer asked for that provider by name.
+    runpod|hetzner) SHOWN=(); PROVIDERS=("$ONLY") ;;
+    *)
+      case " ${DEVBOX_DEPLOYED[*]-} " in
+        *" $ONLY "*) SHOWN=("$ONLY"); PROVIDERS=() ;;
+        *) echo "devbox status: no target named $ONLY in DEVBOX_TARGETS of $DEVBOX_ENV" >&2; exit 2 ;;
+      esac ;;
+  esac
+fi
+# How long a pod has to answer its idle state. The
+# environment may set less, which is how a test proves the line of a pod that
+# does not answer without waiting 10 seconds.
+POD_SECONDS="${DEVBOX_STATUS_POD_SECONDS:-10}"
+[[ "$POD_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] \
+  || usage_error "DEVBOX_STATUS_POD_SECONDS is '$POD_SECONDS': write a whole number of seconds from 1 to 999"
+
+# Every address is checked before anything is sent to any target, so a typo in
+# the third is refused by name rather than shown as a host that does not answer.
+for name in ${SHOWN[@]+"${SHOWN[@]}"}; do
+  devbox_target_use "$name" || exit 2
+done
+if [ "${#SHOWN[@]}" -gt 0 ]; then
+  devbox_probe_limits_ok || exit 2
+fi
+MACHINE_ID="$(devbox_machine_id)" || exit 2
+PRIV="$(devbox_gate_private_dir)" || exit 2
+WORK="$(mktemp -d "$PRIV/status.XXXXXX")" || { echo "devbox status: cannot create a directory in $PRIV" >&2; exit 2; }
+# Every target's master ends with this run, not 60 seconds after it.
+trap 'devbox_targets_close_all; rm -rf "$WORK"' EXIT
+
+# The rented Hetzner server runs the full server half, so
+# once it is ready it is a target, at DEVBOX_TARGET_HETZNER, as verify reaches
+# it. hetzner_use sets that address, the pin and the server's own gate
+# password from this worktree's record. The record is read and never written:
+# its known_hosts file goes to this run's private dir. The server gets the
+# status verb only after the API says it runs, so a server that deleted
+# itself is a billing row and not an unreachable target.
+HZ_TARGET=0
+HZ_SELF=""
+HZ_RUNNING=0
+case " ${PROVIDERS[*]-} " in *" hetzner "*)
+  if [[ "${HCLOUD_TOKEN:-}" =~ ^[A-Za-z0-9]{1,256}$ ]] && command -v jq >/dev/null 2>&1 \
+     && command -v ssh-keygen >/dev/null 2>&1; then
+    HZ_STATE="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)/devbox-hetzner"
+    if hetzner_live && hetzner_use "$WORK/hetzner.known_hosts" 2>/dev/null; then
+      HZ_TARGET=1
+      HZ_SELF="$HZ_STATE"
+    fi
+  fi ;;
+esac
+if [ "${#SHOWN[@]}" -eq 0 ] && [ "$HZ_TARGET" = 1 ]; then
+  devbox_probe_limits_ok || exit 2
+fi
+
+# ── asking every target ──────────────────────────────────────────────────────
+#
+# One background job per target, each writing one file: a first line that says
+# what happened, then the reply when there is one.
+#
+#   reply                    the status verb answered; the reply follows
+#   unreachable <reason>     the master did not open
+#   refused                  the gate password was refused
+#   hostkey <message>        the host key is not the pinned one
+#   slow                     the master opened and the verb did not finish
+#   incomplete               the host's own limit cut the verb (exit 124)
+#   noverb                   the verb answered nothing; the `version` answer follows
+#
+# The limits are the probe's: a 3-second connect, 10 seconds
+# for the master open, and DEVBOX_PROBE_ANSWER_SECONDS (25) for the verb.
+status_one() (
+  set +e
+  local name="$1" now rc reply
+  # shellcheck disable=SC2034  # read by devbox_gate_target in devbox-transport
+  GATE_CONNECT_TIMEOUT="$DEVBOX_PROBE_CONNECT_TIMEOUT"
+  # shellcheck disable=SC2034  # read by _gate_limit in devbox-transport; this subshell's value only
+  GATE_TIME_LIMIT="$DEVBOX_PROBE_OPEN_SECONDS"
+  now="$(date +%s)"
+  devbox_target_use "$name" 2>/dev/null || { echo "unreachable its address is not an address"; exit 0; }
+  rc=0
+  devbox_gate_open 2>/dev/null || rc=$?
+  case "$rc" in
+    0) devbox_unreachable_clear "$GATE_PRIV" "$name" ;;
+    3) echo "refused"; exit 0 ;;
+    4) echo "hostkey $GATE_OPEN_ERROR"; exit 0 ;;
+    *)
+      devbox_unreachable_set "$GATE_PRIV" "$name" "$TARGET_ADDR" "$now"
+      case "$GATE_OPEN_ERROR" in
+        *"timed out"*) echo "unreachable no answer in ${DEVBOX_PROBE_CONNECT_TIMEOUT}s" ;;
+        *) echo "unreachable $GATE_OPEN_ERROR" ;;
+      esac
+      exit 0 ;;
+  esac
+  # shellcheck disable=SC2034  # read by _gate_limit in devbox-transport; this subshell's value only
+  GATE_TIME_LIMIT="$DEVBOX_PROBE_ANSWER_SECONDS"
+  rc=0
+  local asked="$SECONDS"
+  reply="$(devbox_gate status "$MACHINE_ID" 2>/dev/null)" || rc=$?
+  # gate-root runs the runner under `timeout 20`, and ssh hands its 124 back
+  # here. Read as this client's own 25-second limit, it printed "no answer to
+  # status in 25s" after 20 seconds and wrote the unreachable cache for a
+  # target that answered, so the next verify skipped it and could rent a paid
+  # server. A 124 that came before this client's limit is the host's own cut.
+  if [ "$rc" -eq 124 ] && [ $((SECONDS - asked)) -lt "$DEVBOX_PROBE_ANSWER_SECONDS" ]; then
+    echo "incomplete"; exit 0
+  fi
+  # The cache is written as the probe writes it, so the next verify skips a
+  # target that this run found silent, and only for 60 seconds.
+  if _gate_limit_hit "$rc"; then
+    devbox_unreachable_set "$GATE_PRIV" "$name" "$TARGET_ADDR" "$now"
+    echo "slow"; exit 0
+  elif [ "$rc" -eq 255 ]; then
+    devbox_unreachable_set "$GATE_PRIV" "$name" "$TARGET_ADDR" "$now"
+    echo "unreachable the connection failed during status"; exit 0
+  fi
+  if [ -z "$reply" ]; then
+    # A host on protocol 6 refuses `status` as an unknown verb and prints
+    # nothing. Its `version` answer names the protocol it
+    # runs, so the line can say which deploy is due.
+    echo "noverb"
+    devbox_gate version 2>/dev/null | head -1
+    exit 0
+  fi
+  echo "reply"
+  printf '%s\n' "$reply"
+  exit 0
+)
+
+# ── rendering ────────────────────────────────────────────────────────────────
+#
+# The view has two parts: one line per target, with a bar for each limit, and
+# one table of every gate on every target and every run on this laptop. The
+# view it replaces printed one block per server and a block of this laptop's
+# runs above them, so one gate showed in two places under two names, and a
+# developer read three blocks to learn where their gate stood in line.
+#
+# Colour only on a terminal, never with NO_COLOR set or TERM=dumb. Every
+# state is also a word, so the view reads the same in a log.
+COLOR=0
+if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ -n "${TERM:-}" ] && [ "$TERM" != dumb ]; then
+  COLOR=1
+fi
+# $1 green, yellow, red, bold, dim or nothing, then the text. In PAINTED, so
+# a table of many cells costs no subshell per cell.
+paint_to() {
+  local code=""
+  case "$1" in green) code=32 ;; yellow) code=33 ;; red) code=31 ;; bold) code=1 ;; dim) code=2 ;; esac
+  if [ "$COLOR" = 1 ] && [ -n "$code" ]; then PAINTED=$'\033['"$code"m"$2"$'\033[0m'; else PAINTED="$2"; fi
+}
+paint() { paint_to "$1" "${*:2}"; printf '%s' "$PAINTED"; }
+
+# The bars and the marks: block characters where the locale's charmap is
+# UTF-8, ASCII elsewhere, as the watch spinner chooses its frames.
+BAR_W=8
+CHARMAP="$(locale charmap 2>/dev/null)" || CHARMAP=""
+if [ "$CHARMAP" = UTF-8 ]; then
+  BAR_ON='█'; BAR_OFF='░'; MARK='▶'; ELLIPSIS='…'
+else
+  BAR_ON='#'; BAR_OFF='.'; MARK='>'; ELLIPSIS='~'
+fi
+
+# A clock reading: 50s, 6m12s, 1h02m, 3d2h. For a time that has passed.
+dur_clock() {
+  local s="$1"
+  [ "$s" -ge 0 ] || s=0
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%dm%02ds' $((s / 60)) $((s % 60))
+  elif [ "$s" -lt 86400 ]; then printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  else printf '%dd%dh' $((s / 86400)) $((s % 86400 / 3600)); fi
+}
+# An estimate or a limit, to the nearest minute: 40s, 3m, 60m, 1h56m, 3d2h.
+dur_about() {
+  local s="$1" m
+  [ "$s" -ge 0 ] || s=0
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"; return; fi
+  m=$(((s + 30) / 60))
+  if [ "$m" -le 60 ]; then printf '%dm' "$m"
+  elif [ "$s" -lt 86400 ]; then printf '%dh%02dm' $((m / 60)) $((m % 60))
+  else printf '%dd%dh' $((s / 86400)) $((s % 86400 / 3600)); fi
+}
+# Bytes as 512M, 7.1G, 30G: one decimal below 10 of a unit, none above.
+human_bytes() {
+  local b="$1" unit=1 suffix=B tenths
+  case "$b" in ""|*[!0-9]*) printf '%s' "${b:--}"; return ;; esac
+  for suffix in K M G T; do
+    unit=$((unit * 1024))
+    if [ "$suffix" = T ] || [ "$b" -lt $((unit * 1024)) ]; then break; fi
+  done
+  if [ "$b" -lt 1024 ]; then printf '%dB' "$b"; return; fi
+  tenths=$(((b * 10 + unit / 2) / unit))
+  if [ "$tenths" -lt 100 ]; then printf '%d.%d%s' $((tenths / 10)) $((tenths % 10)) "$suffix"
+  else printf '%d%s' $(((b + unit / 2) / unit)) "$suffix"; fi
+}
+isnum() { [[ "${1-}" =~ ^[0-9]+$ ]]; }
+# $1 with every character that is not printable removed. A host writes the
+# `version` answer and the ssh error text this view prints, and an ESC or BEL in
+# either is a terminal control sequence: a hostile or broken host could retitle,
+# clear or recolour the developer's terminal. Every host-written line passes here before it is printed or
+# interpolated. The status reply is cleaned by devbox_status_parse.
+printable() { local s="${1-}"; printf '%s' "${s//[^[:print:]]/}"; }
+
+# A gate's name in the table is <repository>/<worktree>, or the repository
+# alone for its main checkout. The worktree's directory name alone was not
+# enough: several repositories each had a worktree named for the same
+# release, and the view printed the same name once per repository. The name comes from the worktree
+# path in this laptop's run file, or, for this repository, from its worktree
+# list, whose slugs are computed as devbox verify computes them: the physical
+# toplevel, the worktree's own DEVBOX_PROJECT, this machine's label and id. A
+# gate of this laptop that neither source names shows its slug.
+#
+# The gates of the repository this command runs in are marked: a developer who
+# asks from a checkout looks for that checkout's gates first.
+declare -A PATH_NAME=() PATH_PROJ=() SLUG_NAME=() SLUG_PROJ=()
+PROJECT_COMMON="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || PROJECT_COMMON=""
+PT_NAME=""
+PT_PROJ=0
+# $1 a worktree path. Sets PT_NAME, and PT_PROJ to 1 when the worktree belongs
+# to this repository. git is asked once per path for the whole run, so a watch
+# does not fork git for each run at every refresh.
+path_task() {
+  local p="$1" common main="" repo
+  if [ -n "${PATH_NAME[$p]+x}" ]; then
+    PT_NAME="${PATH_NAME[$p]}"; PT_PROJ="${PATH_PROJ[$p]}"; return 0
+  fi
+  PT_NAME="${p##*/}"; PT_PROJ=0
+  if common="$(git -C "$p" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && [ -n "$common" ]; then
+    case "$common" in
+      */.git) main="${common%/.git}"; repo="${main##*/}" ;;
+      *) repo="${common##*/}"; repo="${repo%.git}" ;;
+    esac
+    if [ "$p" = "$main" ]; then PT_NAME="$repo"; else PT_NAME="$repo/${p##*/}"; fi
+    [ "$common" != "$PROJECT_COMMON" ] || PT_PROJ=1
+  fi
+  PATH_NAME[$p]="$PT_NAME"; PATH_PROJ[$p]="$PT_PROJ"
+}
+build_project_names() {
+  local label line path top project slug
+  label="$(devbox_machine_label 2>/dev/null)" || return 0
+  while IFS= read -r line; do
+    case "$line" in "worktree "*) path="${line#worktree }" ;; *) continue ;; esac
+    [ -d "$path" ] || continue
+    top="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || continue
+    project="$(cd "$top" && devbox_config_parse .devbox/config.env >/dev/null 2>&1 && printf '%s' "$DEVBOX_PROJECT")" || continue
+    slug="$(devbox_slug "$label" "$MACHINE_ID" "$project" "$top" 2>/dev/null)" || continue
+    path_task "$top"
+    SLUG_NAME[$slug]="$PT_NAME"
+    SLUG_PROJ[$slug]=1
+  done < <(git -C "$ROOT" worktree list --porcelain 2>/dev/null)
+}
+
+# Fields of one line, two spaces apart.
+join_fields() {
+  local out="" f
+  for f in "$@"; do out="${out:+$out  }$f"; done
+  printf '%s' "$out"
+}
+
+RC=0
+note_rc() { [ "$RC" -ne 0 ] || RC="$1"; }
+
+# Name column of the target lines, wide enough for every name in the view.
+COL=10
+for name in ${SHOWN[@]+"${SHOWN[@]}"} ${PROVIDERS[@]+"${PROVIDERS[@]}"}; do
+  [ "$((${#name} + 2))" -le "$COL" ] || COL=$((${#name} + 2))
+done
+target_line() {  # $1 the name, $2 the rest, already painted
+  printf '%-*s%s\n' "$COL" "$1" "$2"
+}
+# Each target's place in the target order, the rented Hetzner server last: the
+# table keeps that order within each of its groups.
+declare -A TIDX=()
+for name in ${SHOWN[@]+"${SHOWN[@]}"}; do TIDX[$name]=$((${#TIDX[@]} + 1)); done
+[ -n "${TIDX[hetzner]+x}" ] || TIDX[hetzner]=$((${#TIDX[@]} + 1))
+# render_target fills these: the target line, or the failure line that takes
+# its place, and the table rows of that target.
+SRV_TEXT=""
+ROW_TEXT=""
+# A failure line, in place of the target line.
+fail_line() {  # $1 the name, $2 the exit code, $3 the text
+  SRV_TEXT+="$(target_line "$1" "$(paint red "$3")")"$'\n'
+  note_rc "$2"
+}
+
+# The line for a host whose handshake failed, all exit 5. $1
+# the verdict's code, $2 its text, $3 the protocol the host reported.
+deploy_line() {
+  local name="$1" vrc="$2" verdict="$3" proto="$4"
+  case "$vrc" in
+    1) fail_line "$name" 5 "$verdict. Reinstall or update the devbox client on this machine." ;;
+    6) fail_line "$name" 5 "protocol $proto, this client speaks $DEVBOX_PROTOCOL_VERSION: deploy is due" ;;
+    *) fail_line "$name" 5 "$verdict: deploy is due" ;;
+  esac
+}
+
+# One gauge of a target line, in GAUGE: the label, BAR_W cells of which $2 are
+# filled, and the value, padded to $5 so the next gauge starts in the same
+# column on every target line. $4 the colour of the bar and the value.
+gauge() {
+  local label="$1" n="$2" val="$3" col="$4" pad j bar=""
+  [ "$n" -le "$BAR_W" ] || n="$BAR_W"
+  for ((j = 0; j < BAR_W; j++)); do
+    if [ "$j" -lt "$n" ]; then bar+="$BAR_ON"; else bar+="$BAR_OFF"; fi
+  done
+  pad=$(($5 - ${#val}))
+  [ "$pad" -ge 0 ] || pad=0
+  paint_to "$col" "$bar $val"
+  printf -v GAUGE '%s %s%*s' "$label" "$PAINTED" "$pad" ''
+}
+# The filled cells for $1 of $2, rounded, and at least one for any use above 0,
+# so a server that does a little never reads as one that does nothing.
+cells() {
+  local n=$((($1 * BAR_W * 2 + $2) / ($2 * 2)))
+  [ "$n" -gt 0 ] || [ "$1" -eq 0 ] || n=1
+  printf '%s' "$n"
+}
+
+# The target line, from the parsed reply.
+#
+# `tokens` is a reservation and `load` a measurement, side by side
+# (docs/pool.md section 1.1): a host can have every token reserved while its
+# load is low, and a load far above its core count with tokens to spare. The
+# two bars show both.
+render_host() {
+  local name="$1" hw hcol="" reason="" line col n used pct disp lv tok load mem jobs
+  case "$STATUS_HEALTH" in
+    ok)
+      # 90 seconds is the age at which verify skips the target, because the
+      # watchdog that writes the line every 30 seconds is not running.
+      if isnum "$STATUS_HEALTH_AGE" && [ "$STATUS_HEALTH_AGE" -le "$DEVBOX_HEALTH_STALE_SECONDS" ]; then
+        hw=ok; hcol=green
+      else
+        hw=stale; hcol=yellow
+      fi ;;
+    degraded) hw=degraded; hcol=yellow; reason="$STATUS_HEALTH_REASON" ;;
+    down) hw=down; hcol=red; reason="$STATUS_HEALTH_REASON" ;;
+    missing) hw=unknown; hcol=yellow; reason="no health record" ;;
+    *) hw=unknown; hcol=yellow; reason="unreadable health record" ;;
+  esac
+  paint_to "$hcol" "$hw"
+  printf -v line '%-*s%s%*s' "$COL" "$name" "$PAINTED" $((10 - ${#hw})) ''
+  # A full pool queues the next gate, whatever the load.
+  col=""
+  if isnum "$STATUS_HELD" && isnum "$STATUS_TOTAL" && [ "$STATUS_TOTAL" -gt 0 ]; then
+    n="$(cells "$STATUS_HELD" "$STATUS_TOTAL")"
+    [ "$STATUS_HELD" -lt "$STATUS_TOTAL" ] || col=yellow
+  else
+    n=0
+  fi
+  gauge tokens "$n" "$STATUS_HELD/$STATUS_TOTAL" "$col" 7; tok="$GAUGE"
+  # The load average is a decimal, so awk reads it, in the C locale for the
+  # reason rent_price gives. Red at or above the core count, yellow from 3/4.
+  read -r disp n lv < <(LC_ALL=C awk -v l="$STATUS_LOAD1" -v c="$STATUS_CORES" -v w="$BAR_W" 'BEGIN {
+      if (l !~ /^[0-9]+(\.[0-9]+)?$/ || c !~ /^[1-9][0-9]*$/) { print "- 0 0"; exit }
+      d = (l < 10) ? sprintf("%.1f", l) : sprintf("%d", l + 0.5)
+      n = int(l * w / c + 0.5); if (n == 0 && l > 0) n = 1
+      printf "%s/%s %d %d\n", d, c, n, (l >= c) ? 2 : ((l >= 0.75 * c) ? 1 : 0) }')
+  case "$lv" in 2) col=red ;; 1) col=yellow ;; *) col="" ;; esac
+  gauge load "${n:-0}" "${disp:--}" "$col" 7; load="$GAUGE"
+  # Memory in use is the total minus what the kernel calls available.
+  col=""
+  if isnum "$STATUS_MEM_AVAIL" && isnum "$STATUS_MEM_TOTAL" && [ "$STATUS_MEM_TOTAL" -gt 0 ]; then
+    used=$((STATUS_MEM_TOTAL - STATUS_MEM_AVAIL))
+    [ "$used" -ge 0 ] || used=0
+    n="$(cells "$used" "$STATUS_MEM_TOTAL")"
+    pct=$((used * 100 / STATUS_MEM_TOTAL))
+    if [ "$pct" -ge 90 ]; then col=red; elif [ "$pct" -ge 75 ]; then col=yellow; fi
+    gauge mem "$n" "$(human_bytes "$used")/$(human_bytes "$STATUS_MEM_TOTAL")" "$col" 9
+  else
+    gauge mem 0 "-" "" 9
+  fi
+  mem="$GAUGE"
+  # The jobs limit queues a gate even with tokens free.
+  col=""
+  if isnum "$STATUS_JOBS" && isnum "$STATUS_MAX_JOBS" && [ "$STATUS_JOBS" -ge "$STATUS_MAX_JOBS" ]; then col=yellow; fi
+  paint_to "$col" "$STATUS_JOBS/$STATUS_MAX_JOBS"
+  jobs="jobs $PAINTED"
+  line+="$tok  $load  $mem  $jobs"
+  if [ -n "$reason" ]; then paint_to "$hcol" "$reason"; line+="  $PAINTED"; fi
+  SRV_TEXT+="$line"$'\n'
+}
+
+# ── the task table ───────────────────────────────────────────────────────────
+#
+# One record per row, fields joined by the unit separator, which no host field
+# holds: devbox_status_parse removes every character that is not printable.
+# A tab would not do: read folds two tabs into one, and an empty field would
+# shift every field after it.
+#
+#   group  1 running, 2 queued, 3 on this laptop, 4 lost
+#   place  the target's place in the target order, 0 for this laptop
+#   key1 key2  the order within the group
+#   owner  me or other
+#   slug   the slug of a gate of this laptop, or -
+#   name   the name, when the row knows it; else the slug's name at render
+#   state, its colour, target, tokens, time, left, its colour, cores, memory,
+#   note, its colour
+US=$'\037'
+ROW_ACC=""
+add_row() { local IFS="$US"; ROW_ACC+="$*"$'\n'; }
+
+# Every duration is the HOST's epoch minus a host epoch, so a
+# laptop clock that is off changes nothing.
+run_row() {  # $1 the run's index, $2 the target, $3 its place
+  local i="$1" owner slug elapsed="" median left="" lcol="" note="" ncol="" state=running scol=green
+  local cpu="-" mem="-" mx t rem k1=0 f time="-"
+  owner="${STATUS_RUN_OWNER[i]}"; slug="${STATUS_RUN_SLUG[i]}"
+  if isnum "${STATUS_RUN_GRANTED[i]}" && isnum "$STATUS_EPOCH"; then
+    k1="${STATUS_RUN_GRANTED[i]}"
+    elapsed=$((STATUS_EPOCH - STATUS_RUN_GRANTED[i]))
+    [ "$elapsed" -ge 0 ] || elapsed=0
+    time="$(dur_clock "$elapsed")"
+  fi
+  if [ "${STATUS_RUN_STATE[i]}" = stopping ]; then
+    # The watchdog stopped it and the grant is not yet returned: an estimate
+    # or a watchdog limit would describe a run that is ending, so the row
+    # holds its run time and the stop reason alone.
+    state=stopping; scol=red
+    note="${STATUS_RUN_REASON[i]:-no reason recorded}"; ncol=red
+  else
+    median="${STATUS_RUN_MEDIAN[i]}"
+    # The median is the only duration the pool records, so the estimate keeps
+    # its `~`, and a run past it says by how much rather than show a time
+    # below zero.
+    if ! isnum "$median" || ! isnum "${STATUS_RUN_SAMPLES[i]}" || [ "${STATUS_RUN_SAMPLES[i]}" -eq 0 ]; then
+      left="-"
+    elif [ -z "$elapsed" ]; then
+      left="usually $(dur_about "$median")"
+    elif [ "$elapsed" -lt "$median" ]; then
+      left="~$(dur_about $((median - elapsed)))"
+    else
+      left="$(dur_about $((elapsed - median))) over"; lcol=yellow
+    fi
+    # The wall-clock limit, for this laptop's own runs alone, and only in its
+    # last 10 minutes: printed on every run, it doubled the lines of the view.
+    # Red within 5 minutes of it, when the stop is close enough to act on.
+    if [ "$owner" = me ] && [ -n "$elapsed" ] && isnum "${STATUS_RUN_MAX[i]}" && [ "${STATUS_RUN_MAX[i]}" -gt 0 ]; then
+      rem=$((STATUS_RUN_MAX[i] - elapsed))
+      if [ "$rem" -lt 600 ]; then
+        if [ "$rem" -gt 0 ]; then note="the watchdog stops it in $(dur_about "$rem")"; else note="the watchdog stops it now"; fi
+        if [ "$rem" -lt 300 ]; then ncol=red; else ncol=yellow; fi
+      fi
+    fi
+  fi
+  # Percent of one core, shown as cores: 1830% is 18.3 cores.
+  if isnum "${STATUS_RUN_CPU[i]}"; then
+    t=$(((STATUS_RUN_CPU[i] + 5) / 10))
+    cpu="$((t / 10)).$((t % 10))"
+  fi
+  mx="${STATUS_RUN_MEM_MAX[i]}"
+  if isnum "${STATUS_RUN_MEM[i]}"; then
+    mem="$(human_bytes "${STATUS_RUN_MEM[i]}")"
+    ! isnum "$mx" || mem+="/$(human_bytes "$mx")"
+  fi
+  if isnum "${STATUS_RUN_OOM[i]}" && [ "${STATUS_RUN_OOM[i]}" -gt 0 ]; then
+    f="${STATUS_RUN_OOM[i]} OOM kill"
+    [ "${STATUS_RUN_OOM[i]}" -eq 1 ] || f="${f}s"
+    note="${note:+$note, }$f"; ncol=red
+  fi
+  add_row 1 "$3" "$k1" "$i" "$owner" "${slug:--}" "" "$state" "$scol" "$2" "${STATUS_RUN_TOKENS[i]}" \
+    "$time" "$left" "$lcol" "$cpu" "$mem" "$note" "$ncol"
+}
+
+ticket_row() {  # $1 the ticket's index, $2 the target, $3 its place
+  local i="$1" state=queued pos=999999 time="-" tok left
+  if isnum "${STATUS_TICKET_POS[i]}"; then pos="${STATUS_TICKET_POS[i]}"; state="queued #$pos"; fi
+  if isnum "${STATUS_TICKET_QUEUED[i]}" && isnum "$STATUS_EPOCH"; then
+    time="$(dur_clock $((STATUS_EPOCH - STATUS_TICKET_QUEUED[i])))"
+  fi
+  tok="${STATUS_TICKET_WANT[i]}"
+  [ "${STATUS_TICKET_MIN[i]}" = "$tok" ] || tok="${STATUS_TICKET_MIN[i]}-$tok"
+  if ! isnum "${STATUS_TICKET_START[i]}"; then
+    left="start unknown"
+  elif [ "${STATUS_TICKET_START[i]}" -eq 0 ]; then
+    left="starts now"
+  else
+    left="starts ~$(dur_about "${STATUS_TICKET_START[i]}")"
+  fi
+  add_row 2 "$3" "$pos" "$i" "${STATUS_TICKET_OWNER[i]}" "${STATUS_TICKET_SLUG[i]:--}" "" "$state" yellow "$2" \
+    "$tok" "$time" "$left" "" "" "" "" ""
+}
+
+# The slugs of this laptop's gates in each target's answer, as " <slug> <slug> ",
+# or empty for a server whose answer the view could not use: a failed call, an
+# incomplete reply, a host on another protocol. Unset until the first answer.
+declare -A JOIN=()
+
+render_target() {  # $1 the target, $2 the file its status job wrote, $3 its place in the target order
+  local name="$1" file="$2" head kind rest reply prc vrc verdict ver i mine=" "
+  SRV_TEXT=""
+  ROW_TEXT=""
+  JOIN[$name]=""
+  head=""
+  if [ -r "$file" ]; then IFS= read -r head <"$file" || true; fi
+  head="$(printable "$head")"
+  kind="${head%% *}"
+  rest="${head#"$kind"}"; rest="${rest# }"
+  case "$kind" in
+    unreachable) fail_line "$name" 3 "unreachable ($rest)"; return ;;
+    slow) fail_line "$name" 3 "no answer to status in ${DEVBOX_PROBE_ANSWER_SECONDS}s"; return ;;
+    incomplete) fail_line "$name" 3 "incomplete answer"; return ;;
+    refused) fail_line "$name" 3 "the gate password was refused"; return ;;
+    hostkey)
+      fail_line "$name" 3 "host key changed"
+      # The repair is a command, so it is printed in full under the line.
+      printf -v rest '%*s%s' "$COL" '' "$rest"
+      SRV_TEXT+="$rest"$'\n'
+      return ;;
+    noverb)
+      ver="$(printable "$(sed -n 2p "$file")")"
+      vrc=0
+      verdict="$(devbox_handshake_verdict "$ver" "$DEVBOX_LIB")" || vrc=$?
+      case "$vrc" in
+        0) fail_line "$name" 5 "it refused the status verb: deploy is due" ;;
+        3) fail_line "$name" 5 "it answered neither status nor version: deploy is due" ;;
+        *) deploy_line "$name" "$vrc" "$verdict" "${ver%% *}" ;;
+      esac
+      return ;;
+    reply) ;;
+    *) fail_line "$name" 3 "no answer (its status job wrote nothing)"; return ;;
+  esac
+  reply="$(tail -n +2 "$file")"
+  prc=0
+  devbox_status_parse "$reply" || prc=$?
+  # The handshake runs on the first line before any other line is read:
+  # a host on another protocol may send other records.
+  vrc=0
+  verdict="$(devbox_handshake_verdict "${STATUS_PROTOCOL}${STATUS_LIB:+ $STATUS_LIB}" "$DEVBOX_LIB")" || vrc=$?
+  if [ "$vrc" -ne 0 ]; then
+    deploy_line "$name" "$vrc" "$verdict" "$STATUS_PROTOCOL"
+    return
+  fi
+  # A reply without `end` was cut by a timeout or a dropped connection. A
+  # table built from part of it would show a host with fewer gates than it runs.
+  case "$prc" in
+    0) ;;
+    2) fail_line "$name" 3 "incomplete answer"; return ;;
+    *) fail_line "$name" 3 "an answer this client cannot read"; return ;;
+  esac
+  render_host "$name"
+  ROW_ACC=""
+  for ((i = 0; i < STATUS_RUN_COUNT; i++)); do
+    run_row "$i" "$name" "$3"
+    [ "${STATUS_RUN_OWNER[i]}" != me ] || mine+="${STATUS_RUN_SLUG[i]} "
+  done
+  for ((i = 0; i < STATUS_TICKET_COUNT; i++)); do
+    ticket_row "$i" "$name" "$3"
+    [ "${STATUS_TICKET_OWNER[i]}" != me ] || mine+="${STATUS_TICKET_SLUG[i]} "
+  done
+  ROW_TEXT="$ROW_ACC"
+  JOIN[$name]="$mine"
+}
+
+# ── runs on this laptop ──────────────────────────────────────────────────────
+#
+# A host sees a gate only once it asks for tokens. `devbox verify` and `devbox
+# run` keep one file each in <private dir>/runs (devbox_runfile_phase in
+# devbox-transport), so the minutes of probe, rental, sync and setup before
+# that show too.
+#
+# A run in phase queued or gate is the same gate as a mine ticket or run in its
+# target's answer, joined on target and slug. It gets no row of its own, so one
+# gate never shows two clocks: the host's and this laptop's.
+#
+# A run in phase queued or gate that its target answered without is lost.
+# Verify runs once waited over an hour on connections whose far end was gone,
+# and the view showed them as gates that ran. A run gets a minute in its phase
+# first: between the queued phase and the ticket, and between the grant and
+# the end of the run, the host may hold no record of it for a moment.
+LOST_SECONDS=60
+LOCAL_ROWS=""
+
+# The rows of this laptop's runs, in LOCAL_ROWS. It also names each slug from
+# its worktree path, for the target rows. A file whose pid is gone, or whose pid
+# now belongs to another process, is removed: a run killed with SIGKILL runs no
+# EXIT trap and leaves its file. The identity test is the pool's, a start time
+# that a recycled pid cannot carry (devbox_pid_identity). With --target, only
+# the runs on that target show.
+collect_local() {
+  local dir="$PRIV/runs" f pid l1 l2 ident cur now started at phase target slug path name
+  local g state scol note ncol age
+  ROW_ACC=""
+  LOCAL_ROWS=""
+  [ -d "$dir" ] || return 0
+  printf -v now '%(%s)T' -1
+  for f in "$dir"/*; do
+    pid="${f##*/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    l1=""; l2=""
+    { IFS= read -r l1 || true; IFS= read -r l2 || true; } <"$f" 2>/dev/null || continue
+    ident=""
+    read -r ident _ <<<"$l2" || true
+    cur="$(devbox_pid_identity "$pid")" || cur=""
+    if [ -z "$cur" ] || { [ -n "$ident" ] && [ "$ident" != - ] && [ "$cur" != "$ident" ]; }; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    started=""; at=""; phase=""; target=""; slug=""; path=""
+    read -r started at phase target slug path <<<"$l1" || true
+    if [ "$ONLY_GIVEN" = 1 ] && [ "$target" != "$ONLY" ]; then continue; fi
+    if ! isnum "$started" || ! isnum "$at" || [ -z "$phase" ]; then
+      add_row 3 0 0 "$pid" me - "pid $pid" "?" yellow - "" "" "" "" "" "" "unreadable run file $f" yellow
+      continue
+    fi
+    [ -n "$target" ] || target=-
+    [ -n "$slug" ] || slug=-
+    name="$slug"
+    if [ -n "$path" ] && [ "$path" != - ]; then
+      path_task "$path"
+      name="$PT_NAME"
+      if [ "$slug" != - ]; then SLUG_NAME[$slug]="$PT_NAME"; SLUG_PROJ[$slug]="$PT_PROJ"; fi
+    fi
+    age=$((now - at))
+    [ "$age" -ge 0 ] || age=0
+    g=3; state="$phase"; scol=""; note=""; ncol=""
+    case "$phase" in
+      queued|gate)
+        if [ "$phase" = gate ]; then state=running; scol=green; else scol=yellow; fi
+        if [ -n "${JOIN[$target]-}" ]; then
+          case "${JOIN[$target]}" in *" $slug "*) continue ;; esac
+          if [ "$age" -gt "$LOST_SECONDS" ]; then
+            g=4; state=lost; scol=red; note="$target has no such gate"; ncol=red
+          fi
+        elif [ -n "${JOIN[$target]+x}" ]; then
+          note="no answer from $target"
+        fi ;;
+    esac
+    add_row "$g" 0 "$started" "$pid" me "$slug" "$name" "$state" "$scol" "$target" "" \
+      "$(dur_clock "$age")" "" "" "" "" "$note" "$ncol"
+  done
+  LOCAL_ROWS="$ROW_ACC"
+}
+
+# The table of every row record in $1, in TABLE, or nothing for no row.
+# Running gates first, then the queue in line order, then the runs on this
+# laptop that no target holds yet, then the lost ones. Within a group, the
+# targets keep their order.
+TB_LINE=""
+TB_PEND=""
+# One cell: $1 the text, $2 the column width, $3 l or r, $4 its colour. An
+# empty cell only adds to the space before the next cell, so no line ends in
+# spaces.
+tb_cell() {
+  local pad=$(($2 - ${#1}))
+  [ "$pad" -ge 0 ] || pad=0
+  if [ -z "$1" ]; then printf -v TB_PEND '%s%*s' "$TB_PEND" $(($2 + 2)) ''; return 0; fi
+  paint_to "$4" "$1"
+  if [ "$3" = r ]; then
+    printf -v TB_LINE '%s%s%*s%s' "$TB_LINE" "$TB_PEND" "$pad" '' "$PAINTED"
+    TB_PEND="  "
+  else
+    TB_LINE+="$TB_PEND$PAINTED"
+    printf -v TB_PEND '%*s' $((pad + 2)) ''
+  fi
+}
+format_table() {
+  local g owner slug name state scol target tok time left lcol cpu mem note ncol who
+  local n=0 i c dim bold
+  local -a W=() A=(l l l r r l r l) H=(STATE TASK TARGET TOKENS TIME LEFT CORES MEM)
+  local -a WHO=() C0=() C1=() C2=() C3=() C4=() C5=() C6=() C7=() SC=() LC=() NOTE=() NC=()
+  TABLE=""
+  [ -n "${1//$'\n'/}" ] || return 0
+  while IFS="$US" read -r g _ _ _ owner slug name state scol target tok time left lcol cpu mem note ncol; do
+    [ -n "$g" ] || continue
+    who=other
+    if [ "$owner" = me ]; then
+      who=laptop
+      if [ -z "$name" ] && [ -n "$slug" ] && [ -n "${SLUG_NAME[$slug]+x}" ]; then name="${SLUG_NAME[$slug]}"; fi
+      [ -n "$name" ] || name="$slug"
+      if [ -n "$slug" ] && [ "${SLUG_PROJ[$slug]-0}" = 1 ]; then who=project; fi
+    else
+      name="other laptop"
+    fi
+    [ "${#name}" -le 36 ] || name="${name:0:35}$ELLIPSIS"
+    WHO[n]="$who"; C0[n]="$state"; C1[n]="$name"; C2[n]="$target"; C3[n]="$tok"; C4[n]="$time"
+    C5[n]="$left"; C6[n]="$cpu"; C7[n]="$mem"; SC[n]="$scol"; LC[n]="$lcol"; NOTE[n]="$note"; NC[n]="$ncol"
+    n=$((n + 1))
+  done < <(printf '%s' "$1" | LC_ALL=C sort -t "$US" -k1,1n -k2,2n -k3,3n -k4,4n)
+  for ((c = 0; c < 8; c++)); do W[c]="${#H[c]}"; done
+  for ((i = 0; i < n; i++)); do
+    [ "${#C0[i]}" -le "${W[0]}" ] || W[0]="${#C0[i]}"
+    [ "${#C1[i]}" -le "${W[1]}" ] || W[1]="${#C1[i]}"
+    [ "${#C2[i]}" -le "${W[2]}" ] || W[2]="${#C2[i]}"
+    [ "${#C3[i]}" -le "${W[3]}" ] || W[3]="${#C3[i]}"
+    [ "${#C4[i]}" -le "${W[4]}" ] || W[4]="${#C4[i]}"
+    [ "${#C5[i]}" -le "${W[5]}" ] || W[5]="${#C5[i]}"
+    [ "${#C6[i]}" -le "${W[6]}" ] || W[6]="${#C6[i]}"
+    [ "${#C7[i]}" -le "${W[7]}" ] || W[7]="${#C7[i]}"
+  done
+  TB_LINE="  "; TB_PEND=""
+  for ((c = 0; c < 8; c++)); do tb_cell "${H[c]}" "${W[c]}" "${A[c]}" ""; done
+  TABLE="$TB_LINE"
+  for ((i = 0; i < n; i++)); do
+    # This repository's gates carry the mark and a bold name. Another laptop's
+    # are dim, so the eye skips them.
+    dim=""; bold=""
+    case "${WHO[i]}" in project) bold=bold ;; other) dim=dim ;; esac
+    if [ -n "$bold" ]; then paint_to bold "$MARK"; TB_LINE="$PAINTED "; else TB_LINE="  "; fi
+    TB_PEND=""
+    tb_cell "${C0[i]}" "${W[0]}" l "${SC[i]:-$dim}"
+    tb_cell "${C1[i]}" "${W[1]}" l "${bold:-$dim}"
+    tb_cell "${C2[i]}" "${W[2]}" l "$dim"
+    tb_cell "${C3[i]}" "${W[3]}" r "$dim"
+    tb_cell "${C4[i]}" "${W[4]}" r "$dim"
+    # A row with nothing past its time, a lost run or one on this laptop,
+    # starts its note in the LEFT column. Past four empty columns it began at
+    # column 100 or so, and a watch on a narrower terminal cut it off.
+    if [ -n "${NOTE[i]}" ] && [ -z "${C5[i]}${C6[i]}${C7[i]}" ]; then
+      tb_cell "${NOTE[i]}" 0 l "${NC[i]:-$dim}"
+      TABLE+=$'\n'"$TB_LINE"
+      continue
+    fi
+    tb_cell "${C5[i]}" "${W[5]}" l "${LC[i]:-$dim}"
+    tb_cell "${C6[i]}" "${W[6]}" r "$dim"
+    tb_cell "${C7[i]}" "${W[7]}" l "$dim"
+    if [ -n "${NOTE[i]}" ]; then
+      paint_to "${NC[i]:-$dim}" "${NOTE[i]}"
+      TB_LINE+="$TB_PEND$PAINTED"
+    fi
+    TABLE+=$'\n'"$TB_LINE"
+  done
+}
+# The line in place of the table when no gate runs or waits. It needs one
+# server that answered: an empty table under servers that did not answer would
+# claim a quiet fleet nobody saw.
+no_task_line() {
+  local t
+  for t in ${JOIN[@]+"${!JOIN[@]}"}; do
+    [ -z "${JOIN[$t]}" ] || { printf 'no gate runs or waits'; return 0; }
+  done
+}
+
+# ── rentals ──────────────────────────────────────────────────────────────────
+#
+# A pod or a server costs money for as long as it exists, and only its own idle
+# watcher deletes it. A pod that no record knows cost money until somebody
+# looked at the RunPod console, so the view lists this repository's records AND
+# the provider's account, joined on the rental name.
+#
+# Status sends GET alone and writes no record. `devbox runpod status` clears the
+# record of a gone pod through runpod_down, which can DELETE. A read-only view
+# that sometimes deletes would make every watch refresh a possible delete, so
+# the view names the repair and leaves it to the developer.
+#
+# A provider job prints `<exit code> <1 when this checkout's Hetzner server
+# runs>` on its first line, then one row per line without the provider's name:
+# rent_compose puts the name in front of the first row, and an indent in front
+# of the rest.
+
+# Each awk runs in the C locale. awk formats a number with the decimal mark of
+# the caller's locale, and a price with a decimal comma is one no script reads
+# as a price.
+# A price per hour, 0.37, 0.125 or 0.0988: four decimals at most, two at least.
+# Hetzner lists prices to four decimals, and three printed 0.0988 as 0.099.
+rent_price() { LC_ALL=C awk -v v="$1" 'BEGIN { s = sprintf("%.4f", v); while (s ~ /0$/ && s ~ /\.[0-9][0-9][0-9]/) s = substr(s, 1, length(s) - 1); printf "%s", s }'; }
+# An amount to the cent.
+rent_money() { LC_ALL=C awk -v v="$1" 'BEGIN { printf "%.2f", v }'; }
+# The cost of $1 per hour over $2 seconds, unrounded, so the sum row rounds once.
+rent_cost() { LC_ALL=C awk -v h="$1" -v s="$2" 'BEGIN { printf "%.6f", h * s / 3600 }'; }
+rent_add() { LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN { printf "%.6f", a + b }'; }
+is_price() { [[ "${1-}" =~ ^[0-9]{1,4}([.][0-9]{1,12})?$ ]]; }
+
+# A creation time as an epoch: a number as it stands, or a date string. RunPod
+# and Hetzner both start theirs with `YYYY-MM-DD HH:MM:SS` or the ISO 8601 form
+# of it, in UTC. Anything else is null, and the row says `up time unknown`.
+# shellcheck disable=SC2016  # a jq program; $ is jq's
+RENT_EPOCH='def epoch: if type == "number" then floor
+  elif type == "string" then (try (.[0:19] | sub(" "; "T") + "Z" | fromdateiso8601) catch null)
+  else null end;'
+
+# Every worktree of this repository whose git dir holds $1/$2, as
+# `<worktree name>\t<record dir>`. A linked worktree's git dir is its own, so
+# each worktree has its own record, as verify writes it.
+rent_records() {
+  local line path dir
+  while IFS= read -r line; do
+    case "$line" in "worktree "*) path="${line#worktree }" ;; *) continue ;; esac
+    [ -d "$path" ] || continue
+    dir="$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || continue
+    [ -f "$dir/$1/$2" ] || continue
+    printf '%s\t%s\n' "${path##*/}" "$dir/$1"
+  done < <(git -C "$ROOT" worktree list --porcelain 2>/dev/null)
+}
+
+# The last line rented_http printed, without its `devbox <provider>: ` prefix.
+# Only printable characters reach the terminal.
+rent_api_error() {
+  local m=""
+  m="$(tail -n 1 "$1" 2>/dev/null)" || true
+  m="${m#devbox runpod: }"
+  m="${m#devbox hetzner: }"
+  m="$(printable "$m")"
+  printf '%s' "${m:-no answer}"
+}
+
+rent_tools_ok() {
+  local t
+  for t in jq curl; do
+    command -v "$t" >/dev/null 2>&1 && continue
+    printf '2 0\n%s\n' "$(paint red "$t is not installed on this laptop, not checked")"
+    return 1
+  done
+}
+
+# The money fields of one live rental, appended to F, and added to the sums
+# S_N, S_H, S_COST and S_UNPRICED. $1 the price per hour, $2 the epoch the
+# rental started, $3 this laptop's now. `about` is part of every amount:
+# the amount is the price times the time up, and the
+# provider's invoice is the record of what was billed.
+# The currency each provider bills in, as the prefix of every price and cost in
+# its block: RunPod in USD, Hetzner in EUR. Each provider block runs in its own
+# subshell and sets it there. One `$` for both printed a EUR price as dollars.
+RENT_CUR='$'
+rent_money_fields() {
+  local up="" c
+  if isnum "$2" && [ "$2" -le "$3" ]; then up=$(($3 - $2)); fi
+  S_N=$((S_N + 1))
+  if is_price "$1"; then
+    F+=("$RENT_CUR$(rent_price "$1")/h")
+    S_H="$(rent_add "$S_H" "$1")"
+  else
+    # The price at the time of the rental, or none. A price looked up now may
+    # not be the one the rental was made at.
+    F+=("price not recorded")
+    S_UNPRICED=$((S_UNPRICED + 1))
+  fi
+  if [ -n "$up" ]; then F+=("up $(dur_clock "$up")"); else F+=("up time unknown"); fi
+  if is_price "$1" && [ -n "$up" ]; then
+    c="$(rent_cost "$1" "$up")"
+    F+=("about $RENT_CUR$(rent_money "$c") so far")
+    S_COST="$(rent_add "$S_COST" "$c")"
+  fi
+}
+
+# The sum row of the live rentals, in RSUM. $1 the noun, pod or server.
+rent_sum() {
+  local noun="$1"
+  local -a f=()
+  RSUM=""
+  [ "$S_N" -gt 0 ] || return 0
+  [ "$S_N" -eq 1 ] || noun="${noun}s"
+  f=("$S_N $noun")
+  if [ "$S_UNPRICED" -eq 0 ]; then
+    f+=("$RENT_CUR$(rent_price "$S_H")/h" "about $RENT_CUR$(rent_money "$S_COST") so far")
+  elif [ "$S_UNPRICED" -eq "$S_N" ]; then
+    f+=("price not recorded")
+  else
+    f+=("$RENT_CUR$(rent_price "$S_H")/h" "about $RENT_CUR$(rent_money "$S_COST") so far for $((S_N - S_UNPRICED))" \
+      "price not recorded for $S_UNPRICED")
+  fi
+  RSUM="$(join_fields "${f[@]}")"
+}
+
+# The rows of RHEAD, RNAMES with RTEXT and RCONT, and RSUM. The name column
+# ends where the fields of a run line start, or later for a long name.
+rent_print() {
+  local i w=$((25 - COL))
+  [ "$w" -ge 2 ] || w=2
+  for i in ${RNAMES[@]+"${!RNAMES[@]}"}; do
+    [ $((${#RNAMES[i]} + 2)) -le "$w" ] || w=$((${#RNAMES[i]} + 2))
+  done
+  [ -z "$RHEAD" ] || printf '%s\n' "$RHEAD"
+  for i in ${RNAMES[@]+"${!RNAMES[@]}"}; do
+    printf '%-*s%s\n' "$w" "${RNAMES[i]}" "${RTEXT[i]}"
+    [ -z "${RCONT[i]}" ] || printf '%*s%s\n' "$w" '' "${RCONT[i]}"
+  done
+  [ -z "$RSUM" ] || printf '%s\n' "$RSUM"
+  if [ -z "$RHEAD" ] && [ "${#RNAMES[@]}" -eq 0 ] && [ -z "$RSUM" ]; then echo "no rental"; fi
+}
+
+# The idle state of one recorded pod, from the pod itself: its runtime's
+# `status` over the record's own ssh config. $1 the record dir, $2 the pod id,
+# $3 its name. The pod's clock is sent with the answer, so the idle time is the
+# pod's now minus the pod's idleSince, and a laptop clock that is off changes
+# nothing.
+#
+# The runtime's watcher touches idleSince on each pass while a gate holds the
+# activity lock, every 30 seconds at most (devbox-rented-idle), and the gate
+# touches it when it ends. So an idle time under one minute is a pod at work or
+# one that finished within that minute, and the line says both.
+pod_idle() {
+  local out="" rc=0 pnow json since="" secs=""
+  [ -f "$1/ssh_config" ] || { echo "idle state unknown (its record holds no ssh config)"; return 0; }
+  command -v timeout >/dev/null 2>&1 || { echo "idle state unknown (no timeout command on this laptop)"; return 0; }
+  out="$(timeout "$POD_SECONDS" ssh -F "$1/ssh_config" devbox-runpod 'date +%s && bash /opt/devbox/runpod-runtime status' \
+    </dev/null 2>/dev/null)" || rc=$?
+  case "$rc" in
+    0) ;;
+    124|137) echo "idle state unknown (no answer in ${POD_SECONDS}s)"; return 0 ;;
+    75) paint yellow "deleting itself now"; echo; return 0 ;;
+    255) echo "idle state unknown (ssh could not reach it)"; return 0 ;;
+    *) echo "idle state unknown (its status check failed with exit $rc)"; return 0 ;;
+  esac
+  pnow="${out%%$'\n'*}"
+  json="${out#*$'\n'}"
+  read -r since secs < <(jq -r --arg id "$2" --arg name "$3" \
+    'if .id == $id and .name == $name and .watchdog == true then "\(.idleSince) \(.idleSeconds)" else "other" end' \
+    <<<"$json" 2>/dev/null) || true
+  if [ "$since" = other ]; then echo "idle state unknown (it answered as another pod)"; return 0; fi
+  if ! isnum "$pnow" || ! isnum "$since" || ! isnum "$secs"; then
+    echo "idle state unknown (an answer this client cannot read)"; return 0
+  fi
+  local age=$((pnow - since)) left
+  [ "$age" -ge 0 ] || age=0
+  if [ "$age" -lt 60 ]; then
+    echo "busy, or idle under 1m, deletes itself after $(dur_about "$secs") idle"
+    return 0
+  fi
+  left=$((secs - age))
+  if [ "$left" -gt 0 ]; then
+    echo "idle $(dur_about "$age"), deletes itself in $(dur_about "$left")"
+  else
+    echo "idle $(dur_about "$age"), deletes itself now"
+  fi
+}
+
+# RunPod: the local records of every worktree, one GET /pods,
+# and the idle state of each pod a record and RunPod agree on.
+rent_runpod() (
+  RENT_CUR='$'
+  set +e
+  local now errf api rc=0 tsv="" id name vcpu ph pcr pst wt dir line hourly cpus created i
+  local -a RNAMES=() RTEXT=() RCONT=() F=() idle_rows=() idle_files=() order=()
+  local -A P_ID=() P_VCPU=() P_HOURLY=() P_CREATED=() P_STATUS=() KNOWN=()
+  local RHEAD="" RSUM="" S_N=0 S_H=0 S_COST=0 S_UNPRICED=0
+  if [ -z "${RUNPOD_KEY:-}" ]; then printf '0 0\nno key in .devbox.env, not checked\n'; exit 0; fi
+  if [[ "$RUNPOD_KEY" == *$'\n'* || "$RUNPOD_KEY" == *$'\r'* ]]; then
+    printf '2 0\n%s\n' "$(paint red "RUNPOD_KEY in .devbox.env holds a line break, not checked")"; exit 0
+  fi
+  rent_tools_ok || exit 0
+  now="$(date +%s)"
+  errf="$WORK/runpod.err.$BASHPID"
+  api="$(RENTED_HTTP_WHO="devbox runpod" RENTED_HTTP_DIR="$WORK" rented_http "$RUNPOD_KEY" GET "$RENTED_RUNPOD_API/pods" /pods 2>"$errf")" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    tsv="$(jq -r "$RENT_EPOCH"' if type == "array" then .[] elif . == null then empty else error("not a list") end
+      | select(type == "object")
+      | [(.id // "" | tostring), (.name // "" | tostring), (.vcpuCount // "" | tostring),
+         (.adjustedCostPerHr // .costPerHr // "" | tostring), ((.createdAt | epoch) // "" | tostring),
+         (.desiredStatus // "" | tostring)] | @tsv' <<<"$api" 2>/dev/null)" \
+      || { rc=1; echo "GET /pods: an answer this client cannot read" >"$errf"; }
+  fi
+  if [ "$rc" -ne 0 ]; then
+    RHEAD="$(paint red "the RunPod API call failed: $(rent_api_error "$errf")")"
+  else
+    while IFS=$'\t' read -r id name vcpu ph pcr pst; do
+      # A pod devbox did not create never shows: the account may hold the
+      # developer's own pods, and they are not this view's to price.
+      runpod_owner_name "$name" || continue
+      [[ "$id" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || continue
+      P_ID[$name]="$id"; P_VCPU[$name]="$vcpu"; P_HOURLY[$name]="$ph"; P_CREATED[$name]="$pcr"; P_STATUS[$name]="$pst"
+      order+=("$name")
+    done <<<"$tsv"
+  fi
+  rm -f "$errf"
+  while IFS=$'\t' read -r wt dir; do
+    [ -n "$dir" ] || continue
+    line="$(jq -r 'if type == "object" and ((.terminated // false) == false) then
+        [(.name // "" | tostring), (.id // "" | tostring), (.hourly // "" | tostring), (.cpus // "" | tostring),
+         (.createdAt // "" | tostring)] | @tsv else empty end' "$dir/pod.json" 2>/dev/null)" || {
+      RNAMES+=("$wt"); RTEXT+=("$(paint yellow "its record $dir/pod.json is not JSON this client can read")"); RCONT+=(""); continue; }
+    [ -n "$line" ] || continue
+    IFS=$'\t' read -r name id hourly cpus created <<<"$line"
+    [[ "$id" =~ ^[A-Za-z0-9_-]{0,64}$ ]] || id="-"
+    KNOWN[$name]=1
+    RNAMES+=("$wt"); RCONT+=("")
+    if [ "$rc" -ne 0 ]; then
+      RTEXT+=("record says pod ${id:-with no id}, not checked")
+    elif [ -z "${P_ID[$name]+x}" ]; then
+      RTEXT+=("$(paint yellow "record says pod ${id:-with no id}, RunPod has no such pod: devbox runpod down in that worktree clears the record")")
+    else
+      F=("pod ${P_ID[$name]}")
+      if isnum "$cpus"; then F+=("$cpus vCPU"); elif isnum "${P_VCPU[$name]}"; then F+=("${P_VCPU[$name]} vCPU"); fi
+      [[ "${P_STATUS[$name]}" =~ ^(RUNNING|)$ ]] || [[ ! "${P_STATUS[$name]}" =~ ^[A-Z_]{1,20}$ ]] || F+=("${P_STATUS[$name],,}")
+      rent_money_fields "$hourly" "$created" "$now"
+      RTEXT+=("$(join_fields "${F[@]}")")
+      i=$((${#RNAMES[@]} - 1))
+      # One ssh per pod, all at once, so N pods cost one 10-second limit.
+      idle_rows+=("$i")
+      # The name is taken once. The redirection of a background command is
+      # expanded in the child, where $BASHPID is the child's own pid, and the
+      # first run of this read an empty file and printed no idle line.
+      idle_files+=("$WORK/runpod.idle.$BASHPID.$i")
+      pod_idle "$dir" "${id:-${P_ID[$name]}}" "$name" >"${idle_files[-1]}" 2>/dev/null &
+    fi
+  done < <(rent_records devbox-runpod pod.json)
+  wait
+  for i in ${idle_rows[@]+"${!idle_rows[@]}"}; do
+    RCONT[idle_rows[i]]="$(cat "${idle_files[i]}" 2>/dev/null)"
+    rm -f "${idle_files[i]}"
+  done
+  # A live devbox pod no record of this repository knows: another laptop,
+  # another repository, or a record that was lost. It has no key here, so no
+  # idle state.
+  for name in ${order[@]+"${order[@]}"}; do
+    [ -z "${KNOWN[$name]+x}" ] || continue
+    F=("pod ${P_ID[$name]}" "$name")
+    ! isnum "${P_VCPU[$name]}" || F+=("${P_VCPU[$name]} vCPU")
+    [[ "${P_STATUS[$name]}" =~ ^(RUNNING|)$ ]] || [[ ! "${P_STATUS[$name]}" =~ ^[A-Z_]{1,20}$ ]] || F+=("${P_STATUS[$name],,}")
+    rent_money_fields "${P_HOURLY[$name]}" "${P_CREATED[$name]}" "$now"
+    RNAMES+=("not recorded"); RTEXT+=("$(join_fields "${F[@]}")"); RCONT+=("")
+  done
+  rent_sum pod
+  if [ "$rc" -eq 0 ]; then printf '0 0\n'; else printf '1 0\n'; fi
+  rent_print
+)
+
+# Hetzner: the records of every worktree and one GET /servers
+# filtered to the devbox label. The first line says whether this checkout's own
+# server runs, which makes it a target.
+rent_hetzner() (
+  RENT_CUR='EUR '
+  set +e
+  local now errf api rc=0 tsv="" id name st typ cr wt dir line rtype created hourly running=0
+  local -a RNAMES=() RTEXT=() RCONT=() F=() order=()
+  local -A S_ID=() S_STATUS=() S_TYPE=() S_CREATED=() KNOWN=()
+  local RHEAD="" RSUM="" S_N=0 S_H=0 S_COST=0 S_UNPRICED=0
+  if [ -z "${HCLOUD_TOKEN:-}" ]; then printf '0 0\nno key in .devbox.env, not checked\n'; exit 0; fi
+  # The rule devbox-hetzner applies: it also keeps a quote or a newline out of
+  # the header file that carries the token.
+  if ! [[ "$HCLOUD_TOKEN" =~ ^[A-Za-z0-9]{1,256}$ ]]; then
+    printf '2 0\n%s\n' "$(paint red "HCLOUD_TOKEN in .devbox.env is not a Hetzner Cloud API token, not checked")"; exit 0
+  fi
+  rent_tools_ok || exit 0
+  now="$(date +%s)"
+  errf="$WORK/hetzner.err.$BASHPID"
+  # 50 is the most one page holds. A laptop with more than 50 devbox servers
+  # has a problem this view would not hide: the sum row counts 50.
+  api="$(HZ_STATE="$WORK" hetzner_api GET '/servers?label_selector=devbox%3Drented&per_page=50' 2>"$errf")" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    tsv="$(jq -r "$RENT_EPOCH"' if type == "object" or . == null then (.servers // [])[] else error("not an object") end
+      | select(type == "object" and .labels.devbox == "rented")
+      | [(.id // "" | tostring), (.name // "" | tostring), (.status // "" | tostring),
+         (.server_type.name // "" | tostring), ((.created | epoch) // "" | tostring)] | @tsv' <<<"$api" 2>/dev/null)" \
+      || { rc=1; echo "GET /servers: an answer this client cannot read" >"$errf"; }
+  fi
+  if [ "$rc" -ne 0 ]; then
+    RHEAD="$(paint red "the Hetzner API call failed: $(rent_api_error "$errf")")"
+  else
+    while IFS=$'\t' read -r id name st typ cr; do
+      hetzner_owner_name "$name" || continue
+      [[ "$id" =~ ^[0-9]{1,15}$ ]] || continue
+      [[ "$st" =~ ^[a-z]{1,20}$ ]] || st="-"
+      [[ "$typ" =~ ^[a-z0-9-]{1,32}$ ]] || typ="-"
+      S_ID[$name]="$id"; S_STATUS[$name]="$st"; S_TYPE[$name]="$typ"; S_CREATED[$name]="$cr"
+      order+=("$name")
+    done <<<"$tsv"
+  fi
+  rm -f "$errf"
+  while IFS=$'\t' read -r wt dir; do
+    [ -n "$dir" ] || continue
+    line="$(jq -r 'if type == "object" and ((.deleted // false) == false) then
+        [(.name // "" | tostring), (.id // "" | tostring), (.serverType // "" | tostring),
+         (.createdAt // "" | tostring), (.hourly // "" | tostring)] | @tsv else empty end' "$dir/server.json" 2>/dev/null)" || {
+      RNAMES+=("$wt"); RTEXT+=("$(paint yellow "its record $dir/server.json is not JSON this client can read")"); RCONT+=(""); continue; }
+    [ -n "$line" ] || continue
+    IFS=$'\t' read -r name id rtype created hourly <<<"$line"
+    [[ "$id" =~ ^[0-9]{0,15}$ ]] || id="-"
+    [[ "$rtype" =~ ^[a-z0-9-]{1,32}$ ]] || rtype="-"
+    KNOWN[$name]=1
+    RNAMES+=("$wt"); RCONT+=("")
+    if [ "$rc" -ne 0 ]; then
+      RTEXT+=("record says server ${id:-with no id}, not checked")
+    elif [ -z "${S_ID[$name]+x}" ]; then
+      RTEXT+=("$(paint yellow "record says server ${id:-with no id}, Hetzner has no such server: devbox hetzner down in that worktree clears the record")")
+    else
+      F=("server ${S_ID[$name]}" "$rtype")
+      [ "${S_STATUS[$name]}" = running ] || F+=("${S_STATUS[$name]}")
+      rent_money_fields "$hourly" "$created" "$now"
+      RTEXT+=("$(join_fields "${F[@]}")")
+      if [ "$dir" = "$HZ_SELF" ] && [ "${S_STATUS[$name]}" = running ]; then running=1; fi
+    fi
+  done < <(rent_records devbox-hetzner server.json)
+  for name in ${order[@]+"${order[@]}"}; do
+    [ -z "${KNOWN[$name]+x}" ] || continue
+    F=("server ${S_ID[$name]}" "$name" "${S_TYPE[$name]}")
+    [ "${S_STATUS[$name]}" = running ] || F+=("${S_STATUS[$name]}")
+    # No record, so no price recorded at its creation.
+    rent_money_fields "" "${S_CREATED[$name]}" "$now"
+    RNAMES+=("not recorded"); RTEXT+=("$(join_fields "${F[@]}")"); RCONT+=("")
+  done
+  rent_sum server
+  if [ "$rc" -eq 0 ]; then printf '0 %s\n' "$running"; else printf '1 0\n'; fi
+  rent_print
+)
+
+rent_job() {
+  case "$1" in
+    runpod) rent_runpod ;;
+    hetzner) rent_hetzner ;;
+  esac
+}
+
+# The rows of a provider job's file, the first after the provider's name and
+# the rest under it. $1 the provider, $2 the file.
+rent_compose() {
+  local p="$1" file="$2" head="" line first=1
+  local -a rows=()
+  if [ -r "$file" ]; then IFS= read -r head <"$file" || true; fi
+  if [[ "$head" =~ ^[0-9]+\ [01]$ ]]; then
+    mapfile -t rows < <(tail -n +2 "$file")
+  else
+    rows=("$(paint red "no answer (its job wrote nothing)")")
+  fi
+  for line in ${rows[@]+"${rows[@]}"}; do
+    if [ "$first" = 1 ]; then target_line "$p" "$line"; else printf '%*s%s\n' "$COL" '' "$line"; fi
+    first=0
+  done
+}
+
+# One provider block of the one-shot view, and its exit code. $1 the provider.
+# The rented Hetzner server's own line and gates are in the target lines and
+# the table, as every target's are. This block holds what it costs.
+render_provider() {
+  local p="$1" head=""
+  rent_compose "$p" "$WORK/$p.rent"
+  if [ -r "$WORK/$p.rent" ]; then IFS= read -r head <"$WORK/$p.rent" || true; fi
+  if [[ "$head" =~ ^([0-9]+)\ [01]$ ]]; then
+    [ "${BASH_REMATCH[1]}" = 0 ] || note_rc "${BASH_REMATCH[1]}"
+  else
+    note_rc 1
+  fi
+}
+
+# $1 is 1 when no block comes before them.
+render_providers() {
+  local p first="$1"
+  for p in ${PROVIDERS[@]+"${PROVIDERS[@]}"}; do
+    [ "$first" = 1 ] || echo
+    first=0
+    render_provider "$p"
+  done
+}
+
+# ── watch mode ───────────────────────────────────────────────────────────────
+#
+# A refresh starts one background job per target, and the render loop draws
+# a frame every 0.25 seconds from the newest complete answer of each target.
+# Each job is status_one, the one-shot view's own call, so the master open, the
+# limits and the unreachable cache are the same in both modes. Every job runs
+# in a subshell of this process, so every master has this process's
+# ControlPath, and the refresh after it finds that master up (`-O check`) and
+# sends no password.
+#
+# A server's line and its table rows are rendered once per answer, so a frame
+# costs no fork for a server that did not answer again.
+declare -A JOB_PID=() JOB_START=() ANS_AT=() ANS_CLOCK=() ANS_KIND=() SRV=() TROWS=()
+# A provider's rows, rendered once per answer.
+declare -A RENT_LEAD=()
+# The API calls and the pod ssh calls of a provider run at most this often,
+# whatever the interval: a price does not change during a
+# rental, and both APIs have a rate limit.
+RENT_SECONDS=30
+NOW=0
+FRAME=0
+REFRESH_CLOCK=""
+RESIZED=0
+# The table, built again at each refresh and when a target answers, because a
+# target's answer decides which runs of this laptop join its gates.
+TABLE=""
+LOCAL_DIRTY=0
+COLS=80
+ROWS=24
+CUT=""
+SPIN_FRAMES=()
+T_SMCUP=""
+T_RMCUP=""
+T_CIVIS=""
+T_CNORM=""
+STOP=""
+
+# The visible part of a line, cut at $1 columns, in CUT. A colour sequence
+# takes no column, and every one is kept, so a cut inside a red field still
+# carries the reset and the next line does not turn red.
+cut_line() {  # $1 the width, $2 the line
+  local w="$1" s="$2" seg seq n=0
+  CUT=""
+  while [ -n "$s" ]; do
+    if [ "${s:0:1}" = $'\033' ]; then
+      seq="${s%%m*}m"
+      CUT+="$seq"
+      s="${s:${#seq}}"
+      continue
+    fi
+    seg="${s%%$'\033'*}"
+    s="${s:${#seg}}"
+    [ "$n" -lt "$w" ] || continue
+    [ $((n + ${#seg})) -le "$w" ] || seg="${seg:0:w - n}"
+    CUT+="$seg"
+    n=$((n + ${#seg}))
+  done
+}
+
+# The terminal's size, from the terminal itself, so a resize is seen at the
+# next frame. COLUMNS and LINES serve when the terminal reports 0, as a fresh
+# pseudo-terminal does.
+screen_size() {
+  local r="" c=""
+  read -r r c < <(stty size </dev/tty 2>/dev/null) || true
+  if [[ "$r" =~ ^[1-9][0-9]*$ ]] && [[ "$c" =~ ^[1-9][0-9]*$ ]]; then
+    ROWS="$r"; COLS="$c"; return 0
+  fi
+  if [[ "${COLUMNS:-}" =~ ^[1-9][0-9]*$ ]]; then COLS="$COLUMNS"; else COLS=80; fi
+  if [[ "${LINES:-}" =~ ^[1-9][0-9]*$ ]]; then ROWS="$LINES"; else ROWS=24; fi
+}
+
+# One job, a target's status_one or a provider's rent_job. It writes its
+# answer to <name>.part and renames it to <name>.new as its last step, so the
+# render loop never reads half of one. $1 the job's name, then its command.
+watch_start() {
+  local name="$1"
+  shift
+  rm -f "$WORK/$name.new"
+  # Its stderr goes nowhere: a job killed by the EXIT trap would otherwise
+  # print "Terminated" over the developer's restored screen.
+  { "$@" >"$WORK/$name.part" || true; mv -f "$WORK/$name.part" "$WORK/$name.new"; } </dev/null 2>/dev/null &
+  JOB_PID[$name]=$!
+  JOB_START[$name]="$NOW"
+}
+
+# Take every answer that came back, and render its block once. A frame then
+# costs no fork for a block that did not change.
+watch_collect() {
+  local name pid head clock p
+  for name in ${JOB_PID[@]+"${!JOB_PID[@]}"}; do
+    pid="${JOB_PID[$name]}"
+    [ -e "$WORK/$name.new" ] || ! kill -0 "$pid" 2>/dev/null || continue
+    wait "$pid" 2>/dev/null || true
+    if [ -e "$WORK/$name.new" ]; then mv -f "$WORK/$name.new" "$WORK/$name"; else : >"$WORK/$name"; fi
+    unset 'JOB_PID[$name]'
+    # The numbers are as old as the moment they were asked for, not the moment
+    # they arrived: a reply that took 20 seconds is 20 seconds old on arrival.
+    ANS_AT[$name]="${JOB_START[$name]}"
+    printf -v clock '%(%H:%M:%S)T' "${JOB_START[$name]}"
+    ANS_CLOCK[$name]="$clock"
+    head=""
+    IFS= read -r head <"$WORK/$name" || true
+    case "$name" in
+      *.rent)
+        p="${name%.rent}"
+        # The rented Hetzner server is asked the status verb only while the
+        # API says it runs.
+        if [ "$p" = hetzner ]; then
+          if [ "${head#* }" = 1 ]; then HZ_RUNNING=1; else HZ_RUNNING=0; fi
+        fi
+        RENT_LEAD[$p]="$(rent_compose "$p" "$WORK/$name")"
+        LOCAL_DIRTY=1 ;;
+      *)
+        ANS_KIND[$name]="${head%% *}"
+        render_target "$name" "$WORK/$name" "${TIDX[$name]}"
+        SRV[$name]="${SRV_TEXT%$'\n'}"
+        TROWS[$name]="$ROW_TEXT"
+        LOCAL_DIRTY=1 ;;
+    esac
+  done
+}
+
+watch_refresh() {
+  local name p
+  watch_targets
+  for name in ${WT_LIST[@]+"${WT_LIST[@]}"}; do
+    # A target whose last job is still out gets no second one. A slow target
+    # would otherwise hold one more ssh, one more sudo and one more pool lock
+    # at every refresh until its first call came back.
+    [ -z "${JOB_PID[$name]-}" ] || continue
+    case "${ANS_KIND[$name]-}" in
+      # A refused password and a host key off its pin do not change during the
+      # session: .devbox.env is read once. Sending the password again at each
+      # refresh gets this laptop's address banned by the host's fail2ban sshd
+      # jail (infra/bootstrap.sh: 5 failures in 10 minutes ban it for 1 hour),
+      # which at 3 seconds takes 15 seconds.
+      refused|hostkey) continue ;;
+      # Off the LAN, a LAN-only target costs its 3-second connect at every
+      # refresh. Once in RETRY_SECONDS is enough to see it come back.
+      unreachable) [ $((NOW - ${JOB_START[$name]:-0})) -ge "$RETRY_SECONDS" ] || continue ;;
+    esac
+    watch_start "$name" status_one "$name"
+  done
+  for p in ${PROVIDERS[@]+"${PROVIDERS[@]}"}; do
+    [ -z "${JOB_PID[$p.rent]-}" ] || continue
+    if [ -n "${JOB_START[$p.rent]+x}" ] && [ $((NOW - ${JOB_START[$p.rent]})) -lt "$RENT_SECONDS" ]; then
+      continue
+    fi
+    watch_start "$p.rent" rent_job "$p"
+  done
+}
+
+# The targets whose line and rows the view shows now: every deployed target,
+# and the rented Hetzner server while the API says it runs.
+watch_targets() {
+  WT_LIST=(${SHOWN[@]+"${SHOWN[@]}"})
+  [ "$HZ_TARGET" != 1 ] || [ "$HZ_RUNNING" != 1 ] || WT_LIST+=(hetzner)
+}
+
+# The table from the newest answer of each target shown, and this laptop's
+# runs.
+watch_table() {
+  local name all=""
+  collect_local
+  watch_targets
+  for name in ${WT_LIST[@]+"${WT_LIST[@]}"}; do all+="${TROWS[$name]-}"; done
+  format_table "$all$LOCAL_ROWS"
+  [ -n "$TABLE" ] || TABLE="$(no_task_line)"
+}
+
+# Old numbers are never shown as current: a block older than
+# $3 seconds says from when it is, at the end of its first line. $1 the name of
+# the variable that holds the block, $2 the job whose answer it shows.
+mark_stale() {
+  local -n blk="$1"
+  local first rest
+  [ $((NOW - ${ANS_AT[$2]})) -gt "$3" ] || return 0
+  first="${blk%%$'\n'*}"
+  rest="${blk:${#first}}"
+  blk="$first (as of ${ANS_CLOCK[$2]})$rest"
+}
+
+watch_draw() {
+  local spin header_spin=" " view name block rows buf i p rent_stale
+  local -a lines=()
+  spin="${SPIN_FRAMES[FRAME % ${#SPIN_FRAMES[@]}]}"
+  [ "${#JOB_PID[@]}" -eq 0 ] || header_spin="$spin"
+  printf -v view '%-*s%s' $((COLS - 1)) "devbox status  $REFRESH_CLOCK  every ${INTERVAL}s  q quits" "$header_spin"
+  watch_targets
+  [ "${#WT_LIST[@]}" -eq 0 ] || view+=$'\n'
+  for name in ${WT_LIST[@]+"${WT_LIST[@]}"}; do
+    if [ -n "${SRV[$name]+x}" ]; then
+      block="${SRV[$name]}"
+      mark_stale block "$name" $((2 * INTERVAL))
+    else
+      printf -v block '%-*s%s' "$COL" "$name" "waiting for its first answer"
+    fi
+    view+=$'\n'"$block"
+  done
+  [ -z "$TABLE" ] || view+=$'\n\n'"$TABLE"
+  # A provider is asked every RENT_SECONDS, so its rows are stale after two
+  # of those, not after two intervals.
+  rent_stale=$((2 * INTERVAL))
+  [ "$rent_stale" -ge $((2 * RENT_SECONDS)) ] || rent_stale=$((2 * RENT_SECONDS))
+  for p in ${PROVIDERS[@]+"${PROVIDERS[@]}"}; do
+    block=""
+    if [ -n "${RENT_LEAD[$p]+x}" ]; then
+      block="${RENT_LEAD[$p]}"
+      mark_stale block "$p.rent" "$rent_stale"
+    else
+      printf -v block '%-*s%s' "$COL" "$p" "waiting for its first answer"
+    fi
+    view+=$'\n\n'"$block"
+  done
+  mapfile -t lines <<<"$view"
+  # The last row stays empty: a newline written on it would scroll the screen,
+  # and every frame would move the lines under it.
+  buf="$T_HOME"
+  for ((i = 0; i < ${#lines[@]} && i < ROWS - 1; i++)); do
+    cut_line "$COLS" "${lines[i]}"
+    buf+="$T_EL$CUT"$'\n'
+  done
+  buf+="$T_ED"
+  printf '%s' "$buf"
+}
+
+# Every job, then every process under it, so the TERM reaches the ssh and the
+# timeout a job runs and not only the subshell above them. Without pgrep only
+# the jobs themselves are listed, and their ssh ends when the master closes.
+# shellcheck disable=SC2317  # reached from watch_exit, which the EXIT trap calls, never by name
+watch_job_tree() {
+  local p
+  local -a kids=()
+  for p in "$@"; do
+    printf '%s\n' "$p"
+    mapfile -t kids < <(pgrep -P "$p" 2>/dev/null || true)
+    [ "${#kids[@]}" -eq 0 ] || watch_job_tree "${kids[@]}"
+  done
+}
+
+# The terminal first: a trap that does not restore it leaves the developer's
+# shell with no cursor and on the alternate screen. Then the
+# jobs, then every master, then the private dir. Each step may fail without
+# stopping the next.
+# shellcheck disable=SC2317  # reached through the EXIT trap of watch_main, never by name
+watch_exit() {
+  local -a pids=()
+  printf '%s%s' "$T_CNORM" "$T_RMCUP" || true
+  mapfile -t pids < <(watch_job_tree ${JOB_PID[@]+"${JOB_PID[@]}"})
+  disown -a 2>/dev/null || true
+  [ "${#pids[@]}" -eq 0 ] || kill "${pids[@]}" 2>/dev/null || true
+  devbox_targets_close_all || true
+  rm -rf "$WORK" || true
+  # A signal ends the watch with its own code. A child that the same Ctrl-C
+  # killed can make set -e leave with 130 first, and Ctrl-C still exits 0.
+  [ -z "$STOP" ] || exit "$STOP"
+}
+
+watch_main() {
+  local key krc next=0 can_read=1
+  # Ctrl-C is the normal way out of a watch, so it exits 0.
+  # Each trap only records the signal, and the loop leaves at its next check.
+  # A trap that ran `exit` itself, inside the interrupted `read`, could crash
+  # bash with SIGSEGV (exit 139) on Ctrl-C, and a crashed shell runs no EXIT
+  # trap: no cursor, still on the alternate screen.
+  trap watch_exit EXIT
+  trap 'STOP=0' INT
+  trap 'STOP=143' TERM
+  trap 'STOP=129' HUP
+  trap 'RESIZED=1' WINCH
+  if [ "$CHARMAP" = UTF-8 ]; then
+    SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  else
+    SPIN_FRAMES=('|' '/' '-' "\\")
+  fi
+  T_SMCUP="$(tput smcup 2>/dev/null)" || T_SMCUP=""
+  T_RMCUP="$(tput rmcup 2>/dev/null)" || T_RMCUP=""
+  T_CIVIS="$(tput civis 2>/dev/null)" || T_CIVIS=""
+  T_CNORM="$(tput cnorm 2>/dev/null)" || T_CNORM=""
+  printf '%s%s' "$T_SMCUP" "$T_CIVIS"
+  screen_size
+  # With stdin not a terminal no key can be read, and read would return at
+  # once on every frame: the loop would spin at full speed. It sleeps instead,
+  # and Ctrl-C still leaves.
+  [ -t 0 ] || can_read=0
+  while :; do
+    [ -z "$STOP" ] || exit "$STOP"
+    printf -v NOW '%(%s)T' -1
+    watch_collect
+    if [ "$NOW" -ge "$next" ]; then
+      # A worktree added during the watch is named at the next refresh.
+      build_project_names
+      watch_refresh
+      LOCAL_DIRTY=1
+      printf -v REFRESH_CLOCK '%(%H:%M:%S)T' "$NOW"
+      next=$((NOW + INTERVAL))
+      screen_size
+    elif [ "$RESIZED" = 1 ]; then
+      screen_size
+    fi
+    RESIZED=0
+    if [ "$LOCAL_DIRTY" = 1 ]; then
+      watch_table
+      LOCAL_DIRTY=0
+    fi
+    watch_draw
+    FRAME=$((FRAME + 1))
+    if [ -n "$FRAMES" ] && [ "$FRAME" -ge "$FRAMES" ]; then exit 0; fi
+    key=""
+    krc=0
+    if [ "$can_read" = 1 ]; then
+      read -rsn1 -t 0.25 key || krc=$?
+      # 1 is end of file, a terminal that went away: every later read would
+      # return at once.
+      [ "$krc" -ne 1 ] || can_read=0
+    else
+      sleep 0.25 || true
+    fi
+    [ -z "$STOP" ] || exit "$STOP"
+    case "$key" in q|Q) exit 0 ;; esac
+  done
+}
+
+if [ "$WATCH" = 1 ]; then
+  watch_main
+fi
+
+for name in ${SHOWN[@]+"${SHOWN[@]}"}; do
+  status_one "$name" >"$WORK/$name" 2>/dev/null &
+done
+for p in ${PROVIDERS[@]+"${PROVIDERS[@]}"}; do
+  case "$p" in
+    hetzner)
+      {
+        rent_job hetzner >"$WORK/hetzner.rent" 2>/dev/null || true
+        hz_head=""
+        IFS= read -r hz_head <"$WORK/hetzner.rent" || true
+        if [ "$HZ_TARGET" = 1 ] && [ "${hz_head#* }" = 1 ]; then
+          status_one hetzner >"$WORK/hetzner" 2>/dev/null || true
+        fi
+      } & ;;
+    *) rent_job "$p" >"$WORK/$p.rent" 2>/dev/null & ;;
+  esac
+done
+wait
+
+# The target lines in target order, the rented Hetzner server last, then the
+# table, then the rentals. The exit code is the first failure in that order.
+build_project_names
+servers=""
+rows=""
+for name in ${SHOWN[@]+"${SHOWN[@]}"} hetzner; do
+  [ "$name" != hetzner ] || [ -e "$WORK/hetzner" ] || continue
+  render_target "$name" "$WORK/$name" "${TIDX[$name]}"
+  servers+="$SRV_TEXT"
+  rows+="$ROW_TEXT"
+done
+collect_local
+format_table "$rows$LOCAL_ROWS"
+[ -n "$TABLE" ] || TABLE="$(no_task_line)"
+first=1
+if [ -n "$servers" ]; then printf '%s' "$servers"; first=0; fi
+if [ -n "$TABLE" ]; then
+  [ "$first" = 1 ] || echo
+  printf '%s\n' "$TABLE"
+  first=0
+fi
+render_providers "$first"
+exit "$RC"

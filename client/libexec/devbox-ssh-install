@@ -1,0 +1,276 @@
+#!/bin/bash
+# Write, print or remove this host's block in ~/.ssh/config. Opt-in, and the
+# only thing in this repository that writes that file.
+#
+# ~/.ssh/config is global, mutable, shared with every other tool and hard to
+# reverse safely, so the job is split in two: `devbox doctor` PRINTS the
+# block and stops, and a developer who wants it written asks for it here.
+# Everything below exists to keep that write reversible.
+#
+# The block sits between `# >>> devbox <host> >>>` and `# <<< devbox <host> <<<`,
+# and both delimiters are matched as whole lines. That is how a later run finds
+# its own block again instead of guessing, and it is what --remove deletes.
+#
+# A second run rewrites the block IN PLACE. ssh keeps the FIRST value it obtains
+# for a keyword, so a block re-appended at the end of a config that already has
+# a `Host *` above it loses every keyword to that pattern, and the rewrite looks
+# like it did nothing.
+#
+# Every line outside the delimiters passes through byte for byte. That promise
+# is why the file is rebuilt by an awk filter over the original rather than by
+# an edit of the region, and why nothing here adds a separating blank line.
+#
+# This command opens no ssh connection. It reads and writes one text file, so it
+# runs and is tested on a laptop with no devbox and no network.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: devbox ssh-install [--host <host>] [--hostname <address>] [--user <login>]
+                          [--identity <key file>] [--print | --remove]
+                          [--config <path>]
+
+  --host <host>      the ssh destination to write a Host block for. Required:
+                     a client reaches its targets as devbox-gate and needs none.
+  --hostname <addr>  HostName: the address or DNS name that resolves
+  --user <login>     User: your account on the devbox
+  --identity <path>  IdentityFile: the key file the devbox accepts
+  --print            write the block to stdout and change no file
+  --remove           delete this host's block, and nothing else
+  --config <path>    the ssh config file to act on; defaults to ~/.ssh/config
+
+Exit: 0 done, 1 the config holds a malformed devbox block, 2 a usage error.
+EOF
+}
+
+# No default. An older client read DEVBOX_HOST from the environment, and that
+# key is removed: a client names its targets in .devbox.env and reaches them as the gate
+# account, so the operator's root block names its host by hand.
+host=""
+hostname=""
+user=""
+identity=""
+mode="write"
+# DEVBOX_SSH_CONFIG and --config exist so a test can point this at a temporary
+# file. A test that exercised the default would rewrite the developer's own
+# ~/.ssh/config on every run of the suite.
+config="${DEVBOX_SSH_CONFIG:-}"
+
+# Named so a missing value is reported as the flag the developer typed. `shift 2`
+# on a flag with nothing after it consumes the loop's own terminator and the
+# next flag is read as a value.
+#
+# A value that starts with -- is refused for the same reason: `--hostname
+# --config path` otherwise wrote `HostName --config` into the block and sent the
+# whole write to the DEFAULT ~/.ssh/config, which is the one file this command
+# must never edit by accident.
+need() {
+  [ "$#" -ge 2 ] || { echo "devbox ssh-install: $1 needs a value" >&2; exit 2; }
+  case "$2" in
+    --*) echo "devbox ssh-install: $1 needs a value, and got the flag $2" >&2; exit 2 ;;
+  esac
+}
+
+# --print and --remove ask different questions, so the second one is refused
+# rather than silently overriding the first.
+set_mode() {
+  [ "$mode" = "write" ] || {
+    echo "devbox ssh-install: --print and --remove ask different questions; pass one" >&2
+    exit 2
+  }
+  mode="$1"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host)     need "$@"; host="$2";     shift 2 ;;
+    --hostname) need "$@"; hostname="$2"; shift 2 ;;
+    --user)     need "$@"; user="$2";     shift 2 ;;
+    # A path to a key, never key material, so this argv carries no secret.
+    --identity) need "$@"; identity="$2"; shift 2 ;;
+    --config)   need "$@"; config="$2";   shift 2 ;;
+    --print)    set_mode print;  shift ;;
+    --remove)   set_mode remove; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "devbox ssh-install: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# A service manager and a cron job both run with no HOME. Expanding an unset one
+# would aim this command at /.ssh/config, which is somebody else's file or a
+# permission error, so it is named rather than guessed.
+if [ -z "$config" ]; then
+  [ -n "${HOME:-}" ] || {
+    echo "devbox ssh-install: HOME is not set, so there is no ~/.ssh/config. Pass --config <path>." >&2
+    exit 2
+  }
+  config="$HOME/.ssh/config"
+fi
+
+[ -n "$host" ] || {
+  echo "devbox ssh-install: no host. Pass --host <host>." >&2
+  usage >&2
+  exit 2
+}
+
+# The host goes into both delimiters. A name holding a space, a newline or a
+# glob writes an opening marker that no later run can match as a whole line, and
+# the block could then never be found again, replaced, or removed.
+case "$host" in
+  *[!A-Za-z0-9._-]*)
+    echo "devbox ssh-install: refusing host '$host': a devbox Host block is named with letters, digits, dot, dash and underscore" >&2
+    exit 2 ;;
+esac
+
+# A value holding a newline writes further ssh_config keywords inside the block,
+# so a --user could smuggle in a ProxyCommand that every later ssh obeys.
+for v in "$hostname" "$user" "$identity"; do
+  case "$v" in
+    *$'\n'*)
+      echo "devbox ssh-install: refusing a value that contains a newline" >&2
+      exit 2 ;;
+  esac
+done
+
+# A block with a Host line and nothing under it changes no ssh behaviour, and
+# writing one still edits a global file. Refuse the no-op rather than report a
+# write that did nothing.
+if [ "$mode" != "remove" ] && [ -z "$hostname$user$identity" ]; then
+  echo "devbox ssh-install: nothing to write. Pass at least one of --hostname, --user or --identity." >&2
+  echo "devbox doctor prints the three values this block needs." >&2
+  exit 2
+fi
+
+BEGIN="# >>> devbox $host >>>"
+END="# <<< devbox $host <<<"
+
+# The removal command is written into the block itself, so the file says how to
+# undo it even to a reader who has never run devbox.
+build_block() {
+  printf '%s\n' "$BEGIN"
+  printf '# devbox ssh-install wrote this block. Take it back out with:\n'
+  printf '#   devbox ssh-install --host %s --remove\n' "$host"
+  printf 'Host %s\n' "$host"
+  if [ -n "$hostname" ]; then printf '    HostName %s\n' "$hostname"; fi
+  if [ -n "$user" ];     then printf '    User %s\n' "$user"; fi
+  if [ -n "$identity" ]; then printf '    IdentityFile %s\n' "$identity"; fi
+  printf '%s\n' "$END"
+}
+
+if [ "$mode" = "print" ]; then
+  build_block
+  exit 0
+fi
+
+# ── what the config already holds ────────────────────────────────────────────
+begins=0
+ends=0
+existed=0
+if [ -e "$config" ]; then
+  existed=1
+  if [ ! -f "$config" ] || [ ! -r "$config" ]; then
+    echo "devbox ssh-install: $config is not a readable file" >&2
+    exit 1
+  fi
+  # grep -c exits 1 on a count of zero, which set -e would read as a failure.
+  begins="$(grep -cxF -- "$BEGIN" "$config" || true)"
+  ends="$(grep -cxF -- "$END" "$config" || true)"
+fi
+
+# An opening marker with no closing one gives the block no end. Guessing where
+# it ends is guessing which of a developer's own lines to delete, so this
+# refuses and names what it found instead.
+if [ "$begins" != "$ends" ] || [ "$begins" -gt 1 ]; then
+  echo "devbox ssh-install: refusing to touch $config: it holds $begins opening and $ends closing devbox markers for $host" >&2
+  echo "A block with no end has no end to guess at. Repair the markers by hand, then run this again." >&2
+  exit 1
+fi
+if [ "$begins" -eq 1 ]; then
+  begin_line="$(grep -nxF -- "$BEGIN" "$config" | cut -d: -f1)"
+  end_line="$(grep -nxF -- "$END" "$config" | cut -d: -f1)"
+  if [ "$end_line" -le "$begin_line" ]; then
+    echo "devbox ssh-install: refusing to touch $config: the closing devbox marker for $host is at line $end_line, above the opening one at line $begin_line" >&2
+    exit 1
+  fi
+fi
+
+if [ "$mode" = "remove" ] && [ "$begins" -eq 0 ]; then
+  echo "devbox ssh-install: no devbox block for $host in $config; nothing removed"
+  exit 0
+fi
+
+# ── the write ────────────────────────────────────────────────────────────────
+#
+# Built beside the target and moved onto it, so an interrupted run leaves the
+# original config whole rather than half a file that ssh cannot parse. mktemp
+# creates the file at 0600: ssh rejects a config other users can write with
+# "Bad owner or permissions", and then every ssh from this account fails, not
+# only the ones for this host.
+#
+# The directory is created at 0700 only when it is missing, and an existing one
+# keeps the mode it has: ssh refuses a key under a directory other users can
+# write, and a chmod of somebody's own ~/.ssh is not this command's business.
+dir="$(dirname "$config")"
+if [ ! -d "$dir" ]; then
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+fi
+tmp="$(mktemp "$dir/.devbox-ssh-install.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+if [ "$existed" -eq 1 ]; then
+  # mktemp reserves the name rather than the timestamp deciding it alone. Three
+  # runs inside one second shared one backup name, MEASURED, and the
+  # earliest state was overwritten: that is the state a developer reaches for
+  # when a write went wrong.
+  backup="$(mktemp "$config.devbox-backup-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+  cp -p "$config" "$backup"
+  echo "devbox ssh-install: backed up $config to $backup"
+fi
+
+if [ "$begins" -eq 1 ]; then
+  # The markers and the block travel through the environment, not through awk's
+  # -v, which applies backslash escape processing to the value: an IdentityFile
+  # path holding a backslash would be written back changed. ENVIRON passes the
+  # bytes as they are.
+  DEVBOX_BEGIN="$BEGIN" DEVBOX_END="$END" DEVBOX_BLOCK="$(build_block)" DEVBOX_MODE="$mode" \
+    awk '
+      $0 == ENVIRON["DEVBOX_BEGIN"] {
+        if (ENVIRON["DEVBOX_MODE"] == "write") printf "%s\n", ENVIRON["DEVBOX_BLOCK"]
+        skip = 1
+        next
+      }
+      skip && $0 == ENVIRON["DEVBOX_END"] { skip = 0; next }
+      !skip { print }
+    ' "$config" >"$tmp"
+else
+  # Guarded, because this is also the branch that runs when there is no config
+  # at all yet. An unguarded cat of a missing file aborted the run with the
+  # temporary file already created and nothing written.
+  if [ "$existed" -eq 1 ]; then
+    cat "$config" >"$tmp"
+    # A config whose last line carries no newline would otherwise be joined to
+    # the opening marker, which edits a line outside the block.
+    if [ -s "$tmp" ] && [ "$(tail -c1 "$tmp" | wc -l)" -eq 0 ]; then
+      printf '\n' >>"$tmp"
+    fi
+  fi
+  build_block >>"$tmp"
+fi
+
+mv -f "$tmp" "$config"
+trap - EXIT
+
+case "$mode" in
+  remove) echo "devbox ssh-install: removed the devbox block for $host from $config" ;;
+  *)
+    if [ "$begins" -eq 1 ]; then
+      echo "devbox ssh-install: replaced the devbox block for $host in $config"
+    elif [ "$existed" -eq 1 ]; then
+      echo "devbox ssh-install: wrote a devbox block for $host to $config"
+    else
+      echo "devbox ssh-install: created $config at mode 0600 with a devbox block for $host"
+    fi
+    echo "devbox ssh-install: take it back out with: devbox ssh-install --host $host --remove"
+    ;;
+esac

@@ -1,0 +1,491 @@
+#!/bin/bash
+# Choose the target a gate runs on. Sourced by devbox-verify, devbox-gc,
+# devbox-doctor and devbox-status, after devbox-config and devbox-transport.
+# shellcheck shell=bash
+#
+# A client used to know one host, DEVBOX_HOST. It now knows a list of deployed
+# targets, DEVBOX_TARGETS, and the rented ones in DEVBOX_RENT, and it asks every
+# deployed target one `probe` before it decides. The decision is
+# devbox_select, a pure function of the answers, so tests/test-target-select.sh
+# drives every selection rule with probe lines and no host.
+
+# Seconds an unreachable answer is kept. Back-to-back runs off the
+# LAN would otherwise each wait the full connect timeout for a LAN-only target.
+DEVBOX_UNREACHABLE_SECONDS=60
+# A health line older than this means the watchdog that writes it every 30
+# seconds is not running, so nothing on that host is being watched.
+DEVBOX_HEALTH_STALE_SECONDS=90
+# Seconds the probe waits for each deployed target to answer.
+DEVBOX_PROBE_CONNECT_TIMEOUT=3
+# Seconds each ssh of the probe may run in all. ConnectTimeout bounds
+# only the TCP connect and the banner. A host that accepted TCP and then stalled
+# in authentication (an overloaded sshd), or a path that dropped mid-call (cafe
+# wifi, a NAT that forgets the flow), held the probe's `wait` with no bound, and
+# with it every `devbox verify`, with no skip line. The master open gets the
+# connect timeout, a key exchange and one password attempt. Each verb after it
+# gets 25 seconds: gate-root bounds the probe's two host calls at 10 seconds
+# each, and sshd, sudo and the network take the rest. The environment may set
+# shorter values, which is how tests/test-target-select.sh stalls a stub host
+# without waiting 25 seconds.
+DEVBOX_PROBE_OPEN_SECONDS="${DEVBOX_PROBE_OPEN_SECONDS:-10}"
+DEVBOX_PROBE_ANSWER_SECONDS="${DEVBOX_PROBE_ANSWER_SECONDS:-25}"
+
+# The chosen target, set by devbox_target_use.
+TARGET=""
+TARGET_ADDR=""
+# A target that is not in .devbox.env: the rented Hetzner server, which
+# devbox-hetzner adds by name once it answers. Its address is in
+# DEVBOX_TARGET_<NAME> like a deployed one's; these hold the known_hosts file with
+# the key the client made for it, and its own gate password. Their names do not
+# start with DEVBOX_TARGET_: devbox_env_load unsets every variable with that
+# prefix, and an unset associative array reads a name as an arithmetic index.
+declare -gA TARGET_KNOWN_HOSTS=()
+declare -gA TARGET_SECRET=()
+# Where a rented target's pin comes from, for the messages: its rental record,
+# not a .devbox.env line.
+declare -gA TARGET_PIN_ORIGIN=()
+
+# Point the transport at one target, by name. Returns 2, with the
+# transport's own message, when its address is not an address.
+#
+# The pin is DEVBOX_TARGET_<NAME>_HOSTKEY, which the parser checked for a
+# deployed target and devbox-hetzner sets for the server it made.
+devbox_target_use() {
+  local name="$1" var pin
+  var="DEVBOX_TARGET_${name^^}"
+  pin="${var}_HOSTKEY"
+  # shellcheck disable=SC2034  # read by the scripts that source this file, never here
+  TARGET="$name"
+  TARGET_ADDR="${!var-}"
+  devbox_gate_target "$TARGET_ADDR" "$var in ${DEVBOX_ENV:-.devbox.env}" \
+    "${TARGET_KNOWN_HOSTS[$name]-}" "${TARGET_SECRET[$name]-}" \
+    "${!pin-}" "${TARGET_PIN_ORIGIN[$name]:-$pin in ${DEVBOX_ENV:-.devbox.env}}"
+}
+
+# Check every deployed target's address before anything is sent to any of them,
+# so a typo in the third one is refused by name rather than read as a host that
+# does not answer.
+devbox_targets_check() {
+  local name
+  for name in "${DEVBOX_DEPLOYED[@]}"; do
+    devbox_target_use "$name" || return 2
+  done
+}
+
+# Close the ControlMaster of every deployed target. The probe opens one per
+# target, so a caller's EXIT trap closes them all, not only the one it chose:
+# each one left to ControlPersist holds a connection for 60 more seconds.
+devbox_targets_close_all() {
+  local name
+  for name in "${DEVBOX_DEPLOYED[@]}" "${!TARGET_SECRET[@]}"; do
+    devbox_target_use "$name" >/dev/null 2>&1 || continue
+    devbox_gate_close
+  done
+}
+
+# ── affinity ─────────────────────────────────────────────────────────────────
+#
+# Each target keeps its own copy of each worktree's workspace: the synced
+# source, node_modules, the virtualenv, the build cache and the database. A
+# worktree that jumped between targets whenever one was busy would upload the
+# whole checkout and run the full DEVBOX_SETUP each time, which takes minutes.
+# So the client records where this worktree last ran, in the worktree's OWN git
+# dir, and prefers it. A linked worktree's git dir is its own, so two worktrees
+# of one checkout keep two records.
+devbox_affinity_file() {
+  local dir
+  dir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 1
+  [ -n "$dir" ] || return 1
+  printf '%s/devbox/last-target' "$dir"
+}
+
+devbox_affinity_read() {
+  local file name=""
+  file="$(devbox_affinity_file)" || return 0
+  [ -r "$file" ] || return 0
+  IFS= read -r name <"$file" || true
+  [[ "$name" =~ ^[a-z0-9]+$ ]] || return 0
+  printf '%s' "$name"
+}
+
+# Written by rename, so a run that is killed mid-write leaves the old record or
+# the new one, never half a name.
+devbox_affinity_write() {
+  local file tmp
+  file="$(devbox_affinity_file)" || return 0
+  mkdir -p "${file%/*}" || return 1
+  tmp="$file.$$"
+  printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$file"
+}
+
+# ── the unreachable cache ────────────────────────────────────────────────────
+#
+# One file per target in the private dir, holding `<epoch> <address>`. The
+# address is part of the record, so a target whose address changed in
+# .devbox.env is probed again at once.
+devbox_unreachable_file() { printf '%s/unreachable-%s' "$1" "$2"; }
+
+# Prints the age in seconds of a fresh record for this target, or returns 1.
+devbox_unreachable_age() {
+  local priv="$1" name="$2" addr="$3" now="$4" file epoch="" was="" age
+  file="$(devbox_unreachable_file "$priv" "$name")"
+  [ -r "$file" ] || return 1
+  read -r epoch was <"$file" || true
+  [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$was" = "$addr" ] || return 1
+  age=$((now - epoch))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$DEVBOX_UNREACHABLE_SECONDS" ] || return 1
+  printf '%s' "$age"
+}
+
+devbox_unreachable_set() {
+  printf '%s %s\n' "$4" "$3" >"$(devbox_unreachable_file "$1" "$2")" 2>/dev/null || true
+}
+
+devbox_unreachable_clear() {
+  rm -f "$(devbox_unreachable_file "$1" "$2")"
+}
+
+# ── the probe ────────────────────────────────────────────────────────────────
+#
+# Ask every named deployed target, in parallel, and print what each one said as
+# FACTS, one line each, in the order the names were given:
+#
+#   <name> unreachable <reason>       no answer, a cached "no answer", or a
+#                                     verb that did not answer in time
+#   <name> refused <ssh's line>       the gate password was refused
+#   <name> hostkey <message>          the host key, recorded or scanned, is not
+#                                     the pinned one
+#   <name> newkey <fingerprint>       this probe recorded the pinned key first
+#   <name> probe <probe line>         the answer of the probe verb
+#   <name> requires <exit status>     check-requires failed; the full answer is
+#                                     in <outdir>/<name>.requires
+#
+# $1 want, $2 min, $3 a directory for the answers, $4 1 to read the
+# unreachable cache or 0 to ask anyway, then the names. DEVBOX_PROBE_REQUIRES,
+# an array, holds the DEVBOX_REQUIRES tokens, each already checked.
+#
+# Each target opens its ControlMaster here, with a 3-second connect timeout, and
+# keeps it: the rest of the run reuses the chosen target's master. The caller
+# closes every one of them with devbox_targets_close_all. Every ssh here also
+# runs under GATE_TIME_LIMIT, so one stalled target cannot hold the `wait`.
+DEVBOX_PROBE_REQUIRES=()
+devbox_targets_probe() {
+  local want="$1" min="$2" out="$3" use_cache="$4" name now
+  shift 4
+  devbox_probe_limits_ok || return 2
+  now="$(date +%s)"
+  for name in "$@"; do
+    devbox_probe_one "$want" "$min" "$out" "$use_cache" "$name" "$now" >"$out/$name.facts" 2>/dev/null &
+  done
+  wait
+  for name in "$@"; do
+    cat "$out/$name.facts" 2>/dev/null || true
+  done
+}
+
+# The two limits and the tool that applies them, checked before any target is
+# asked. Returns 1 with a message. The probe and `devbox status` both ask every
+# target under these limits, so both check them here.
+devbox_probe_limits_ok() {
+  local v
+  # A limit that is not a number would make every `timeout` fail at once, and
+  # each target would then read as one that gave no answer.
+  for v in DEVBOX_PROBE_OPEN_SECONDS DEVBOX_PROBE_ANSWER_SECONDS; do
+    [[ "${!v}" =~ ^[1-9][0-9]{0,3}$ ]] || {
+      echo "devbox: $v is '${!v}' in the environment. Write a whole number of seconds from 1 to 9999, or unset it." >&2
+      return 1
+    }
+  done
+  # Every ssh of the probe runs under `timeout`. Without it each master open
+  # exits 127, every target reads as unreachable and enters the cache, and rule
+  # 4 rents a paid server on every run, or the run exits 3 as "no target
+  # answered". The cause is a tool missing on this laptop, so it is exit 2.
+  devbox_need_timeout || return 1
+}
+
+devbox_probe_one() (
+  set +e
+  local want="$1" min="$2" out="$3" use_cache="$4" name="$5" now="$6" age rc line req_rc
+  # shellcheck disable=SC2034  # read by devbox_gate_target in devbox-transport, which the caller sourced
+  GATE_CONNECT_TIMEOUT="$DEVBOX_PROBE_CONNECT_TIMEOUT"
+  # shellcheck disable=SC2034  # read by _gate_limit in devbox-transport; this subshell's value only
+  GATE_TIME_LIMIT="$DEVBOX_PROBE_OPEN_SECONDS"
+  devbox_target_use "$name" || { echo "$name unreachable its address is not an address"; exit 0; }
+  if [ "$use_cache" = 1 ] && age="$(devbox_unreachable_age "$GATE_PRIV" "$name" "$TARGET_ADDR" "$now")"; then
+    echo "$name unreachable no answer ${age}s ago, kept for ${DEVBOX_UNREACHABLE_SECONDS}s"
+    exit 0
+  fi
+  rc=0
+  devbox_gate_open || rc=$?
+  case "$rc" in
+    0) devbox_unreachable_clear "$GATE_PRIV" "$name" ;;
+    3) echo "$name refused $GATE_OPEN_ERROR"; exit 0 ;;
+    4) echo "$name hostkey $GATE_OPEN_ERROR"; exit 0 ;;
+    *)
+      devbox_unreachable_set "$GATE_PRIV" "$name" "$TARGET_ADDR" "$now"
+      case "$GATE_OPEN_ERROR" in
+        *"timed out"*) echo "$name unreachable no answer in ${DEVBOX_PROBE_CONNECT_TIMEOUT}s" ;;
+        *) echo "$name unreachable $GATE_OPEN_ERROR" ;;
+      esac
+      exit 0 ;;
+  esac
+  [ -z "$GATE_NEW_HOSTKEY" ] || echo "$name newkey $GATE_NEW_HOSTKEY"
+  # shellcheck disable=SC2034  # read by _gate_limit in devbox-transport; this subshell's value only
+  GATE_TIME_LIMIT="$DEVBOX_PROBE_ANSWER_SECONDS"
+  rc=0
+  line="$(devbox_gate probe "$want" "$min" 2>/dev/null)" || rc=$?
+  if _gate_limit_hit "$rc"; then
+    devbox_probe_slow "$name" probe "$now" "$DEVBOX_PROBE_ANSWER_SECONDS"
+    exit 0
+  elif [ "$rc" -eq 255 ]; then
+    devbox_probe_lost "$name" probe "$now"
+    exit 0
+  fi
+  line="${line%%$'\n'*}"
+  echo "$name probe $line"
+  # The image is asked only of a target whose answer is a probe line at all: a
+  # host that does not know `probe` is a handshake failure, and that is the
+  # reason its skip line must name.
+  if [ "${#DEVBOX_PROBE_REQUIRES[@]}" -gt 0 ] && devbox_probe_parse "$line"; then
+    req_rc=0
+    devbox_gate check-requires "${DEVBOX_PROBE_REQUIRES[@]}" >"$out/$name.requires" 2>&1 || req_rc=$?
+    if _gate_limit_hit "$req_rc"; then
+      devbox_probe_slow "$name" check-requires "$now" "$DEVBOX_PROBE_ANSWER_SECONDS"
+    elif [ "$req_rc" -eq 255 ]; then
+      devbox_probe_lost "$name" check-requires "$now"
+    elif [ "$req_rc" -ne 0 ]; then
+      echo "$name requires $req_rc"
+    fi
+  fi
+  exit 0
+)
+
+# A verb that did not answer within $4 seconds, its GATE_TIME_LIMIT. The
+# target is unreachable for this run, and the cache keeps the next run from
+# waiting on it again.
+# devbox_select reads an `unreachable` fact before a `probe` fact, so a target
+# whose check-requires stalled after its probe answered is skipped as well.
+devbox_probe_slow() {
+  devbox_unreachable_set "$GATE_PRIV" "$1" "$TARGET_ADDR" "$3"
+  echo "$1 unreachable no answer to $2 in ${4}s"
+}
+
+# ssh's own failure, 255, on a verb after the master opened: the master died, or
+# the path dropped mid-call. Read as the host's answer, an empty probe line was a
+# handshake failure, and on every target the run exited 5 and told the operator
+# to run `devbox server install` for a network fault. A check-requires that
+# failed this way was recorded as `requires 255`, and on every target the run
+# exited 6 for an image that was never asked. Such a target is unreachable
+# for this run. Neither verb exits 255 on the host.
+devbox_probe_lost() {
+  devbox_unreachable_set "$GATE_PRIV" "$1" "$TARGET_ADDR" "$3"
+  echo "$1 unreachable the connection failed during $2"
+}
+
+# ── the choice ───────────────────────────────────────────────────────────────
+#
+# A pure function: it reads the facts devbox_targets_probe printed on stdin, and
+# these variables, and touches nothing else.
+#
+#   SELECT_TARGETS    array, the deployed targets in DEVBOX_TARGETS order
+#   SELECT_AFFINITY   the target this worktree last ran on, or empty
+#   SELECT_RENT       array, the rented targets in DEVBOX_RENT order
+#   SELECT_MAX_WAIT   DEVBOX_MAX_QUEUE_WAIT; 0 is no ceiling
+#   SELECT_ACTION     DEVBOX_QUEUE_FULL_ACTION, local or fail
+#   SELECT_LIB        the library this client loaded, for the handshake
+#   SELECT_MIN        DEVBOX_MIN_TOKENS, for the line that names a pool too small
+#
+# It prints one `skip` line for each target that is not chosen and fails a
+# condition, in list order, and then ONE decision:
+#
+#   skip <name> <class> <text>
+#   pick <name> <rule> <verdict> <seconds> <tokens> <jobs> <queued>
+#   rent <provider>
+#   local [<name>]       the laptop; the name is a target over the ceiling that
+#                        the caller may still wait on if this laptop cannot run
+#                        the gate
+#   fail <code> <class>
+#
+# A class is what a skip means and which code it carries alone: unreachable 3,
+# auth 3, handshake 5, client 5, requires 6, unhealthy 8, never 8, busy 8,
+# over 8.
+#
+# The rules, the first that matches:
+#   1. the affinity target, when it passes every check and fits now
+#   2. the first target in list order that does
+#   3. among targets that fail only "fits now", the smallest wait under the
+#      ceiling; a wait the host could not estimate ranks after every number
+#   4. the first rented target
+#   5. the laptop, with DEVBOX_QUEUE_FULL_ACTION=local
+#   6. none
+#
+# Before rule 4: a failure that a person must repair, and that holds for EVERY
+# deployed target, fails the run with the code it had when a client knew one
+# host. A refused gate password or a host key off its pin is 3 (a
+# rotated password exits 3, never a silent skip), a handshake failure is 5 and
+# an image that lacks a DEVBOX_REQUIRES token is 6, so the operator learns that
+# a deploy is due rather than a pod being rented around it. A pool too small for
+# DEVBOX_MIN_TOKENS on every target is 8 for the same reason: routing a
+# permanent misconfiguration to a laptop would leave every target unused with
+# nobody told why. An unreachable target is the cafe case, and a rented target
+# or the laptop is its answer, so "every target is unreachable" is read only at
+# rule 6, and exits 3 there.
+devbox_select() {
+  local line name kind rest verdict vrc proto lib n
+  local -A open=() refused=() hostkey=() probe=() requires=() class=() text=()
+  local -a fit=() busy=() over=()
+  while IFS= read -r line; do
+    name="${line%% *}"
+    rest="${line#"$name"}"; rest="${rest# }"
+    kind="${rest%% *}"
+    rest="${rest#"$kind"}"; rest="${rest# }"
+    case "$kind" in
+      unreachable) open[$name]="$rest" ;;
+      refused) refused[$name]="$rest" ;;
+      hostkey) hostkey[$name]="$rest" ;;
+      probe) probe[$name]="$rest" ;;
+      requires) requires[$name]="$rest" ;;
+    esac
+  done
+
+  for name in "${SELECT_TARGETS[@]}"; do
+    if [ -n "${open[$name]+x}" ]; then
+      class[$name]=unreachable; text[$name]="unreachable (${open[$name]})"; continue
+    fi
+    if [ -n "${refused[$name]+x}" ]; then
+      class[$name]=auth; text[$name]="skipped: the gate password was refused"; continue
+    fi
+    if [ -n "${hostkey[$name]+x}" ]; then
+      class[$name]=auth; text[$name]="skipped: ${hostkey[$name]}"; continue
+    fi
+    if [ -z "${probe[$name]+x}" ]; then
+      class[$name]=unreachable; text[$name]="unreachable (it gave no answer)"; continue
+    fi
+    devbox_probe_parse "${probe[$name]}" && n=0 || n=1
+    proto="$PROBE_PROTOCOL"; lib="$PROBE_LIB"
+    vrc=0
+    verdict="$(devbox_handshake_verdict "$proto${lib:+ $lib}" "$SELECT_LIB")" || vrc=$?
+    if [ "$vrc" -eq 1 ]; then
+      class[$name]=client; text[$name]="skipped: $verdict"; continue
+    elif [ "$vrc" -ne 0 ]; then
+      class[$name]=handshake; text[$name]="skipped: $verdict"; continue
+    fi
+    if [ "$n" -ne 0 ]; then
+      class[$name]=handshake; text[$name]="skipped: its probe answer is not a line this client reads: ${probe[$name]}"; continue
+    fi
+    if [ -n "${requires[$name]+x}" ]; then
+      class[$name]=requires; text[$name]="skipped: its workspace image does not satisfy DEVBOX_REQUIRES"; continue
+    fi
+    case "$PROBE_HEALTH" in
+      ok)
+        if [ "$PROBE_HEALTH_AGE" -lt 0 ] || [ "$PROBE_HEALTH_AGE" -gt "$DEVBOX_HEALTH_STALE_SECONDS" ]; then
+          class[$name]=unhealthy
+          text[$name]="skipped: its health record is ${PROBE_HEALTH_AGE}s old, so its watchdog is not running"
+          continue
+        fi ;;
+      degraded|down)
+        class[$name]=unhealthy; text[$name]="skipped: $PROBE_HEALTH${PROBE_REASON:+ ($PROBE_REASON)}"; continue ;;
+      missing)
+        class[$name]=unhealthy; text[$name]="skipped: it has no health record, so its watchdog is not running"; continue ;;
+      *)
+        class[$name]=unhealthy; text[$name]="skipped: its health record does not read as one, so its watchdog is not trusted"; continue ;;
+    esac
+    case "$PROBE_VERDICT" in
+      now) fit+=("$name"); class[$name]=fit ;;
+      never)
+        class[$name]=never
+        # $PROBE_TOKENS is the pool's CURRENT held/total, a fraction such as
+        # 0/32, and not a bare count: a message that called it "smaller" than
+        # that string would compare a number this project asks for against
+        # text that reads as one. The total is pulled back out of it so the
+        # line names two numbers.
+        text[$name]="skipped: its pool holds ${PROBE_TOKENS#*/} token(s) in all, and can never grant DEVBOX_MIN_TOKENS=$SELECT_MIN" ;;
+      wait)
+        if [ "$SELECT_MAX_WAIT" -eq 0 ] || [ "$PROBE_SECS" -le "$SELECT_MAX_WAIT" ]; then
+          busy+=("$PROBE_SECS $name"); class[$name]=busy
+          text[$name]="skipped: busy, about ${PROBE_SECS}s of queuing"
+        else
+          over+=("$PROBE_SECS $name"); class[$name]=over
+          text[$name]="skipped: busy, about ${PROBE_SECS}s of queuing, over the DEVBOX_MAX_QUEUE_WAIT of ${SELECT_MAX_WAIT}s"
+        fi ;;
+      *)
+        busy+=("- $name"); class[$name]=busy
+        text[$name]="skipped: busy, and its pool could not estimate the wait" ;;
+    esac
+    probe[$name]="$PROBE_VERDICT $PROBE_SECS $PROBE_TOKENS $PROBE_JOBS $PROBE_QUEUED"
+  done
+
+  local pick="" rule=""
+  if [ -n "$SELECT_AFFINITY" ] && [ "${class[$SELECT_AFFINITY]-}" = fit ]; then
+    pick="$SELECT_AFFINITY"; rule=1
+  elif [ "${#fit[@]}" -gt 0 ]; then
+    pick="${fit[0]}"; rule=2
+  elif [ "${#busy[@]}" -gt 0 ]; then
+    pick="$(_devbox_select_least "${busy[@]}")"; rule=3
+  fi
+
+  # The skip lines, before the decision, for every target that is not the pick
+  # and failed a check. A target that passed every check and lost only to the
+  # affinity target or to list order is not skipped, so it has no line.
+  for name in "${SELECT_TARGETS[@]}"; do
+    [ "$name" != "$pick" ] || continue
+    [ "${class[$name]}" != fit ] || continue
+    printf 'skip %s %s %s\n' "$name" "${class[$name]}" "${text[$name]}"
+  done
+
+  if [ -n "$pick" ]; then
+    printf 'pick %s %s %s\n' "$pick" "$rule" "${probe[$pick]}"
+    return 0
+  fi
+
+  local hard="" c all=1
+  if [ "${#SELECT_TARGETS[@]}" -gt 0 ]; then
+    for name in "${SELECT_TARGETS[@]}"; do
+      c="${class[$name]}"
+      [ "$c" != client ] || c=handshake
+      if [ -z "$hard" ]; then hard="$c"; elif [ "$hard" != "$c" ]; then all=0; fi
+    done
+    if [ "$all" -eq 1 ]; then
+      case "$hard" in
+        auth) echo "fail 3 auth"; return 0 ;;
+        handshake) echo "fail 5 handshake"; return 0 ;;
+        requires) echo "fail 6 requires"; return 0 ;;
+        never) echo "fail 8 never"; return 0 ;;
+      esac
+    fi
+  fi
+  if [ "${#SELECT_RENT[@]}" -gt 0 ]; then
+    printf 'rent %s\n' "${SELECT_RENT[0]}"
+    return 0
+  fi
+  if [ "$SELECT_ACTION" = local ]; then
+    if [ "${#over[@]}" -gt 0 ]; then
+      printf 'local %s\n' "$(_devbox_select_least "${over[@]}")"
+    else
+      echo "local"
+    fi
+    return 0
+  fi
+  if [ "${#SELECT_TARGETS[@]}" -gt 0 ] && [ "$all" -eq 1 ] && [ "$hard" = unreachable ]; then
+    echo "fail 3 unreachable"
+  else
+    echo "fail 8 none"
+  fi
+}
+
+# The name with the smallest wait among "<seconds> <name>" words, the affinity
+# target first on a tie and list order after it. A wait of `-` is one the pool
+# could not estimate, and ranks after every number.
+_devbox_select_least() {
+  local entry secs name best="" best_secs="" best_aff=0 aff
+  for entry in "$@"; do
+    secs="${entry%% *}"; name="${entry#* }"
+    [ "$secs" != - ] || secs=999999999
+    aff=0; [ "$name" != "$SELECT_AFFINITY" ] || aff=1
+    if [ -z "$best" ] || [ "$secs" -lt "$best_secs" ] \
+       || { [ "$secs" -eq "$best_secs" ] && [ "$aff" -gt "$best_aff" ]; }; then
+      best="$name"; best_secs="$secs"; best_aff="$aff"
+    fi
+  done
+  printf '%s' "$best"
+}

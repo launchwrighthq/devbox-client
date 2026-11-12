@@ -1,0 +1,12 @@
+#!/bin/bash
+# `devbox run -- <command>`: one command in this checkout's devbox workspace, with
+# the same sync, setup and token grant as the gate. Agents re-running one test
+# had no remote route, so they ran pytest on the laptop, and the load average
+# went far above the core count, MEASURED.
+#
+# It is not a gate and never falls back to this machine. devbox-verify holds the
+# whole path, so the two cannot drift; --run selects the command.
+set -euo pipefail
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# bash rather than exec of the file itself: a wheel install carries no exec bit.
+exec bash "$_here/devbox-verify" --run "$@"

@@ -1,0 +1,114 @@
+#!/bin/bash
+# Run the gate here and on the devbox, then diff the OUTCOME, not the clock.
+#
+# A difference in SKIPPED is treated as a failure, not a curiosity. That is
+# exactly how the first version of this runner lied: with no Postgres, a
+# project skipped its database tests and still exited 0, so the gate was green
+# over less code than the local one.
+set -uo pipefail
+
+counts() {
+  # Both gates end with a pytest- or vitest-shaped summary line. Pull the four
+  # numbers out of whichever appears, and print them normalised.
+  #
+  # vitest prints TWO summary lines ("Test Files ..." then "Tests ..."); this
+  # awk keeps whichever match came LAST, so the more granular "Tests" line
+  # (per-test counts) overwrites the coarser "Test Files" line (per-file
+  # counts). tests/test-devbox-compare.sh pins it against output captured from
+  # real pytest and vitest runs: a pytest line (counts in any order, a trailing
+  # "N warnings" that must NOT be read as a count) and vitest's two-line pair
+  # (pipe-separated fields, the per-file line first).
+  awk '
+    /[0-9]+ (passed|failed|skipped|error)/ {
+      for (i = 1; i < NF; i++) {
+        if ($(i+1) ~ /^passed/)  p = $i
+        if ($(i+1) ~ /^failed/)  f = $i
+        if ($(i+1) ~ /^skipped/) s = $i
+        if ($(i+1) ~ /^error/)   e = $i
+      }
+    }
+    END { printf "passed=%d failed=%d skipped=%d errors=%d\n", p, f, s, e }
+  '
+}
+
+main() {
+  local root l r devbox logs
+  # The remote gate runs where `devbox verify` would choose, unless
+  # --target names one. A comparison against a target the developer did not
+  # mean reads as a divergence of the gate when it is a divergence of hosts.
+  local -a target=()
+  local name=""
+  case "$#:${1:-}" in
+    0:) ;;
+    2:--target) name="$2" ;;
+    1:--target=*) name="${1#--target=}" ;;
+    *) echo "usage: devbox compare [--target <name>]" >&2; exit 2 ;;
+  esac
+  if [ "$#" -gt 0 ]; then
+    [ -n "$name" ] || { echo "usage: devbox compare [--target <name>]" >&2; exit 2; }
+    target=(--target "$name")
+  fi
+
+  # Both gates come from the dispatcher BESIDE this file, never from a
+  # devbox-verify on PATH: a PATH binary is whichever client some other project
+  # happened to install, and comparing two gates only means something when both
+  # are run by this client. Resolved with readlink -f because the dispatcher is
+  # reached through a symlink from node_modules/.bin, .venv/bin or ~/.local/bin,
+  # where no sibling bin/ exists. Resolved inside main() so that sourcing this
+  # file for the counts() unit tests needs no dispatcher at all.
+  #
+  # Resolved BEFORE the cd, while the invoking directory still applies.
+  # ${BASH_SOURCE[0]} is relative whenever the command line was relative, as
+  # `bash client/libexec/devbox-compare` is, and readlink -f resolves a relative
+  # path against the CURRENT directory. Run after the cd, it looked for the
+  # dispatcher under the repo root instead, and this command died reporting no
+  # dispatcher beside a file that has one.
+  devbox="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../bin/devbox")"
+  [ -x "$devbox" ] || { echo "devbox-compare: no devbox dispatcher beside this file; expected ../bin/devbox" >&2; exit 1; }
+
+  root="$(git rev-parse --show-toplevel)"; cd "$root" || exit
+
+  # The logs went to a fixed /tmp/devbox-compare-*.log, which is two faults at
+  # once in a world-writable directory: two concurrent runs write one file and
+  # then read each other's numbers, and any other user can pre-create that path
+  # and decide what this gate parses. mktemp -d gives a private directory nobody
+  # else can guess or own.
+  # Refuse rather than write beside an unset path: with no log to parse, both
+  # gates count zero and this command reports an equivalence it never checked.
+  logs="$(mktemp -d)" || { echo "devbox-compare: mktemp -d failed; refusing to run without a log directory" >&2; exit 1; }
+  trap 'rm -rf "$logs"' EXIT
+
+  echo "==> local gate"
+  "$devbox" verify --local 2>&1 | tee "$logs/local.log" | tail -3
+  echo "==> remote gate"
+  "$devbox" verify ${target[@]+"${target[@]}"} 2>&1 | tee "$logs/remote.log" | tail -3
+
+  l="$(counts <"$logs/local.log")"
+  r="$(counts <"$logs/remote.log")"
+  printf '\nlocal   %s\nremote  %s\n\n' "$l" "$r"
+
+  if [ "$l" = "$r" ]; then
+    echo "compare: equivalent"
+    exit 0
+  fi
+  echo "compare: DIVERGENT"
+  echo "The remote gate did not test the same thing as the local one."
+  echo "Every difference needs a named cause in .devbox/known-divergence.txt."
+  # A divergent run keeps its two logs, because reading them is the only way to
+  # find out WHY the gates disagree. The path is printed because mktemp made it
+  # unguessable, which is the point everywhere except here.
+  trap - EXIT
+  echo "Full output: $logs/local.log and $logs/remote.log"
+  if [ -f .devbox/known-divergence.txt ]; then
+    echo; echo "Currently accepted:"; cat .devbox/known-divergence.txt
+  fi
+  exit 1
+}
+
+# Guarded so tests/test-devbox-compare.sh can `source` this file to unit-test
+# counts() without ever running the two gates for real. $0 and BASH_SOURCE[0]
+# agree only when the file is executed directly, which is how `devbox compare`
+# reaches it, never when it is sourced.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

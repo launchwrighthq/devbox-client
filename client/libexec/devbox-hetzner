@@ -1,0 +1,529 @@
+#!/bin/bash
+# The rented Hetzner target. Sourced by devbox-verify, after devbox-config,
+# devbox-transport and devbox-targets, for `devbox verify --target hetzner`, for rule 4
+# of the target choice when DEVBOX_RENT names hetzner, and for
+# `devbox hetzner up|status|down`.
+#
+# RunPod rents a bare container, so devbox-runpod carries its own sync, provision and
+# gate. A Hetzner server starts from a snapshot of a deployed devbox, which the
+# operator of the server half builds, so it already runs the gate account, the pool, the
+# watchdog and the workspace image. This file owns only the lifecycle: create the
+# server, hand devbox-verify a target it reaches with the gate transport like any
+# deployed target, and delete the server with a confirmed delete. The server deletes
+# itself after DEVBOX_HETZNER_IDLE_SECONDS with no gate (server/bin/devbox-hetzner-runtime),
+# because a laptop that closes its lid cannot be the one that stops the bill.
+#
+# Every refusal returns a code that devbox-verify passes to devbox_die, which marks
+# it as devbox's own for the strict map: 1 an API call failed, 2 a setting or the
+# project is wrong, 3 the server did not become ready, 4 another run of this checkout
+# holds the creation.
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec bash "$(dirname "$(readlink -f "$0")")/devbox-verify" --hetzner-action "$@"
+fi
+
+# shellcheck source=client/libexec/devbox-rented
+declare -F rented_http >/dev/null || source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-rented"
+
+HZ_API=https://api.hetzner.cloud/v1
+HZ_CLIENT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+HZ_STATE=""
+# 1 while this run creates a server and has not yet seen it ready. A run that dies
+# in that window deletes the server it made, from devbox-verify's EXIT trap.
+HZ_CLEANUP=0
+
+hetzner_api() {
+  local method="$1" path="$2" body="${3:-}"
+  RENTED_HTTP_WHO="devbox hetzner" RENTED_HTTP_DIR="$HZ_STATE" \
+    rented_http "$HCLOUD_TOKEN" "$method" "$HZ_API$path" "$path" "$body"
+}
+
+hetzner_save() { rented_save "$HZ_STATE/server.json" "$@"; }
+
+# 8 random bytes, not RunPod's 16: Hetzner takes a server name as a hostname, and a
+# hostname label holds at most 63 characters.
+hetzner_name() { rented_name devbox-hz 8; }
+
+hetzner_owner_name() {
+  [[ "$1" =~ ^devbox-hz-[a-z0-9][a-z0-9-]{0,7}-[a-f0-9]{10}-[a-f0-9]{16}$ ]]
+}
+
+# What every action needs: the tools, the token and the state directory. The state
+# lives in this worktree's private git dir, as RunPod's does, and devbox-sync never
+# sends it: it holds the server's gate password.
+hetzner_setup() {
+  local tool
+  for tool in jq curl ssh ssh-keygen flock; do
+    command -v "$tool" >/dev/null || { echo "devbox hetzner: install $tool" >&2; return 2; }
+  done
+  # A Hetzner Cloud token is 64 letters and digits. The check also keeps a quote or
+  # a newline out of the header file that carries it.
+  [[ "${HCLOUD_TOKEN:-}" =~ ^[A-Za-z0-9]{1,256}$ ]] || {
+    echo "devbox hetzner: set HCLOUD_TOKEN in ${DEVBOX_ENV:-.devbox.env} to an API token of the Hetzner Cloud project that holds the devbox snapshot" >&2
+    return 2
+  }
+  HZ_STATE="$(git rev-parse --path-format=absolute --git-dir)/devbox-hetzner" || return 1
+  mkdir -p "$HZ_STATE" || return 1
+  chmod 0700 "$HZ_STATE" || return 1
+  # Environment knobs that shorten the waits, for tests/test-hetzner.sh.
+  HZ_POLL="${DEVBOX_HETZNER_POLL_SECONDS:-5}"
+  HZ_READY="${DEVBOX_HETZNER_READY_SECONDS:-600}"
+  HZ_LOCK_WAIT="${DEVBOX_HETZNER_LOCK_SECONDS:-900}"
+  [[ "$HZ_POLL" =~ ^[0-9]{1,3}$ && "$HZ_READY" =~ ^[0-9]{1,4}$ && "$HZ_LOCK_WAIT" =~ ^[0-9]{1,4}$ ]] || {
+    echo 'devbox hetzner: DEVBOX_HETZNER_POLL_SECONDS, DEVBOX_HETZNER_READY_SECONDS and DEVBOX_HETZNER_LOCK_SECONDS are whole numbers of seconds' >&2
+    return 2
+  }
+}
+
+# The keys a new server reads. The server type is an ordered list, tried in turn
+# (hetzner_up): Hetzner refused a create with HTTP 412 resource_unavailable when a
+# type had no capacity in the location, MEASURED for cx43 and cx53 while ccx33
+# and ccx43 were available in the same location. A single
+# type therefore left a rental with no server whenever that type ran out. cx43
+# comes first as the cheapest of the three, then ccx33 and ccx43, dedicated vCPU,
+# ccx43 the closest Hetzner shape to the RunPod default of 16 vCPU. No gate is
+# measured on any of them yet. nbg1 is a German location that offers all three.
+# The idle time and its 8-hour ceiling are RunPod's.
+hetzner_settings() {
+  : "${DEVBOX_HETZNER_SERVER_TYPE:=cx43,ccx33,ccx43}" "${DEVBOX_HETZNER_LOCATION:=nbg1}" "${DEVBOX_HETZNER_IDLE_SECONDS:=7200}"
+  [[ "$DEVBOX_HETZNER_SERVER_TYPE" =~ ^[a-z0-9-]{1,32}(,[a-z0-9-]{1,32}){0,15}$ ]] || {
+    echo "devbox hetzner: DEVBOX_HETZNER_SERVER_TYPE '$DEVBOX_HETZNER_SERVER_TYPE' is not a comma-separated list of Hetzner server types, tried in order, such as cx43,ccx33,ccx43" >&2; return 2; }
+  [[ "$DEVBOX_HETZNER_LOCATION" =~ ^[a-z0-9-]{1,16}$ ]] || {
+    echo "devbox hetzner: DEVBOX_HETZNER_LOCATION '$DEVBOX_HETZNER_LOCATION' is not a Hetzner location, such as nbg1" >&2; return 2; }
+  if ! [[ "$DEVBOX_HETZNER_IDLE_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$DEVBOX_HETZNER_IDLE_SECONDS" -gt 28800 ]; then
+    echo 'devbox hetzner: DEVBOX_HETZNER_IDLE_SECONDS must be between 1 and 28800' >&2; return 2
+  fi
+}
+
+# 0 while a record names a server that is not known to be deleted.
+hetzner_live() {
+  [ -f "$HZ_STATE/server.json" ] || return 1
+  [ "$(jq -r 'if type == "object" then (.deleted // false | tostring) else "invalid" end' "$HZ_STATE/server.json" 2>/dev/null)" = false ]
+}
+
+# 0 once the API answers 404 for the server. The confirmation RunPod's cleanup
+# makes: a DELETE that returned 200 is a request, and only a later not-found read
+# proves the server, and its bill, are gone.
+hetzner_gone() {
+  local i=0
+  while :; do
+    [ "$(hetzner_api GET "/servers/$1")" != null ] || return 0
+    i=$((i + 1))
+    [ "$i" -lt 24 ] || return 1
+    sleep "$HZ_POLL"
+  done
+}
+
+# The server id of a record whose create response was lost, found by its exact
+# name. Prints nothing when no such server exists.
+hetzner_find() {
+  local name="$1" found
+  found=$(hetzner_api GET "/servers?name=$name") || return 1
+  found=$(jq --arg name "$name" '[.servers[]? | select(.name == $name)]' <<<"$found") || return 1
+  [ "$(jq length <<<"$found")" -le 1 ] || { echo 'devbox hetzner: two servers carry this rental name; nothing deleted' >&2; return 1; }
+  jq -r '.[0].id // empty' <<<"$found"
+}
+
+hetzner_owned() {
+  jq -e --arg name "$1" '.server.name == $name and .server.labels.devbox == "rented"' >/dev/null
+}
+
+hetzner_down() (
+  # A run's EXIT trap and a `devbox hetzner down` can arrive together. Serialize
+  # deletion, then read the record again.
+  flock -w 60 8 || return 1
+  [ -f "$HZ_STATE/server.json" ] || return 0
+  local deleted name id server
+  deleted=$(jq -er 'if type == "object" and (.deleted == null or (.deleted | type) == "boolean") then (.deleted // false | tostring) else error("invalid rental record") end' "$HZ_STATE/server.json") || return 1
+  [ "$deleted" = false ] || return 0
+  name=$(jq -r '.name' "$HZ_STATE/server.json")
+  hetzner_owner_name "$name" || { echo 'devbox hetzner: invalid rental owner in the record' >&2; return 1; }
+  id=$(jq -r '.id // empty' "$HZ_STATE/server.json")
+  if [ -z "$id" ]; then
+    id=$(hetzner_find "$name") || return 1
+    # A lost create response is not proof that creation failed. The server carries
+    # its own watcher; keep the record while a create can still appear.
+    if [ -z "$id" ] && [ "$(jq -r '.createUncertain // false' "$HZ_STATE/server.json")" = true ] &&
+       [ "$(date +%s)" -lt "$(jq -r '(.createdAt // now) + 600 | floor' "$HZ_STATE/server.json")" ]; then
+      echo 'devbox hetzner: creation outcome unknown; retry devbox hetzner down to confirm' >&2
+      return 1
+    fi
+  fi
+  if [ -n "$id" ]; then
+    [[ "$id" =~ ^[0-9]+$ ]] || return 1
+    server=$(hetzner_api GET "/servers/$id") || return 1
+    if [ "$server" != null ]; then
+      hetzner_owned "$name" <<<"$server" || {
+        echo 'devbox hetzner: the server does not carry this rental name and the devbox=rented label; nothing deleted' >&2; return 1; }
+      hetzner_api DELETE "/servers/$id" >/dev/null || return 1
+      hetzner_gone "$id" || { echo 'devbox hetzner: deletion not yet confirmed; retry devbox hetzner down' >&2; return 1; }
+    fi
+  fi
+  # jq owns $id; shell expansion would change the JSON program.
+  # shellcheck disable=SC2016
+  hetzner_save --arg id "$id" '.id = (if $id == "" then null else ($id | tonumber) end) | .deleted = true' || return 1
+  rm -f "$HZ_STATE/gate-password" "$HZ_STATE/known_hosts" "$HZ_STATE/hostkey" "$HZ_STATE/hostkey.pub" "$HZ_STATE/request.json"
+  echo "==> Hetzner server deleted: ${id:-no server created}"
+) 8>"$HZ_STATE/delete.lock"
+
+# The newest snapshot labelled devbox=workspace in the token's project, as its id
+# and its disk size in GB, or nothing.
+hetzner_snapshot() {
+  local images
+  images=$(hetzner_api GET '/images?type=snapshot&label_selector=devbox%3Dworkspace&sort=created:desc&per_page=50') || return 1
+  jq -r '[.images[]? | select(.type == "snapshot" and .status == "available" and .labels.devbox == "workspace")]
+         | sort_by(.created) | last | if . == null then empty else "\(.id) \(.disk_size)" end' <<<"$images"
+}
+
+# The disk of server type $1 in GB, or nothing when Hetzner lists no such type.
+hetzner_type_disk() {
+  local types
+  types=$(hetzner_api GET "/server_types?name=$1") || return 1
+  jq -r --arg name "$1" '[.server_types[]? | select(.name == $name) | .disk][0] // empty' <<<"$types"
+}
+
+hetzner_up() {
+  local name snapshot image disk server="" id ip pin hourly type size rc i pw="" refused="" unavailable=0
+  local -a types
+  name=$(hetzner_name) || return 1
+  hetzner_owner_name "$name" || { echo "devbox hetzner: this laptop's host name gives no valid server name ($name)" >&2; return 2; }
+  # Authenticate and find the snapshot before allocation, so a refused token or a
+  # missing snapshot cannot leave an uncertain create.
+  snapshot=$(hetzner_snapshot) || return 1
+  [ -n "$snapshot" ] || {
+    echo "devbox hetzner: the Hetzner project of HCLOUD_TOKEN holds no available snapshot labelled devbox=workspace. The operator of the server half builds one." >&2
+    return 2
+  }
+  image="${snapshot%% *}" disk="${snapshot#* }"
+  [[ "$image" =~ ^[0-9]+$ ]] || { echo "devbox hetzner: the snapshot id '$image' is not a number" >&2; return 1; }
+  [[ "$disk" =~ ^[0-9]{1,6}([.][0-9]{1,6})?$ ]] || { echo "devbox hetzner: snapshot $image names no disk size in GB ('$disk')" >&2; return 1; }
+  rm -f "$HZ_STATE/hostkey" "$HZ_STATE/hostkey.pub" "$HZ_STATE/known_hosts" "$HZ_STATE/gate-password"
+  # The host key is made HERE, and the server receives it in its user data. The
+  # client then knows the key before the first contact, so no man in the middle can
+  # take the gate password then. Hetzner gives a new server an address that another
+  # customer's server held, and a key recorded on first contact would refuse the
+  # next rental at that address.
+  ssh-keygen -q -t ed25519 -N '' -C devbox-hetzner -f "$HZ_STATE/hostkey" || return 1
+  # The pin of this rental, kept in its record: the transport holds the server to
+  # it on every connection, as it holds a deployed target to its
+  # DEVBOX_TARGET_<NAME>_HOSTKEY, so a known_hosts file that something else
+  # rewrote is refused rather than trusted.
+  pin="$(ssh-keygen -l -f "$HZ_STATE/hostkey.pub" | awk '{ print $2; exit }')"
+  devbox_hostkey_pin_ok "$pin" || { echo "devbox hetzner: ssh-keygen gave '$pin' as the fingerprint of the new host key, not SHA256:<43 characters>" >&2; return 1; }
+  # A gate password of this server alone: the user data holds it, Hetzner stores
+  # the user data, and the deployed targets' DEVBOX_GATE_PASSWORD must not be in it.
+  # The same recipe that makes the deployed targets' password.
+  while [ "${#pw}" -lt 32 ]; do
+    pw="$(head -c 48 /dev/urandom | base64 | tr -d '/+=\n')"
+  done
+  (umask 077; printf '%s' "$pw" >"$HZ_STATE/gate-password") || return 1
+  # serverType is set to each type before its create below.
+  jq -n --arg name "$name" --argjson createdAt "$(date +%s)" \
+    --arg location "$DEVBOX_HETZNER_LOCATION" --argjson image "$image" --argjson idleSeconds "$DEVBOX_HETZNER_IDLE_SECONDS" \
+    --arg hostKey "$pin" \
+    '{name:$name,createdAt:$createdAt,serverType:null,location:$location,image:$image,idleSeconds:$idleSeconds,hostKey:$hostKey,createUncertain:true}' \
+    >"$HZ_STATE/server.json" || return 1
+  # The token and the password reach jq on stdin, written by printf and cat, so
+  # neither becomes an argument of jq or of curl. The cloud-config is JSON, which
+  # YAML reads as it stands, so no value needs YAML quoting.
+  # The jq program names its own variables.
+  # shellcheck disable=SC2016
+  { printf '%s\n' "$HCLOUD_TOKEN"; cat "$HZ_STATE/gate-password"; } | (umask 077; jq -Rs \
+    --arg name "$name" --arg location "$DEVBOX_HETZNER_LOCATION" \
+    --argjson image "$image" --arg idle "$DEVBOX_HETZNER_IDLE_SECONDS" \
+    --rawfile hostkey "$HZ_STATE/hostkey" --rawfile hostpub "$HZ_STATE/hostkey.pub" \
+    --rawfile runtime "$HZ_CLIENT/../../server/bin/devbox-hetzner-runtime" \
+    --rawfile rentedidle "$HZ_CLIENT/../../server/bin/devbox-rented-idle" '
+    split("\n") as [$token, $pw]
+    | {
+        ssh_deletekeys: true,
+        ssh_genkeytypes: [],
+        ssh_keys: {ed25519_private: $hostkey, ed25519_public: $hostpub},
+        write_files: [
+          {path: "/etc/devbox/hetzner/token", owner: "root:root", permissions: "0600", content: $token},
+          {path: "/etc/devbox/hetzner/gate-password", owner: "root:root", permissions: "0600", content: ("devbox-gate:" + $pw + "\n")},
+          {path: "/etc/devbox/hetzner/owner", permissions: "0644", content: ($name + "\n")},
+          {path: "/etc/devbox/hetzner/idle-seconds", permissions: "0644", content: ($idle + "\n")},
+          {path: "/usr/local/libexec/devbox/devbox-rented-idle", permissions: "0644", encoding: "b64", content: ($rentedidle | @base64)},
+          {path: "/usr/local/libexec/devbox/devbox-hetzner-runtime", permissions: "0755", encoding: "b64", content: ($runtime | @base64)}
+        ],
+        runcmd: [["/bin/bash", "/usr/local/libexec/devbox/devbox-hetzner-runtime", "boot"]]
+      } as $config
+    | {name: $name, location: $location, image: $image, start_after_create: true,
+       labels: {devbox: "rented"}, public_net: {enable_ipv4: true, enable_ipv6: false},
+       user_data: ("#cloud-config\n" + ($config | tojson))}' >"$HZ_STATE/request.json") || return 1
+  # Hetzner refuses user data over 32 KiB.
+  [ "$(jq '.user_data | length' "$HZ_STATE/request.json")" -le 32768 ] || {
+    echo 'devbox hetzner: the cloud-init user data is over the 32 KiB Hetzner accepts' >&2
+    rm -f "$HZ_STATE/request.json"; return 1
+  }
+  # One create per type of DEVBOX_HETZNER_SERVER_TYPE, in order, until one is made.
+  # A type whose disk is smaller than the snapshot's is skipped before its create:
+  # a server cannot boot a snapshot larger than its own disk. A type with no
+  # capacity in the location (HTTP 412 resource_unavailable, see hetzner_settings)
+  # passes to the next. Any other refusal stops the rental, as it did before.
+  IFS=, read -ra types <<<"$DEVBOX_HETZNER_SERVER_TYPE"
+  for i in "${!types[@]}"; do
+    type="${types[$i]}"
+    size=$(hetzner_type_disk "$type") || { rm -f "$HZ_STATE/request.json" "$HZ_STATE/hostkey"; return 1; }
+    if [ -z "$size" ]; then
+      echo "==> Hetzner server type $type skipped: Hetzner lists no such server type"
+      refused+="${refused:+; }$type: Hetzner lists no such server type"
+      continue
+    fi
+    [[ "$size" =~ ^[0-9]{1,6}$ ]] || { echo "devbox hetzner: Hetzner gave '$size' as the disk of server type $type, not a size in GB" >&2; rm -f "$HZ_STATE/request.json" "$HZ_STATE/hostkey"; return 1; }
+    if jq -en --argjson size "$size" --argjson disk "$disk" '$size < $disk' >/dev/null; then
+      echo "==> Hetzner server type $type skipped: its $size GB disk is smaller than the $disk GB of snapshot $image"
+      refused+="${refused:+; }$type: a $size GB disk, smaller than the snapshot's $disk GB"
+      continue
+    fi
+    # jq owns $type.
+    # shellcheck disable=SC2016
+    { (umask 077; rented_save "$HZ_STATE/request.json" --arg type "$type" '.server_type = $type') &&
+      hetzner_save --arg type "$type" '.serverType = $type'; } || { rm -f "$HZ_STATE/request.json" "$HZ_STATE/hostkey"; return 1; }
+    rc=0
+    server=$(RENTED_HTTP_UNAVAILABLE=1 hetzner_api POST /servers "$HZ_STATE/request.json") || rc=$?
+    [ "$rc" -ne 0 ] || break
+    server=""
+    [ "$rc" -eq 3 ] || { rm -f "$HZ_STATE/request.json" "$HZ_STATE/hostkey"; return 1; }
+    unavailable=1
+    echo "==> Hetzner server type $type has no capacity in $DEVBOX_HETZNER_LOCATION (HTTP 412 resource_unavailable)${types[$((i + 1))]+; trying ${types[$((i + 1))]}}"
+    refused+="${refused:+; }$type: no capacity in $DEVBOX_HETZNER_LOCATION"
+  done
+  rm -f "$HZ_STATE/request.json" "$HZ_STATE/hostkey"
+  if [ -z "$server" ]; then
+    # Every create was refused or never sent, so no server exists, and the record
+    # must not hold the next run on an uncertain create.
+    hetzner_save '.createUncertain = false | .deleted = true' || return 1
+    rm -f "$HZ_STATE/gate-password" "$HZ_STATE/hostkey.pub" "$HZ_STATE/known_hosts"
+    echo "devbox hetzner: no server type of DEVBOX_HETZNER_SERVER_TYPE could be created in $DEVBOX_HETZNER_LOCATION: $refused" >&2
+    # A type with no capacity now may have some later, which is the API's answer
+    # (1). A list that holds no type able to carry the snapshot is a setting (2).
+    [ "$unavailable" = 1 ] && return 1
+    return 2
+  fi
+  # The answer also carries a root password when no ssh key was named. It is never
+  # read: sshd on a devbox refuses root passwords (PermitRootLogin prohibit-password).
+  id=$(jq -er '.server.id | numbers' <<<"$server") || { echo 'devbox hetzner: the create answer named no server id' >&2; return 1; }
+  ip=$(jq -r '.server.public_net.ipv4.ip // empty' <<<"$server")
+  # The price of this rental, read from the create answer at the moment it was
+  # made, so it is the price of the type that was created: the server type lists
+  # one price per location, and Hetzner bills the gross one. A price looked up later may not be the one the rental was made at,
+  # so `devbox status` prints `price not recorded` rather than look one up. It is
+  # in EUR, which the record says, because RunPod's is in USD.
+  hourly=$(jq -r --arg location "$DEVBOX_HETZNER_LOCATION" \
+    '[.server.server_type.prices[]? | select(.location == $location) | .price_hourly.gross | tonumber?][0] // empty | . + 0' \
+    <<<"$server" 2>/dev/null) || hourly=""
+  [[ "$hourly" =~ ^[0-9]{1,4}([.][0-9]{1,12})?$ ]] || hourly=""
+  # jq owns $id, $ip and $hourly.
+  # shellcheck disable=SC2016
+  hetzner_save --argjson id "$id" --arg ip "$ip" --arg hourly "$hourly" \
+    '.id = $id | .ip = $ip | .createUncertain = false
+     | if $hourly == "" then . else .hourly = ($hourly | tonumber) | .currency = "EUR" end' || return 1
+  echo "==> Hetzner server $id: $type in $DEVBOX_HETZNER_LOCATION, from snapshot $image${hourly:+, EUR $hourly/hour}"
+}
+
+# Point the transport at the rented server: its address, the host key that the
+# client made for it, the pin of that key, and its own gate password.
+# $1 is where the known_hosts file goes: the record's own for verify, and a
+# file in its own private dir for `devbox status`, which writes nothing into a
+# rental record.
+hetzner_use() {
+  local ip pw pin kh="$1"
+  ip=$(jq -r '.ip // empty' "$HZ_STATE/server.json")
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "devbox hetzner: the record holds no IPv4 address for the server" >&2; return 1; }
+  if [ ! -s "$HZ_STATE/hostkey.pub" ] || [ ! -s "$HZ_STATE/gate-password" ]; then
+    echo 'devbox hetzner: the record has lost the host key or the gate password of its server; run devbox hetzner down, then try again' >&2
+    return 2
+  fi
+  pin=$(jq -r '.hostKey // empty' "$HZ_STATE/server.json")
+  if ! devbox_hostkey_pin_ok "$pin" || [ "$(ssh-keygen -l -f "$HZ_STATE/hostkey.pub" | awk '{ print $2; exit }')" != "$pin" ]; then
+    echo "devbox hetzner: the record's host key pin '$pin' is not the fingerprint of $HZ_STATE/hostkey.pub; run devbox hetzner down, then try again" >&2
+    return 2
+  fi
+  printf '%s %s\n' "$ip" "$(cut -d' ' -f1,2 "$HZ_STATE/hostkey.pub")" >"$kh"
+  IFS= read -r pw <"$HZ_STATE/gate-password" || [ -n "$pw" ] || return 1
+  DEVBOX_TARGET_HETZNER="$ip"
+  # shellcheck disable=SC2034  # read by devbox_target_use in devbox-targets, by name
+  DEVBOX_TARGET_HETZNER_HOSTKEY="$pin"
+  # shellcheck disable=SC2034  # read by devbox_target_use in devbox-targets, which declares it
+  TARGET_PIN_ORIGIN["hetzner"]="the pin in $HZ_STATE/server.json"
+  # shellcheck disable=SC2034  # read by devbox_target_use in devbox-targets, which declares it
+  TARGET_KNOWN_HOSTS["hetzner"]="$kh"
+  # shellcheck disable=SC2034  # read by devbox_target_use in devbox-targets, which declares it
+  TARGET_SECRET["hetzner"]="$pw"
+}
+
+# Wait until the server takes its gate password and its watchdog reports health.
+# The runtime sets the password last, after the metadata block, so an accepted
+# password means a workspace cannot read the user data. Returns 75 when the
+# server answers that it is deleting itself.
+hetzner_wait() {
+  local deadline=$((SECONDS + HZ_READY)) rc line last="no answer yet" id
+  # A plain local, never `GATE_TIME_LIMIT=25 devbox_gate ...`. An assignment in
+  # front of a function call lasts for that call alone, so _gate_limit_hit below
+  # read the global empty value and was never true: a probe that timeout killed
+  # (124 or 137) was taken as a host that answered, and a server whose gate
+  # stalled was announced ready. The open sets its own limit for its own call.
+  # DEVBOX_PROBE_ANSWER_SECONDS is the limit of the probe of devbox-targets, which
+  # a test may shorten.
+  # shellcheck disable=SC2034  # read by _gate_limit and _gate_limit_hit in devbox-transport
+  local GATE_TIME_LIMIT="$DEVBOX_PROBE_ANSWER_SECONDS"
+  id=$(jq -r '.id' "$HZ_STATE/server.json")
+  # A server that is still booting refuses the connection at once, so a short
+  # connect timeout costs nothing and keeps each round of the wait short.
+  GATE_CONNECT_TIMEOUT=5 devbox_target_use hetzner || return 2
+  while :; do
+    rc=0
+    GATE_TIME_LIMIT=20 devbox_gate_open || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rc=0
+      line=$(devbox_gate probe 1 1 2>"$HZ_STATE/probe.err") || rc=$?
+      if grep -q 'is being deleted' "$HZ_STATE/probe.err" 2>/dev/null; then rm -f "$HZ_STATE/probe.err"; return 75; fi
+      rm -f "$HZ_STATE/probe.err"
+      if devbox_probe_parse "$line"; then
+        if [ "$PROBE_HEALTH" = ok ] && [ "$PROBE_HEALTH_AGE" -ge 0 ] && [ "$PROBE_HEALTH_AGE" -le "$DEVBOX_HEALTH_STALE_SECONDS" ]; then
+          return 0
+        fi
+        last="its watchdog reports $PROBE_HEALTH${PROBE_REASON:+ ($PROBE_REASON)}"
+      elif [ "$rc" -ne 255 ] && ! _gate_limit_hit "$rc"; then
+        # The host answered, with a line this client cannot read or with none: a
+        # snapshot on another protocol. The target choice names that, so waiting
+        # longer cannot help. 255 is ssh's own failure, which a boot can cause.
+        return 0
+      else
+        last="its probe gave no answer"
+      fi
+    else
+      # Refused while cloud-init has not run the runtime yet, and a host key that
+      # differs while the snapshot's own key is still in place: both pass at boot.
+      # ssh checks the key before it sends the password, so a wrong key never
+      # receives it.
+      last="${GATE_OPEN_ERROR:-no answer}"
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "devbox hetzner: server $id at $DEVBOX_TARGET_HETZNER did not become ready in ${HZ_READY}s: $last" >&2
+      return 3
+    fi
+    sleep "$HZ_POLL"
+  done
+}
+
+# Make the rented server a target: reuse this checkout's server, or create one, and
+# wait until it takes a gate. devbox-verify then probes it and runs the gate on it
+# like a deployed target.
+hetzner_ready() {
+  local id name server status rc attempt
+  hetzner_setup || return
+  hetzner_settings || return
+  # The wait below bounds each ssh with `timeout`. Asked before the creation, so
+  # a laptop without it rents nothing.
+  devbox_need_timeout || return 2
+  # Two runs of one checkout must not both create a server. The lock covers the
+  # creation and the wait; the gate itself is serialized on the host.
+  exec {HZ_LOCK_FD}>"$HZ_STATE/up.lock"
+  flock -w "$HZ_LOCK_WAIT" "$HZ_LOCK_FD" || { echo "devbox hetzner: another run of this checkout held the creation for ${HZ_LOCK_WAIT}s; nothing ran" >&2; return 4; }
+  for attempt in 1 2; do
+    if hetzner_live; then
+      name=$(jq -r .name "$HZ_STATE/server.json")
+      hetzner_owner_name "$name" || { echo 'devbox hetzner: invalid rental owner in the record; run devbox hetzner down' >&2; return 2; }
+      id=$(jq -r '.id // empty' "$HZ_STATE/server.json")
+      if [ -z "$id" ]; then
+        id=$(hetzner_find "$name") || return 1
+        [ -n "$id" ] || { echo 'devbox hetzner: an earlier create has no confirmed outcome; run devbox hetzner down before renting again' >&2; return 2; }
+        # jq owns $id.
+        # shellcheck disable=SC2016
+        hetzner_save --argjson id "$id" '.id = $id | .createUncertain = false' || return 1
+      fi
+      [[ "$id" =~ ^[0-9]+$ ]] || return 2
+      server=$(hetzner_api GET "/servers/$id") || return 1
+      if [ "$server" = null ]; then
+        # Not found: the server deleted itself after its idle time. That read is the
+        # confirmation, so hetzner_down records it and deletes nothing.
+        hetzner_down >/dev/null || return 1
+        echo "==> Hetzner server $id deleted itself after its idle time; creating another"
+      else
+        hetzner_owned "$name" <<<"$server" || { echo 'devbox hetzner: the recorded server does not carry this rental name; nothing ran' >&2; return 2; }
+        status=$(jq -r '.server.status' <<<"$server")
+        case "$status" in
+          running|initializing|starting)
+            # jq owns the server object.
+            # shellcheck disable=SC2016
+            hetzner_save --argjson server "$server" '.ip = ($server.server.public_net.ipv4.ip // .ip)' || return 1
+            hetzner_use "$HZ_STATE/known_hosts" || return
+            rc=0
+            hetzner_wait || rc=$?
+            case "$rc" in
+              0) echo "==> Hetzner server $id at $DEVBOX_TARGET_HETZNER: reused"; exec {HZ_LOCK_FD}>&-; return 0 ;;
+              75)
+                echo "==> Hetzner server $id is deleting itself after its idle time; creating another"
+                if hetzner_gone "$id"; then
+                  hetzner_save '.deleted = true' || return 1
+                else
+                  hetzner_down || return 1
+                fi ;;
+              *) return "$rc" ;;
+            esac ;;
+          *)
+            echo "==> Hetzner server $id is $status; deleting it and creating another"
+            hetzner_down || return 1 ;;
+        esac
+      fi
+    fi
+    [ "$attempt" = 1 ] || break
+    HZ_CLEANUP=1
+    hetzner_up || return
+    if [ -z "$(jq -r '.ip // empty' "$HZ_STATE/server.json")" ]; then
+      server=$(hetzner_api GET "/servers/$(jq -r .id "$HZ_STATE/server.json")") || return 1
+      # jq owns $server.
+      # shellcheck disable=SC2016
+      hetzner_save --argjson server "$server" '.ip = ($server.server.public_net.ipv4.ip // "")' || return 1
+    fi
+    hetzner_use "$HZ_STATE/known_hosts" || return
+    rc=0
+    hetzner_wait || rc=$?
+    [ "$rc" -ne 75 ] || rc=3
+    [ "$rc" -eq 0 ] || return "$rc"
+    HZ_CLEANUP=0
+    echo "==> Hetzner server $(jq -r .id "$HZ_STATE/server.json") at $DEVBOX_TARGET_HETZNER: ready"
+    exec {HZ_LOCK_FD}>&-
+    return 0
+  done
+  echo 'devbox hetzner: the recorded server was being deleted, and the next one was too; nothing ran' >&2
+  return 3
+}
+
+# devbox-verify's EXIT trap calls this. A server this run created and never saw
+# ready is deleted, with the same confirmation as `devbox hetzner down`.
+hetzner_cleanup() {
+  [ -n "$HZ_STATE" ] || return 0
+  rm -f "$HZ_STATE/request.json" "$HZ_STATE/hostkey" "$HZ_STATE/probe.err"
+  [ "$HZ_CLEANUP" = 1 ] || return 0
+  HZ_CLEANUP=0
+  hetzner_down || { echo 'devbox hetzner: cleanup unconfirmed; run devbox hetzner down' >&2; return 1; }
+}
+
+# `devbox hetzner status` and `devbox hetzner down`. `up` is hetzner_ready.
+hetzner_action() {
+  local id server
+  hetzner_setup || return
+  case "$1" in
+    down) hetzner_down ;;
+    status)
+      [ -f "$HZ_STATE/server.json" ] || { echo 'devbox hetzner: no rental'; return 0; }
+      if hetzner_live; then
+        id=$(jq -r '.id // empty' "$HZ_STATE/server.json")
+        if [ -n "$id" ]; then
+          [[ "$id" =~ ^[0-9]+$ ]] || return 2
+          server=$(hetzner_api GET "/servers/$id") || return 1
+          if [ "$server" = null ]; then
+            hetzner_down || return 1
+          else
+            echo "==> Hetzner server $id is $(jq -r '.server.status' <<<"$server") at $(jq -r '.server.public_net.ipv4.ip // "no address"' <<<"$server")"
+          fi
+        fi
+      fi
+      jq . "$HZ_STATE/server.json" ;;
+    *) echo 'devbox hetzner: use up, status or down' >&2; return 2 ;;
+  esac
+}

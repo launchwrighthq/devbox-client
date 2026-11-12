@@ -1,0 +1,624 @@
+#!/bin/bash
+# The one way a client reaches a deployed devbox: ssh as the gate account,
+# with the gate password. Sourced by devbox-verify, devbox-gc, devbox-doctor and
+# devbox-status, through devbox-targets, which picks the target.
+# shellcheck shell=bash
+#
+# A client used to log in as root with its own key and send a command STRING,
+# which the host's root shell parsed. The server installer records what that cost:
+# a `$(cat ...)` that the REMOTE shell expanded put a password into a
+# `docker exec` argv. Now a client sends one verb and its words, the host's
+# devbox-gate checks every word against a fixed list, and gate-root runs the
+# verb as root. No function in this file builds a string for a remote shell.
+#
+# The transport, as built:
+#   - the password reaches ssh through SSH_ASKPASS (client/libexec/devbox-askpass)
+#     with SSH_ASKPASS_REQUIRE=force. It is set in the ssh process environment
+#     alone and never in an argv: `ps aux` is readable by every user.
+#   - password authentication only, one prompt, no key offered.
+#   - one ControlMaster per target per run, with its socket in a private 0700
+#     dir, so a run authenticates once for its short calls instead of about 15
+#     times. The `run` verb takes its own connection (see devbox_gate).
+#   - a pinned host key. Each target names the SHA256 fingerprint of its ed25519
+#     host key, DEVBOX_TARGET_<NAME>_HOSTKEY, which the operator's deploy reads
+#     from the host over the operator's own ssh. ssh runs with StrictHostKeyChecking=yes
+#     against devbox's own known_hosts file, and devbox_gate_pin writes an entry
+#     only when ssh-keyscan returns the pinned key. The first build recorded
+#     whatever key answered first (accept-new), and the client probes every
+#     target on its own, often from an unattended agent: a man in the middle on
+#     that first contact, on a cafe network to a public VPS, was recorded as the
+#     host and received DEVBOX_GATE_PASSWORD, which opens every target. "Compare
+#     the fingerprint once" never happened.
+
+DEVBOX_GATE_USER=devbox-gate
+_DEVBOX_TRANSPORT_HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# devbox_hostkey_pin_ok, the one rule for a pin, lives in the data parser,
+# which refuses a malformed DEVBOX_TARGET_<NAME>_HOSTKEY before any target is
+# used. A caller that sources this file alone gets it here.
+# shellcheck source=client/libexec/devbox-config
+declare -F devbox_hostkey_pin_ok >/dev/null || source "$_DEVBOX_TRANSPORT_HERE/devbox-config"
+
+# Set by devbox_gate_target, read by every function below.
+GATE_NAME=""
+GATE_ADDR=""
+GATE_PORT=""
+GATE_DEST=""
+GATE_ASKPASS=""
+GATE_KNOWN_HOSTS=""
+# The password of the target devbox_gate_target last prepared, when it is not
+# DEVBOX_GATE_PASSWORD. A rented Hetzner server has a password of its own,
+# so the user data that Hetzner stores never holds the password of every
+# deployed target.
+GATE_PASSWORD=""
+GATE_PRIV=""
+GATE_OPTS=()
+# The pinned fingerprint of the target's ed25519 host key, and where it came
+# from, for the messages.
+GATE_PIN=""
+GATE_PIN_ORIGIN=""
+# Seconds ssh waits for a target to answer. The probe of every deployed target
+# sets 3: a laptop in a cafe cannot reach a LAN-only target, and a run
+# that waited 10 seconds for it before every gate paid that wait each time.
+GATE_CONNECT_TIMEOUT=10
+# Seconds one ssh of devbox_gate_open or devbox_gate may run in all, or empty
+# for no limit. ConnectTimeout covers the TCP connect and the banner, and
+# nothing after them. The probe sets this, because a host that accepts
+# TCP and then stalls in authentication, or a path that drops mid-call, held
+# the probe's `wait`, and with it every `devbox verify`, with no skip line.
+# `--foreground` keeps the ssh in the caller's process group, so a Ctrl-C still
+# reaches it.
+GATE_TIME_LIMIT=""
+# Seconds an idle master stays up after its last call. `devbox status --watch`
+# sets more than its interval: with 60, a watch at
+# `--interval 120` found its master gone at every refresh and sent the gate
+# password once per refresh instead of once per session.
+GATE_CONTROL_PERSIST=60
+# Set by devbox_gate_open.
+GATE_OPEN_ERROR=""
+GATE_NEW_HOSTKEY=""
+
+_gate_refuse() { echo "${DEVBOX_GUARD_WHO:-devbox}: $*" >&2; }
+
+# Run a command under GATE_TIME_LIMIT, when one is set. The variables a caller
+# assigns in front of this function reach the command's environment, so the
+# password still travels in the environment of ssh alone.
+_gate_limit() {
+  if [ -n "$GATE_TIME_LIMIT" ]; then
+    timeout --foreground -k 2 "$GATE_TIME_LIMIT" "$@"
+  else
+    "$@"
+  fi
+}
+# _gate_limit needs GNU `timeout`, which stock macOS does not ship. Without it
+# every limited ssh exits 127, and a caller reads that as a host that did not
+# answer. Each caller that sets GATE_TIME_LIMIT asks this first.
+devbox_need_timeout() {
+  command -v timeout >/dev/null 2>&1 && return 0
+  _gate_refuse "this laptop has no 'timeout' command, which bounds each ssh to a target. Install GNU coreutils; on macOS, brew install coreutils and put its gnubin directory on PATH."
+  return 1
+}
+# True when the exit status is timeout's own: 124 after TERM, 137 after the
+# KILL that -k sends to an ssh that ignored the TERM.
+_gate_limit_hit() {
+  [ -n "$GATE_TIME_LIMIT" ] && { [ "$1" -eq 124 ] || [ "$1" -eq 137 ]; }
+}
+
+# The private directory for the ControlMaster sockets, mode 0700, owned by this
+# user. A socket in a directory another user can write is a socket another user
+# can replace, and the next ssh of this run would then talk through it.
+# $XDG_RUNTIME_DIR is per user and cleared at logout. A shell without one (cron,
+# a container, an ssh session with no PAM) falls back to a per-uid directory
+# under $TMPDIR, which is checked rather than trusted: another user can create
+# that name first.
+devbox_gate_private_dir() {
+  local base dir
+  base="${XDG_RUNTIME_DIR:-}"
+  if [ -n "$base" ] && [ -d "$base" ]; then
+    dir="$base/devbox"
+  else
+    dir="${TMPDIR:-/tmp}/devbox-$(id -u)"
+  fi
+  [ -d "$dir" ] || mkdir -m 0700 "$dir" 2>/dev/null || true
+  if [ -L "$dir" ] || [ ! -d "$dir" ] || [ ! -O "$dir" ]; then
+    _gate_refuse "$dir is not a directory this user owns, so it cannot hold the ssh control socket"
+    return 1
+  fi
+  chmod 0700 "$dir" || return 1
+  printf '%s' "$dir"
+}
+
+# ── runs on this laptop ──────────────────────────────────────────────────────
+#
+# A host sees a gate only from the moment it asks for tokens. Before that a run
+# probes, syncs and runs DEVBOX_SETUP, which takes minutes on a cold workspace,
+# and a rented pod has no pool at all. So `devbox verify` and `devbox run` keep
+# one file per run, <private dir>/runs/<pid>, and `devbox status` reads it:
+#
+#   <started-epoch> <phase-epoch> <phase> <target> <slug> <worktree path>
+#   <identity> <verify|run>
+#
+# The second line is the pid's identity, devbox_pid_identity below, and the
+# command. A pid alone names whatever process holds that number now, so status
+# needs the identity to tell this run from a later process that got its pid.
+# The file holds a worktree path, so it lives in the private dir (mode 0700),
+# never in /tmp.
+#
+# The run never fails because of this file. A write that fails is said once on
+# stderr, and the run goes on without the file.
+DEVBOX_RUNFILE=""
+DEVBOX_RUNFILE_OFF=0
+DEVBOX_RUNFILE_STARTED=""
+DEVBOX_RUNFILE_IDENT=""
+# The phase line's fields this run last wrote, so a later phase change names
+# only what changed: the target, the slug, the path and the command stay.
+DEVBOX_RUNFILE_TARGET="-"
+DEVBOX_RUNFILE_SLUG="-"
+DEVBOX_RUNFILE_PATH="-"
+DEVBOX_RUNFILE_MODE="verify"
+
+# The pid's start time, the identity devbox-pool's _pid_starttime reads: field
+# 22 of /proc/<pid>/stat, in clock ticks since boot, cut at the LAST ')' because
+# the executable name in field 2 may hold spaces and parentheses. A recycled pid
+# cannot carry the same start time. This is a second copy of that rule, because
+# the pool runs on the host and this file on the laptop, and the shared library
+# that both load changes only with a protocol bump.
+#
+# A laptop with no /proc (macOS) gives the start time `ps -o lstart=` prints,
+# with its spaces removed. Every failure prints nothing and returns 1, so a
+# caller never compares an empty string against a recorded identity.
+devbox_pid_identity() {
+  local pid="${1-}" line rest st
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  if [ -r /proc/self/stat ]; then
+    read -r line <"/proc/$pid/stat" 2>/dev/null || return 1
+    rest="${line##*)}"
+    [ "$rest" != "$line" ] || return 1
+    local -a f
+    read -r -a f <<<"$rest"
+    st="${f[19]:-}"
+    [[ "$st" =~ ^[0-9]+$ ]] || return 1
+  else
+    st="$(ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+    st="${st//[[:space:]]/}"
+    [ -n "$st" ] || return 1
+  fi
+  printf '%s' "$st"
+}
+
+# The directory of the run files. It prints nothing and returns 1 when the
+# private dir is not one this user owns; devbox_gate_private_dir says why.
+devbox_runs_dir() {
+  local priv
+  priv="$(devbox_gate_private_dir)" || return 1
+  [ -d "$priv/runs" ] || mkdir -m 0700 "$priv/runs" 2>/dev/null || [ -d "$priv/runs" ] || return 1
+  printf '%s' "$priv/runs"
+}
+
+_devbox_runfile_failed() {
+  DEVBOX_RUNFILE_OFF=1
+  echo "devbox: cannot write this run's file for devbox status ($1); the run goes on, and devbox status does not show it" >&2
+}
+
+# Write the run file for a new phase, by rename, so status never reads half of
+# one. $1 the phase: probe, rent, sync, setup, queued or gate. $2 the target,
+# when it changes; $3 the slug, $4 the worktree path and $5 verify or run, when
+# they are known. Always returns 0.
+devbox_runfile_phase() {
+  local phase="${1-}" now dir tmp
+  [ "$DEVBOX_RUNFILE_OFF" = 0 ] || return 0
+  [ -z "${2-}" ] || DEVBOX_RUNFILE_TARGET="$2"
+  [ -z "${3-}" ] || DEVBOX_RUNFILE_SLUG="$3"
+  # A newline in the path would start a second line, which status reads as
+  # the identity.
+  [ -z "${4-}" ] || DEVBOX_RUNFILE_PATH="${4//$'\n'/?}"
+  [ -z "${5-}" ] || DEVBOX_RUNFILE_MODE="$5"
+  printf -v now '%(%s)T' -1
+  [ -n "$DEVBOX_RUNFILE_STARTED" ] || DEVBOX_RUNFILE_STARTED="$now"
+  if [ -z "$DEVBOX_RUNFILE" ]; then
+    dir="$(devbox_runs_dir 2>/dev/null)" || { _devbox_runfile_failed "the private dir is not usable"; return 0; }
+    DEVBOX_RUNFILE="$dir/$$"
+    DEVBOX_RUNFILE_IDENT="$(devbox_pid_identity "$$")" || DEVBOX_RUNFILE_IDENT="-"
+  fi
+  tmp="$DEVBOX_RUNFILE.$BASHPID.tmp"
+  if printf '%s %s %s %s %s %s\n%s %s\n' "$DEVBOX_RUNFILE_STARTED" "$now" "$phase" \
+       "$DEVBOX_RUNFILE_TARGET" "$DEVBOX_RUNFILE_SLUG" "$DEVBOX_RUNFILE_PATH" \
+       "$DEVBOX_RUNFILE_IDENT" "$DEVBOX_RUNFILE_MODE" >"$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$DEVBOX_RUNFILE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  _devbox_runfile_failed "$DEVBOX_RUNFILE could not be written"
+  return 0
+}
+
+# Remove the run file and write no more. Callers run it from their EXIT trap.
+devbox_runfile_remove() {
+  DEVBOX_RUNFILE_OFF=1
+  [ -z "$DEVBOX_RUNFILE" ] || rm -f "$DEVBOX_RUNFILE" 2>/dev/null || true
+  return 0
+}
+
+# Read a copy of the gate's stderr, and move the phase from queued to gate at
+# devbox-pool's `==> granted` line, the only sign of the grant this laptop
+# gets. It reads to the end of its input, because the tee that feeds it exits
+# on a write to a closed pipe, and that tee also carries the gate's stderr to
+# the developer.
+devbox_runfile_watch_grant() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in "==> granted "*) devbox_runfile_phase gate; break ;; esac
+  done
+  cat >/dev/null
+}
+
+# A word that crosses to the host as one argument, or that sits in the rsync -e
+# string, holds none of the characters a shell or rsync's own splitter reads.
+# The guards in lib/devbox-lib.sh already hold every value a caller passes to
+# this class; this check is what keeps a NEW caller from shifting words.
+_gate_word_ok() {
+  case "${1-}" in
+    ""|*[!A-Za-z0-9._:/+~=@%-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Parse one target value and prepare every option. $1 is the value, $2 names
+# where it came from. Returns 2, with a message, when the value is not an
+# address or the pin is missing or malformed. $3, when set, is a known_hosts
+# file that already holds the host's key (a rented Hetzner server, whose key the
+# client made), used in place of devbox's own. $4, when set, is the target's own
+# gate password. $5 is the pin, the SHA256 fingerprint of the host's ed25519
+# key, and $6 names where the pin came from.
+#
+# The value is an address, or address:port. The user is always devbox-gate, so
+# a value that names one is refused rather than read: `root@host` from an older
+# .devbox.env would otherwise reach the gate account with a password that is
+# not root's, and fail as a refused password, which names the wrong repair.
+# A leading dash is refused because ssh would read the value as an option.
+devbox_gate_target() {
+  local value="${1-}" origin="${2:-the configuration}" pinned="${3-}" priv kh_dir
+  GATE_NAME="$value"
+  GATE_PASSWORD="${4-}"
+  GATE_PIN="${5-}"
+  GATE_PIN_ORIGIN="${6:-the pin of $value}"
+  case "$value" in
+    *@*)
+      _gate_refuse "refusing the host '$value' from $origin: it names a user, and the user is always $DEVBOX_GATE_USER. Write the address alone, or address:port"
+      return 2 ;;
+    ""|-*)
+      _gate_refuse "refusing the host '$value' from $origin: write an address, or address:port"
+      return 2 ;;
+  esac
+  if [[ "$value" =~ ^([A-Za-z0-9._-]+):([0-9]+)$ ]] || [[ "$value" =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]+)$ ]]; then
+    GATE_ADDR="${BASH_REMATCH[1]}"
+    GATE_PORT="${BASH_REMATCH[2]}"
+  elif [[ "$value" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    GATE_ADDR="$value"
+    GATE_PORT=22
+  else
+    _gate_refuse "refusing the host '$value' from $origin: write an address, or address:port"
+    return 2
+  fi
+  if [ "${#GATE_PORT}" -gt 5 ] || [ "$GATE_PORT" -lt 1 ] || [ "$GATE_PORT" -gt 65535 ]; then
+    _gate_refuse "refusing the host '$value' from $origin: the port must be 1 to 65535"
+    return 2
+  fi
+  # The parser refuses a listed target with no pin. This is the same rule for a
+  # caller that did not come through it: with no pin, nothing tells a host from
+  # a man in the middle, and the password goes to whichever answered.
+  if ! devbox_hostkey_pin_ok "$GATE_PIN"; then
+    _gate_refuse "refusing the host '$value' from $origin: $GATE_PIN_ORIGIN is '$GATE_PIN', not the SHA256:<fingerprint> of its ed25519 host key. Copy the DEVBOX_TARGET_<NAME>_HOSTKEY line the operator's deploy prints for it."
+    return 2
+  fi
+  GATE_DEST="$DEVBOX_GATE_USER@$GATE_ADDR"
+  priv="$(devbox_gate_private_dir)" || return 1
+  GATE_PRIV="$priv"
+  # A wheel is a zip, and a zip carries no exec bit, so `pip install
+  # devbox-client` can land client/libexec/ without one. client/bin/devbox runs
+  # such a program under bash, but ssh exec()s SSH_ASKPASS itself and fails with
+  # EACCES. The copy in the private dir carries the bit.
+  GATE_ASKPASS="$_DEVBOX_TRANSPORT_HERE/devbox-askpass"
+  # The probe runs this once per target, in parallel, so a copy that is already
+  # in place is reused rather than written again under a sibling's feet.
+  if [ ! -x "$GATE_ASKPASS" ]; then
+    if [ ! -x "$priv/askpass" ] || ! cmp -s "$GATE_ASKPASS" "$priv/askpass"; then
+      install -m 0700 "$GATE_ASKPASS" "$priv/askpass" || return 1
+    fi
+    GATE_ASKPASS="$priv/askpass"
+  fi
+  kh_dir="$HOME/.config/devbox"
+  mkdir -p "$kh_dir" || return 1
+  GATE_KNOWN_HOSTS="$kh_dir/known_hosts"
+  [ -z "$pinned" ] || GATE_KNOWN_HOSTS="$pinned"
+  # The rsync -e string is split by rsync's own parser, which honours single
+  # quotes and nothing else, so a path that holds one cannot cross it.
+  case "$priv$GATE_KNOWN_HOSTS$GATE_ASKPASS" in
+    *"'"*)
+      _gate_refuse "a path under $priv or $kh_dir holds a single quote, which the rsync -e string cannot carry"
+      return 2 ;;
+  esac
+  # ControlMaster is NOT in this list. ssh keeps the FIRST value it reads for an
+  # option, so devbox_gate_open could not override a value set here. Each caller
+  # names its own mode in front of these.
+  #
+  # The ControlPath holds this process's pid, so each run has its own master.
+  # %C alone hashes only the local host, the remote host, the port and the user,
+  # so every run on this laptop shared ONE master. Two failures followed. sshd
+  # allows MaxSessions 10 per connection, and each run holds its lock session
+  # plus a setup, run or rsync session, so about the sixth concurrent run got
+  # "administratively prohibited". And a killed run's gate kept running while
+  # any other run held the shared master, because sshd does not signal a
+  # session's child when one mux client goes away. The pid is the caller's own
+  # ($$ is the same in a subshell), and devbox_gate_close ends the master.
+  #
+  # GlobalKnownHostsFile=/dev/null makes devbox's own file the only record. A
+  # key that /etc/ssh/ssh_known_hosts holds for the same address under another
+  # name would otherwise refuse or accept a host this file never saw.
+  #
+  # StrictHostKeyChecking=yes: ssh never adds a key, so the only entry is the
+  # one devbox_gate_pin wrote after it matched the pin. HostKeyAlgorithms keeps
+  # ssh to the ed25519 key the pin names: a host that offered another type
+  # first would otherwise fail as a changed key while its pinned key was fine.
+  #
+  # -F /dev/null: ssh reads no config file, neither the user's nor the
+  # system's. devbox_gate_pin asks ssh-keyscan, which reads none and resolves
+  # the value through DNS. A ~/.ssh/config Host block of the same name with
+  # another HostName sent ssh to a second address of the same host, which no
+  # entry recorded. Every run then failed as a changed host key, though the key
+  # and the pin agreed. Every option the gate needs is on this command line.
+  #
+  # ServerAliveInterval: without it, a connection whose far end went away with
+  # no reset (a host restart, a dropped NAT entry) stays open on the laptop.
+  # Verify runs held such connections for over an hour while the host reported
+  # no grant and no ticket for any of them: each socket had sent and received
+  # nothing for many minutes, and the kernel's TCP keepalive first fires after
+  # two hours. 15 seconds times 4 ends such a run in one minute, the
+  # values the RunPod ssh config uses. A gate that prints nothing still answers
+  # the keepalive, because sshd answers it, not the gate.
+  GATE_OPTS=(
+    -F /dev/null
+    -o PreferredAuthentications=password
+    -o PubkeyAuthentication=no
+    -o NumberOfPasswordPrompts=1
+    -o "ControlPath=$priv/$$-%C"
+    -o "ControlPersist=$GATE_CONTROL_PERSIST"
+    -o "UserKnownHostsFile=$GATE_KNOWN_HOSTS"
+    -o GlobalKnownHostsFile=/dev/null
+    -o StrictHostKeyChecking=yes
+    -o HostKeyAlgorithms=ssh-ed25519
+    -o HashKnownHosts=no
+    -o "ConnectTimeout=$GATE_CONNECT_TIMEOUT"
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=4
+    -p "$GATE_PORT"
+  )
+}
+
+# The name ssh records in known_hosts for this target.
+devbox_gate_known_name() {
+  if [ "$GATE_PORT" = 22 ]; then printf '%s' "$GATE_ADDR"; else printf '[%s]:%s' "$GATE_ADDR" "$GATE_PORT"; fi
+}
+
+# Every fingerprint recorded for this target, one per line. Read with
+# ssh-keygen, which also finds a hashed line. ssh accepts any entry for the
+# name, so every one must equal the pin, not just the first.
+devbox_gate_recorded_pins() {
+  [ -f "$GATE_KNOWN_HOSTS" ] || return 0
+  ssh-keygen -l -F "$(devbox_gate_known_name)" -f "$GATE_KNOWN_HOSTS" 2>/dev/null \
+    | awk '!/^#/ && NF >= 3 { print $3 }'
+}
+
+# What a person does when a host key and its pin disagree, one sentence.
+devbox_gate_hostkey_repair() {
+  printf "If the host was reinstalled, copy the DEVBOX_TARGET_<NAME>_HOSTKEY line that the operator's deploy prints for it, then remove the old entry with: ssh-keygen -R '%s' -f %s" \
+    "$(devbox_gate_known_name)" "$GATE_KNOWN_HOSTS"
+}
+
+# Make sure the known_hosts entry of this target is the pinned key, BEFORE any
+# ssh that could send the password.
+#
+#   0  every recorded entry is the pin, or there was none and ssh-keyscan
+#      returned exactly the pin, which is now recorded (GATE_NEW_HOSTKEY)
+#   1  ssh-keyscan returned no ed25519 key: the host did not answer
+#   4  a recorded entry, or the key ssh-keyscan returned, is not the pin
+#
+# GATE_OPEN_ERROR holds the reason on any failure.
+#
+# An existing entry is read on every call, not trusted because it exists: an
+# entry from before a pin changed would otherwise keep a replaced host, or
+# whatever answered in its place, as the host. ssh-keyscan sends no password
+# and authenticates nothing, so the first contact gives a stranger nothing.
+devbox_gate_pin() {
+  local recorded fp scan line key tmp name rc=0
+  local -a keys=()
+  recorded="$(devbox_gate_recorded_pins)"
+  name="$(devbox_gate_known_name)"
+  if [ -n "$recorded" ]; then
+    while IFS= read -r fp; do
+      [ "$fp" != "$GATE_PIN" ] || continue
+      GATE_OPEN_ERROR="the host key recorded for $GATE_NAME in $GATE_KNOWN_HOSTS is $fp, and $GATE_PIN_ORIGIN pins $GATE_PIN. It may be a reinstalled host whose pin changed, or an entry something else wrote. Nothing was sent. $(devbox_gate_hostkey_repair)"
+      return 4
+    done <<<"$recorded"
+    return 0
+  fi
+  scan="$(_gate_limit ssh-keyscan -t ed25519 -T "$GATE_CONNECT_TIMEOUT" -p "$GATE_PORT" "$GATE_ADDR" 2>&1)" || rc=$?
+  while IFS= read -r line; do
+    # "<host> ssh-ed25519 <base64>". The host field is ssh-keyscan's spelling;
+    # the entry is written under the name ssh looks up, devbox_gate_known_name.
+    if [[ "$line" =~ ^[^#[:space:]]+\ ssh-ed25519\ ([A-Za-z0-9+/]+={0,2})$ ]]; then
+      keys+=("${BASH_REMATCH[1]}")
+    fi
+  done <<<"$scan"
+  if [ "${#keys[@]}" -eq 0 ]; then
+    if _gate_limit_hit "$rc"; then
+      GATE_OPEN_ERROR="no answer to ssh-keyscan in ${GATE_TIME_LIMIT}s"
+    else
+      GATE_OPEN_ERROR="$(grep -v '^#' <<<"$scan" | grep -m1 . || true)"
+      [ -n "$GATE_OPEN_ERROR" ] || GATE_OPEN_ERROR="ssh-keyscan got no ed25519 host key from $GATE_ADDR port $GATE_PORT in ${GATE_CONNECT_TIMEOUT}s: Connection timed out, or Connection refused"
+    fi
+    return 1
+  fi
+  tmp="$GATE_PRIV/keyscan.$BASHPID"
+  for key in "${keys[@]}"; do
+    printf '%s ssh-ed25519 %s\n' "$name" "$key" >"$tmp"
+    fp="$(ssh-keygen -l -f "$tmp" 2>/dev/null | awk 'NF >= 2 { print $2; exit }')"
+    if [ "$fp" != "$GATE_PIN" ]; then
+      rm -f "$tmp"
+      GATE_OPEN_ERROR="the host key of $GATE_NAME is ${fp:-unreadable}, and $GATE_PIN_ORIGIN pins $GATE_PIN. It may be an attack on this network, or a reinstalled host. Nothing was sent, and nothing was recorded. $(devbox_gate_hostkey_repair)"
+      return 4
+    fi
+  done
+  rm -f "$tmp"
+  # One line, appended in one write: the probe pins every target at once, into
+  # this one file, from parallel subshells.
+  printf '%s ssh-ed25519 %s\n' "$name" "${keys[0]}" >>"$GATE_KNOWN_HOSTS" || {
+    GATE_OPEN_ERROR="could not write $GATE_KNOWN_HOSTS"
+    return 1
+  }
+  # shellcheck disable=SC2034  # read by the scripts that source this file, never here
+  GATE_NEW_HOSTKEY="$GATE_PIN"
+}
+
+# The pin check for a call that may open a connection of its own: a verb or an
+# rsync with no master up, and the run verb, which never uses the master. It
+# returns 255, ssh's own failure, and prints the line verify reads as ssh's own
+# refusal of a changed key, so a pin that fails here exits 3 (auth) like one the
+# probe found.
+_gate_pin_or_refuse() {
+  local rc=0
+  devbox_gate_pin || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  if [ "$rc" -eq 4 ]; then
+    _gate_refuse "Host key verification failed: $GATE_OPEN_ERROR"
+  else
+    # ssh's own spelling, at the start of the line, which verify reads as a
+    # connect failure (3) and never as the gate's own exit.
+    echo "ssh: connect to host $GATE_ADDR port $GATE_PORT: $GATE_OPEN_ERROR (devbox: ssh-keyscan, before the pin check)" >&2
+  fi
+  return 255
+}
+
+# Open the ControlMaster for this target, or reuse one that is up.
+#
+#   0  the master is up
+#   1  the host did not answer, or ssh failed for another cause
+#   3  the gate password was refused
+#   4  the host key is not the pinned one
+#
+# GATE_OPEN_ERROR holds ssh's first line, or the pin's reason, on any failure.
+# GATE_NEW_HOSTKEY holds the fingerprint when this call recorded the pinned key
+# for the first time.
+#
+# The master is started here with every stream on /dev/null or a file, and
+# never by the first ordinary call. A master that goes to the background keeps
+# the streams it was started with: one started inside `$(... 2>&1)` holds that
+# pipe open, and the substitution waits until the master exits, 60 seconds
+# after its last client. Its stderr therefore goes to a file in the private
+# dir, which the background master may keep open at no cost.
+devbox_gate_open() {
+  local err="" rc=0 errf
+  GATE_OPEN_ERROR=""
+  # shellcheck disable=SC2034  # read by the scripts that source this file, never here
+  GATE_NEW_HOSTKEY=""
+  if ssh "${GATE_OPTS[@]}" -O check "$GATE_DEST" >/dev/null 2>&1; then
+    return 0
+  fi
+  devbox_gate_pin || return
+  # $BASHPID, not $$: the probe opens every target's master at once from
+  # subshells that share $$, and with one file name between them one probe
+  # removed the file another was still to read, so a target that timed out was
+  # reported as "ssh exited 255 and printed nothing".
+  errf="$GATE_PRIV/open.$BASHPID.err"
+  SSH_ASKPASS="$GATE_ASKPASS" SSH_ASKPASS_REQUIRE=force DEVBOX_GATE_PASSWORD="${GATE_PASSWORD:-${DEVBOX_GATE_PASSWORD:-}}" \
+    _gate_limit ssh -o ControlMaster=yes "${GATE_OPTS[@]}" -f -N "$GATE_DEST" </dev/null >/dev/null 2>"$errf" || rc=$?
+  err="$(cat "$errf" 2>/dev/null || true)"
+  rm -f "$errf"
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  case "$err" in
+    *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
+      GATE_OPEN_ERROR="the host key of $GATE_NAME is not the key $GATE_PIN_ORIGIN pins ($GATE_PIN), the one recorded in $GATE_KNOWN_HOSTS. It may be an attack on this network, or a reinstalled host. Nothing was sent. $(devbox_gate_hostkey_repair)"
+      return 4 ;;
+    *"Permission denied"*|*"Too many authentication failures"*)
+      GATE_OPEN_ERROR="${err%%$'\n'*}"
+      return 3 ;;
+  esac
+  if _gate_limit_hit "$rc"; then
+    GATE_OPEN_ERROR="no answer in ${GATE_TIME_LIMIT}s"
+    return 1
+  fi
+  GATE_OPEN_ERROR="${err%%$'\n'*}"
+  [ -n "$GATE_OPEN_ERROR" ] || GATE_OPEN_ERROR="ssh exited $rc and printed nothing"
+  return 1
+}
+
+# Close this run's master, if one is up. Callers run it from their EXIT trap.
+# A master left to ControlPersist would hold its connection for 60 more
+# seconds after the run ended.
+devbox_gate_close() {
+  [ -n "$GATE_DEST" ] || return 0
+  ssh "${GATE_OPTS[@]}" -O exit "$GATE_DEST" >/dev/null 2>&1 || true
+}
+
+# Run one gate verb. stdin, stdout, stderr and the exit code pass through.
+#
+# The `run` verb takes its own connection, with no master. gate-root names the
+# sshd session process of the verb in DEVBOX_POOL_WATCH_PID, and devbox-pool
+# stops the gate when that process exits. Over a master, that
+# process is the master's connection, which outlives a killed run by
+# ControlPersist and by every other call still on it, so the stop never fired.
+# A connection of its own ends exactly when this one ssh goes away. It costs
+# one more password authentication per run. ControlPath=none comes before
+# GATE_OPTS, because ssh keeps the first value it reads for an option.
+devbox_gate() {
+  local w
+  local -a mux=(-o ControlMaster=auto)
+  for w in "$@"; do
+    _gate_word_ok "$w" || {
+      _gate_refuse "refusing to send '$w' to $GATE_NAME: a gate word holds only A-Za-z0-9._:/+~=@%-"
+      return 2
+    }
+  done
+  [ "${1-}" != run ] || mux=(-o ControlMaster=no -o ControlPath=none)
+  _gate_pin_or_refuse || return
+  # shellcheck disable=SC2029  # client-side expansion is the intent: each word is checked above, and devbox-gate splits them with read -ra, never a shell
+  SSH_ASKPASS="$GATE_ASKPASS" SSH_ASKPASS_REQUIRE=force DEVBOX_GATE_PASSWORD="${GATE_PASSWORD:-${DEVBOX_GATE_PASSWORD:-}}" \
+    _gate_limit ssh "${mux[@]}" "${GATE_OPTS[@]}" "$GATE_DEST" "$@"
+}
+
+# rsync to one path under the gate's sync/ tree. Every argument but the last is
+# passed to rsync as it stands; the last is the remote path, such as
+# sync/<slug>/<project>/. devbox-gate accepts only that shape.
+#
+# An IPv6 address goes in brackets. rsync splits a host spec at its FIRST
+# colon, so `devbox-gate@2001:db8::1:sync/...` named the host `2001`, and on an
+# IPv6 target every ssh verb worked while the sync failed.
+devbox_gate_rsync() {
+  local dest="${*: -1}" e="" w host="$GATE_ADDR"
+  local -a args=("${@:1:$#-1}")
+  _gate_word_ok "$dest" || { _gate_refuse "refusing the rsync destination '$dest'"; return 2; }
+  for w in ssh -o ControlMaster=auto "${GATE_OPTS[@]}"; do
+    e="$e '$w'"
+  done
+  case "$host" in *:*) host="[$host]" ;; esac
+  _gate_pin_or_refuse || return
+  SSH_ASKPASS="$GATE_ASKPASS" SSH_ASKPASS_REQUIRE=force DEVBOX_GATE_PASSWORD="${GATE_PASSWORD:-${DEVBOX_GATE_PASSWORD:-}}" \
+    rsync "${args[@]}" -e "${e# }" "$DEVBOX_GATE_USER@$host:$dest"
+}
+
+# The OpenSSH version this laptop runs, as major.minor, or nothing.
+# SSH_ASKPASS_REQUIRE arrived in OpenSSH 8.4. An older ssh ignores it and asks
+# on the terminal, which an agent's shell does not have.
+devbox_ssh_version() {
+  local v
+  v="$(ssh -V 2>&1)" || true
+  [[ "$v" =~ OpenSSH_([0-9]+)\.([0-9]+) ]] || return 1
+  printf '%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+devbox_ssh_version_ok() {
+  local v major minor
+  v="$(devbox_ssh_version)" || return 1
+  major="${v%%.*}"; minor="${v#*.}"
+  [ "$major" -gt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -ge 4 ]; }
+}
