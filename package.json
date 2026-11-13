@@ -1,6 +1,6 @@
 {
   "name": "@launchwrighthq/devbox-client",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "Run a project's verify gate in a workspace on a remote host.",
   "//": [
     "The version must equal VERSION; tests/test-version-agreement.sh checks it.",

@@ -144,7 +144,7 @@ assert_fail "  and carries no ESC or BEL" grep -q $'[\033\a]' <<<"$v"
 # happened once. A change that moves any value here is a protocol bump and a
 # major release: change DEVBOX_PROTOCOL_VERSION, the major in VERSION, and the
 # protocol and the values below, in one commit.
-pinned_protocol=8
+pinned_protocol=2
 assert_eq "$pinned_protocol" "$DEVBOX_PROTOCOL_VERSION" \
   "the values below are the ones protocol $pinned_protocol promises; a bump re-reads them"
 assert_eq "laptop-my-app-my-app-9bde2c" \

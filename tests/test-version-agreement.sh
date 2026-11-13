@@ -75,14 +75,15 @@ assign_count="$(grep -rc '^DEVBOX_PROTOCOL_VERSION=' \
 assert_eq "1" "$assign_count" \
   "exactly one file in the payload assigns DEVBOX_PROTOCOL_VERSION"
 
-# The major and the protocol move together, at a fixed distance. Release 1.0.0
-# was the first public release and spoke protocol 8, so the distance is 7. A
-# protocol bump without a major release would ship as a minor release that
-# every older client of that major refuses, and a major release without a
-# protocol bump would make consumers move their pin for nothing.
+# The protocol IS the release major. Releases 1.0.0 and 1.1.x spoke protocol 8,
+# and a reader had to know an offset of 7 to tell a host's release from its
+# version answer, so 2.0.0 renumbered it. A protocol bump without a major
+# release would ship as a minor release that every older client of that major
+# refuses, and a major release without a protocol bump would make consumers
+# move their pin for nothing.
 release_major="${release%%.*}"
-assert_eq "$((release_major + 7))" "$proto" \
-  "the protocol is the release major plus 7: one major is one protocol"
+assert_eq "$release_major" "$proto" \
+  "the protocol equals the release major: one major is one protocol"
 
 # The CLI's own answer, which no other test reads.
 # `devbox version` resolves the library at run time and prints what it found, so

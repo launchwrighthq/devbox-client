@@ -28,8 +28,8 @@ devbox_sanitize() {
 # disagree: an output of this file that the other half reads or recomputes, or
 # a verb the client reaches over ssh, devbox-runner's and devbox-pool's alike.
 # A comment or a new function keeps it. It is not the release version, which
-# lives in VERSION at the repo root, but the release major moves with it, so
-# one major is one protocol (tests/test-version-agreement.sh).
+# lives in VERSION at the repo root, but the release major equals it, so one
+# major is one protocol (tests/test-version-agreement.sh).
 # devbox_pg_ident's comment below records the collision this prevents. Two
 # checkouts silently shared one Postgres role.
 #
@@ -103,6 +103,14 @@ devbox_sanitize() {
 # that terminal. The library text changed, so the integer moves by this file's
 # rule.
 #
+# 2 is protocol 8 renumbered, and from here the integer IS the release major:
+# release 2.x speaks 2, and tests/test-version-agreement.sh holds the two equal.
+# Releases 1.0.0 and 1.1.x spoke 8, so a reader had to know an offset of 7 to
+# tell which release a host runs from its version answer. Nothing either half
+# computes changed. The new number alone makes a 1.x client refuse a 2.x host,
+# so 2.0.0 is a major release. The earlier protocol 2 predates every host a
+# client of today reaches.
+#
 # This assignment sits BELOW devbox_sanitize, and only for the directive under
 # this line. A shellcheck directive placed before the first command of a file
 # applies to the whole file and to every line added to it later, so a genuinely
@@ -113,7 +121,7 @@ devbox_sanitize() {
 # file is SOURCED, so every line here runs before the sourcing script
 # continues, and the variable is set long before any consumer reads it.
 # shellcheck disable=SC2034  # read by whatever sources this file, never here
-DEVBOX_PROTOCOL_VERSION=8
+DEVBOX_PROTOCOL_VERSION=2
 
 # The handshake's second field: the sha256 of a library file, hex only, with no
 # filename beside it. It is handed the path rather than reading its own, so it
@@ -171,8 +179,8 @@ devbox_lib_fingerprint() {
 # tests/test-devbox-lib.sh can drive every case below with no host, no ssh and
 # no docker.
 #
-# The protocol integer is the ONE compatibility number, and the release major
-# moves with it (tests/test-version-agreement.sh). A client and a server of one
+# The protocol integer is the ONE compatibility number, and it equals the
+# release major (tests/test-version-agreement.sh). A client and a server of one
 # major work together whatever their minor and patch. This function once refused
 # every server whose library differed by one byte, comments included, so every
 # release that touched the library forced every consumer to move its pin before
@@ -193,7 +201,7 @@ devbox_lib_fingerprint() {
 #   6  the two protocol integers differ
 #
 # The fingerprint is a report, never a refusal. A library that differs is the
-# normal state of a laptop on 1.2.0 beside a host on 1.4.1. The success line
+# normal state of a laptop on 2.2.0 beside a host on 2.4.1. The success line
 # still names the case, because `devbox doctor` prints it. A fingerprint this
 # client failed to compute is named as that, never compared as the empty
 # string, which would report two different libraries as the same file.
