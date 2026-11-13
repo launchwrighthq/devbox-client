@@ -465,12 +465,12 @@ cells() {
 
 # The target line, from the parsed reply.
 #
-# `tokens` is a reservation and `load` a measurement, side by side
+# `tokens` is a reservation and `cpu` a measurement, side by side
 # (docs/pool.md section 1.1): a host can have every token reserved while its
-# load is low, and a load far above its core count with tokens to spare. The
-# two bars show both.
+# cores are mostly idle, and every core busy with tokens to spare. The two bars
+# show both.
 render_host() {
-  local name="$1" hw hcol="" reason="" line col n used pct disp lv tok load mem jobs
+  local name="$1" hw hcol="" reason="" line col n used pct disp lv tok cpu mem jobs
   case "$STATUS_HEALTH" in
     ok)
       # 90 seconds is the age at which verify skips the target, because the
@@ -496,15 +496,22 @@ render_host() {
     n=0
   fi
   gauge tokens "$n" "$STATUS_HELD/$STATUS_TOTAL" "$col" 7; tok="$GAUGE"
-  # The load average is a decimal, so awk reads it, in the C locale for the
-  # reason rent_price gives. Red at or above the core count, yellow from 3/4.
+  # The cores that were busy over the host's 1-second sample, of its core
+  # count. This bar was the 1-minute load average through 3.0.0, and a host
+  # whose gates used nearly all of its cores showed a load of several times
+  # its core count in red, because the load average counts every task a cgroup
+  # CPU limit throttles. Another showed red with much of its CPU idle. The
+  # word keeps its place in the host record (lib/devbox-lib.sh, the status
+  # reply), so a host not yet redeployed still sends its load average here.
+  # It is a decimal, so awk reads it, in the C locale for the reason rent_price
+  # gives. One decimal at every size, so a host at 15.7 of 16 cores never reads
+  # as full. Yellow from 70% of the cores, red from 90%.
   read -r disp n lv < <(LC_ALL=C awk -v l="$STATUS_LOAD1" -v c="$STATUS_CORES" -v w="$BAR_W" 'BEGIN {
       if (l !~ /^[0-9]+(\.[0-9]+)?$/ || c !~ /^[1-9][0-9]*$/) { print "- 0 0"; exit }
-      d = (l < 10) ? sprintf("%.1f", l) : sprintf("%d", l + 0.5)
       n = int(l * w / c + 0.5); if (n == 0 && l > 0) n = 1
-      printf "%s/%s %d %d\n", d, c, n, (l >= c) ? 2 : ((l >= 0.75 * c) ? 1 : 0) }')
+      printf "%.1f/%s %d %d\n", l, c, n, (l >= 0.9 * c) ? 2 : ((l >= 0.7 * c) ? 1 : 0) }')
   case "$lv" in 2) col=red ;; 1) col=yellow ;; *) col="" ;; esac
-  gauge load "${n:-0}" "${disp:--}" "$col" 7; load="$GAUGE"
+  gauge cpu "${n:-0}" "${disp:--}" "$col" 7; cpu="$GAUGE"
   # Memory in use is the total minus what the kernel calls available.
   col=""
   if isnum "$STATUS_MEM_AVAIL" && isnum "$STATUS_MEM_TOTAL" && [ "$STATUS_MEM_TOTAL" -gt 0 ]; then
@@ -523,7 +530,7 @@ render_host() {
   if isnum "$STATUS_JOBS" && isnum "$STATUS_MAX_JOBS" && [ "$STATUS_JOBS" -ge "$STATUS_MAX_JOBS" ]; then col=yellow; fi
   paint_to "$col" "$STATUS_JOBS/$STATUS_MAX_JOBS"
   jobs="jobs $PAINTED"
-  line+="$tok  $load  $mem  $jobs"
+  line+="$tok  $cpu  $mem  $jobs"
   # Swap in use, after the bars. A host with no swap paid a memory peak with a
   # killed process: the kernel killed test workers in several workspaces and the
   # shared broker. Every host now has swap, and a host that keeps paging is one

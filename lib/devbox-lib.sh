@@ -898,7 +898,7 @@ devbox_probe_parse() {
 # The answer of the `status` verb, one record per line:
 #
 #   <protocol> <lib-sha256> <host-epoch>
-#   host <health> <health-age> <held> <total> <jobs> <max-jobs> <queued> <load1> <cores> <mem-avail> <mem-total> <swap-used> <swap-total> [<health reason>...]
+#   host <health> <health-age> <held> <total> <jobs> <max-jobs> <queued> <cpu-busy> <cores> <mem-avail> <mem-total> <swap-used> <swap-total> [<health reason>...]
 #   run <run-id> <owner> <slug> <tokens> <granted-epoch> <max-seconds> <median> <samples> <cpu-pct> <mem-bytes> <mem-max-bytes> <oom-kills> <state> [<stop reason>...]
 #   ticket <position> <owner> <slug> <want> <min> <queued-epoch> <start-seconds> <client-run>
 #   end
@@ -911,6 +911,20 @@ devbox_probe_parse() {
 # that id, so the run shows once in the laptop's list. A ticket of a pool that
 # names no run is `-`. <client-run> is not the run record's <run-id>, which is
 # the pool's `<pid>.<starttime>` of one grant.
+#
+# <cpu-busy> is the cores the host kept busy over a 1-second sample of the
+# aggregate `cpu` line of /proc/stat, with one decimal, of <cores>. Through
+# 3.0.0 this word carried the 1-minute load average of /proc/loadavg. Since
+# 3.0.0 a grant is a cgroup cpu.max limit, and the kernel counts every
+# runnable task in the load average, a task its CPU limit throttles too. A
+# host whose gates used nearly all of its cores then reported a load of several
+# times its core count, another reported a load well above its core
+# count with much of its CPU idle, and the operator could not tell a busy
+# host from an idle one. The word's shape and position did not change, so the
+# protocol did not: a 3.0.0 client against a newer host shows busy cores under
+# its old `load` label, and a newer client against a 3.0.0 host shows the load
+# average under the `cpu` label until that host is redeployed. STATUS_LOAD1
+# keeps its name for the same reason the word kept its place.
 #
 # The host writes it with devbox_status_line and the laptop reads it with
 # devbox_status_parse, and both take every field's shape from
@@ -1027,8 +1041,8 @@ devbox_status_line() {
 # read from one it read as 0.
 #
 #   STATUS_EPOCH, and STATUS_HEALTH, STATUS_HEALTH_AGE, STATUS_HELD,
-#   STATUS_TOTAL, STATUS_JOBS, STATUS_MAX_JOBS, STATUS_QUEUED, STATUS_LOAD1,
-#   STATUS_CORES, STATUS_MEM_AVAIL, STATUS_MEM_TOTAL, STATUS_SWAP_USED,
+#   STATUS_TOTAL, STATUS_JOBS, STATUS_MAX_JOBS, STATUS_QUEUED, STATUS_LOAD1
+#   (the <cpu-busy> word, see above), STATUS_CORES, STATUS_MEM_AVAIL, STATUS_MEM_TOTAL, STATUS_SWAP_USED,
 #   STATUS_SWAP_TOTAL, STATUS_HEALTH_REASON
 #   STATUS_RUN_COUNT and the arrays STATUS_RUN_ID, STATUS_RUN_OWNER,
 #   STATUS_RUN_SLUG, STATUS_RUN_TOKENS, STATUS_RUN_GRANTED, STATUS_RUN_MAX,

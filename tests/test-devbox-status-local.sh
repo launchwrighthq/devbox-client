@@ -319,7 +319,7 @@ view="$(printf '%s\n' "$out" | sed -e 's/1m1[0-9]s$/1m10s/' -e 's/  3[0-9]s$/  3
 # and the main checkout by its repository alone. A path that is no worktree
 # any more is named by its directory, with no mark.
 expected="$(cat <<EOF
-lan1      ok        tokens #####... 20/32    load #....... 2.0/32   mem #####... 40G/64G    jobs 1/3
+lan1      ok        tokens #####... 20/32    cpu #....... 2.0/32   mem #####... 40G/64G    jobs 1/3
 
   STATE    TASK                  TARGET  TOKENS   TIME  LEFT  CORES  MEM
 > running  fix-cache/feat-login  lan1        20  6m12s  ~3m    18.3  1.0G/12G

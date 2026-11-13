@@ -238,7 +238,7 @@ before="$(record_sums)"
 # The rented Hetzner server is a target: its line comes with the servers, its
 # gates go in the table, and its provider block holds what it costs.
 expected_view="$(cat <<EOF
-hetzner   ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3
+hetzner   ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3
 
 no gate runs or waits
 

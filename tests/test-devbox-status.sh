@@ -168,15 +168,15 @@ STATUS_ARGS=()
 
 # ═══ R11, R12: the view ══════════════════════════════════════════════════════
 #
-# The bars, worked by hand: 28 of 32 tokens is 7 of 8 cells. A load of 21.4 on
-# 32 cores is 5.35 cells, so 5, and prints as 21 from 10 up. 64G less 24G
-# available is 40G in use, 5 cells. On cloud1, 0.31 on 8 cores is 0.3
+# The bars, worked by hand: 28 of 32 tokens is 7 of 8 cells. 21.4 busy cores of
+# 32 is 5.35 cells, so 5, and prints with its decimal at every size. 64G less
+# 24G available is 40G in use, 5 cells. On cloud1, 0.31 of 8 cores is 0.3
 # cells, and any use above 0 shows one. 1830% of one core is 18.3 cores. The
 # mark `>` is this checkout's: both slugs are worktrees of this repository,
 # named <repository>/<worktree>, and the main checkout by its repository alone.
 expected_view="$(cat <<EOF
-lan1      ok        tokens #######. 28/32    load #####... 21/32    mem #####... 40G/64G    jobs 2/3
-cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap
+lan1      ok        tokens #######. 28/32    cpu #####... 21.4/32  mem #####... 40G/64G    jobs 2/3
+cloud1    ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap
 
   STATE      TASK                  TARGET  TOKENS   TIME  LEFT        CORES  MEM
 > running    fix-cache/feat-login  lan1        20  6m12s  ~3m          18.3  7.1G/12G
@@ -240,8 +240,8 @@ tw=20
 [ "${#gone}" -le "$tw" ] || tw="${#gone}"
 row() { printf '%s %-9s  %-*s  %s\n' "$1" "$2" "$tw" "$3" "$4" | sed 's/ *$//'; }
 expected_other="$(
-  echo "lan1      degraded  tokens #######. 28/32    load ##...... 9.5/32   mem ........ -          jobs 3/3  swap 1.5G/16G  disk 91%"
-  echo "cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap"
+  echo "lan1      degraded  tokens #######. 28/32    cpu ##...... 9.5/32   mem ........ -          jobs 3/3  swap 1.5G/16G  disk 91%"
+  echo "cloud1    ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap"
   echo
   row " " STATE TASK "TARGET  TOKENS    TIME  LEFT           CORES  MEM"
   row " " stopping "other laptop" "lan1         8   1h06m                   0.0  1.0G/2.0G  no work for 1200s, 2 OOM kills"
@@ -310,7 +310,7 @@ reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
 # one line, in its place. cloud1 runs nothing, and it answered, so the table
 # says that no gate runs or waits. The gates of lan1 are not in the table:
 # nothing this client could read said they exist.
-cloud1_block="$(printf '%s\n\n%s' "cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap" "no gate runs or waits")"
+cloud1_block="$(printf '%s\n\n%s' "cloud1    ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap" "no gate runs or waits")"
 case_line() {  # $1 the expected lan1 line, $2 the expected exit code, $3 the case
   assert_eq "$2" "$rc" "$3: exit $2"
   assert_eq "$1" "$(printf '%s\n' "$out" | head -1)" "$3: lan1 keeps its place, with its reason"
@@ -439,7 +439,7 @@ assert_eq "$expected_view" "$cd_out" "run from the linked worktree, which borrow
 # expected one, so the two forms cannot drift apart.
 if locale -a 2>/dev/null | grep -qixE 'c\.utf-?8'; then
   utf_view="$(printf '%s\n' "$expected_view" \
-    | sed -E -e ':b' -e 's/((tokens|load|mem) (█|░)*)#/\1█/' -e 's/((tokens|load|mem) (█|░)*)\./\1░/' -e 'tb' -e 's/^> /▶ /')"
+    | sed -E -e ':b' -e 's/((tokens|cpu|mem) (█|░)*)#/\1█/' -e 's/((tokens|cpu|mem) (█|░)*)\./\1░/' -e 'tb' -e 's/^> /▶ /')"
   utf_out="$(cd "$CO" && env LC_ALL=C.UTF-8 PATH="$TMP/bin:$PATH" HOME="$TMP/fakehome" XDG_RUNTIME_DIR="$TMP/run" \
     FAKE_STATUS_DIR="$TMP/replies" FAKE_PROTO="$PROTO" FAKE_FP="$FP" bash "$STATUS" 2>&1)"
   assert_eq "$utf_view" "$utf_out" "with a UTF-8 charmap, the bars are blocks and this checkout's mark is a triangle"
@@ -454,6 +454,34 @@ assert_eq "0" "$rc" "DEVBOX_STRICT=1 with DEVBOX_TARGETS=cloud1 in the environme
 assert_fail "and the environment's list wins over the file's" contains "lan1" "$out"
 run_status DEVBOX_TARGETS=cloud1
 assert_ok "without strict mode, the file's list wins" contains "lan1      ok" "$out"
+
+# ═══ the cpu bar ═════════════════════════════════════════════════════════════
+#
+# The host record's <cpu-busy> word is the cores busy over the host's 1-second
+# sample. Through 3.0.0 it was the 1-minute load average, which counts every
+# task a cgroup CPU limit throttles: a host whose gates used nearly all of its
+# cores showed a load of several times its core count, and another showed
+# red with much of its CPU idle. 8.0 of 16 is 4 cells, 12.0 of 16 is 6
+# cells, and 15.7 of 16 is 7.9, so 8. A 3.0.0 host still sends its load
+# average in that word, and 40.00 of 16 fills the bar and stops there.
+cpu_reply() {  # $1 the <cpu-busy> word, of 16 cores
+  {
+    printf '%s %s %s\n' "$PROTO" "$FP" "$E"
+    printf 'host ok 5 0 20 0 3 0 %s 16 %s %s 0 0\n' "$1" "$((30 * GIB))" "$((32 * GIB))"
+    printf 'end\n'
+  } >"$TMP/replies/cloud1.invalid.status"
+}
+STATUS_ARGS=(--target cloud1)
+for case in "8.0 ####.... 8.0/16 " "12.0 ######.. 12.0/16" "15.7 ######## 15.7/16" "40.00 ######## 40.0/16"; do
+  read -r word bar shown <<<"$case"
+  cpu_reply "$word"
+  run_status
+  assert_ok "busy $word of 16 cores: cpu $bar $shown" \
+    grep -qE "^cloud1    ok        tokens \.{8} 0/20     cpu ${bar//./\\.} ${shown//./\\.} +mem " <<<"$out"
+done
+assert_fail "and no target line names load" grep -q ' load ' <<<"$out"
+STATUS_ARGS=()
+reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
 
 # ═══ R15: colour ═════════════════════════════════════════════════════════════
 assert_fail "a non-terminal output has no escape byte" contains "$ESC" "$out"
@@ -473,6 +501,23 @@ if script --version 2>/dev/null | grep -q util-linux; then
   assert_ok "and the OOM kill is red" contains "${ESC}[31m1 OOM kill" "$tty_out"
   assert_ok "a gate of this checkout has a bold name" contains "${ESC}[1mfix-cache/feat-login${ESC}[0m" "$tty_out"
   assert_ok "a gate of another laptop is dim" contains "${ESC}[2mother laptop${ESC}[0m" "$tty_out"
+  # The cpu bar's bands: plain below 70% of the cores, yellow from 70%, red
+  # from 90%. Half the cores busy is a host with room, and must not read as a
+  # warning.
+  for case in "8.0 8.0/16 plain" "12.0 12.0/16 yellow" "15.7 15.7/16 red"; do
+    read -r word shown band <<<"$case"
+    cpu_reply "$word"
+    tty_out="$(on_tty TERM=xterm)"
+    case "$band" in
+      plain)  assert_ok "busy $word of 16 cores on a terminal: cpu $shown, no colour" \
+                grep -qE "cpu [^${ESC}]+ ${shown//./\\.} " <<<"$tty_out" ;;
+      yellow) assert_ok "busy $word of 16 cores on a terminal: cpu $shown in yellow" \
+                grep -qE "cpu ${ESC}\[33m[^ ]+ ${shown//./\\.}${ESC}\[0m" <<<"$tty_out" ;;
+      red)    assert_ok "busy $word of 16 cores on a terminal: cpu $shown in red" \
+                grep -qE "cpu ${ESC}\[31m[^ ]+ ${shown//./\\.}${ESC}\[0m" <<<"$tty_out" ;;
+    esac
+  done
+  reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
   tty_out="$(on_tty "TERM=xterm NO_COLOR=1")"
   assert_ok "NO_COLOR on a terminal: the view is there" contains "lan1      ok" "$tty_out"
   assert_fail "and it has no escape byte" contains "$ESC" "$tty_out"
@@ -592,7 +637,7 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
   assert_ok "the old lan1 line ends with the time it is from" \
     grep -qE '^lan1      ok        tokens .* jobs 2/3 \(as of [0-9]{2}:[0-9]{2}:[0-9]{2}\)$' <<<"$(plain "$out")"
   assert_ok "and cloud1, which answers, has no such mark" \
-    grep -qxF 'cloud1    ok        tokens ░░░░░░░░ 0/20     load █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3  no swap' <<<"$(plain "$out")"
+    grep -qxF 'cloud1    ok        tokens ░░░░░░░░ 0/20     cpu █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3  no swap' <<<"$(plain "$out")"
   # The rows of the old answer stay in the table, under the line that dates them.
   assert_ok "lan1's gates stay in the table" grep -qE '^▶ running    fix-cache/feat-login  lan1 ' <<<"$(plain "$out")"
   # The spinner turns in the header alone, while a refresh is out. One beside

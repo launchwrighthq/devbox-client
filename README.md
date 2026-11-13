@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.0.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.0.1"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.1"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.1"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.0.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.0.1 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -384,8 +384,8 @@ not its pin.
 ## devbox status
 
 `devbox status` asks every target one `status` verb, in parallel. It prints one line per
-target in `DEVBOX_TARGETS` order: health, then a bar each for reserved tokens, load against
-the core count and memory in use, then jobs, and swap while the host uses it. Then one table
+target in `DEVBOX_TARGETS` order: health, then a bar each for reserved tokens, busy cores
+against the core count and memory in use, then jobs, and swap while the host uses it. Then one table
 lists every gate that runs, then the queue in line order, then the runs this laptop started
 that no target holds yet (probe, rent, lock, sync, setup), then the lost ones. `lock` is the
 wait for a free lane. A run that waits in several queues is one row, and its target cell names
