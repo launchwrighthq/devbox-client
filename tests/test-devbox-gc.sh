@@ -92,17 +92,21 @@ run_gc() {
   return 0
 }
 
-# The slug `devbox verify` builds for the checkout at $1, taken from the line it
-# prints once the handshake passes. verify is run from INSIDE the checkout,
-# because that is how `make verify` reaches it and because the path it hashes is
-# the toplevel git reports from there. It fails a few lines later, when the fake
-# host answers ensure-workspace with nothing, which is well before rsync.
-verify_slug() {
-  local root="$1" text
-  text="$(cd "$root" && env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" SSH_LOG="$TMP/ssh-verify.log" \
-    FAKE_SERVER_VERSION="$proto $fp" bash "$VERIFY" 2>&1)"
-  printf '%s\n' "$text" | sed -n 's/^==> workspace \([^ ]*\) on .*/\1/p' | head -1
+# The lane slugs `devbox verify` builds for the checkout at $1, lane 1 first,
+# read off the `lock` verb it sends once the handshake passes: those are the
+# workspaces it may run in, so they are the slugs gc must keep. verify is run
+# from INSIDE the checkout, because that is how `make verify` reaches it and
+# because the path it hashes is the toplevel git reports from there. The fake
+# host answers the lock with no lane, so verify stops there, well before
+# ensure-workspace and rsync. verify_slug is lane 1 alone.
+verify_lanes() {
+  local root="$1"
+  : >"$TMP/ssh-verify.log"
+  (cd "$root" && env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" SSH_LOG="$TMP/ssh-verify.log" \
+    FAKE_SERVER_VERSION="$proto $fp" DEVBOX_LOCK_WAIT=1 bash "$VERIFY" >/dev/null 2>&1)
+  sed -n 's/.*devbox-gate@[^ ]* lock [0-9]* //p' "$TMP/ssh-verify.log" | head -1
 }
+verify_slug() { local l; l="$(verify_lanes "$1")"; printf '%s' "${l%% *}"; }
 
 # The slug `devbox gc` puts on the keep-list for the root at $1, read off the
 # keep-list gc prints. Every fixture here passes exactly ONE root, so that line
@@ -377,6 +381,8 @@ run_gc --yes "$TMP/plain"
 assert_eq "5" "$rc" "a server on a different protocol version exits 5"
 assert_ok "the refusal names both versions" \
   contains "client speaks $proto, the server speaks 99" "$out"
+assert_ok "and names both repairs, because the integer does not say which half is older" \
+  contains "move this project's devbox-client pin" "$out"
 assert_ok "a refused handshake sends no destructive gc verb" sent_no_destructive_gc
 
 # An empty answer is what an unreachable host and a server with no version verb
@@ -456,5 +462,75 @@ run_gc --dry-run "$TMP/two"
 assert_eq "0" "$rc" "a dry run over two targets exits 0"
 assert_fail "and sends no destructive gc verb to either" sent_destructive_gc
 assert_eq "2" "$(grep -c 'gc --dry-run' "$TMP/ssh.log")" "and asks each target for its plan once"
+
+# ── 8. lanes (R14) ───────────────────────────────────────────────────────────
+#
+# A worktree holds up to DEVBOX_LANES workspaces on each target, each with its
+# own slug, and the server deletes every slug the keep-list does not name. So
+# the keep-list carries every lane from 1 to DEVBOX_LANES, and a lane above a
+# lowered count is left off for the server to collect. The lane slugs are read
+# off what gc prints, never computed here, for the reason the header gives.
+keep_words() { printf '%s\n' "$out" | sed -n 's/^keeping: //p' | head -1; }
+SERVER_VERSION="$proto $fp"
+SERVER_PLAN="would keep ws-fixture"
+
+# The default, with no DEVBOX_LANES in the config, is two lanes. Lane 1 is
+# today's slug, the one verify builds (section 1 compares it byte for byte).
+make_checkout "$TMP/lanes" 'DEVBOX_PROJECT=lanes-fixture' lanes-fixture-host
+run_gc --dry-run "$TMP/lanes"
+assert_eq "0" "$rc" "a checkout that sets no DEVBOX_LANES: the dry run exits 0"
+read -r -a two_lanes <<<"$(keep_words)"
+assert_eq "2" "${#two_lanes[@]}" "with no DEVBOX_LANES, the keep-list holds two lanes of the worktree"
+lane1="${two_lanes[0]:-}"
+lane2="${two_lanes[1]:-}"
+assert_ok "lane 1 is a slug" test -n "$lane1"
+assert_ok "and lane 2 is another one" test -n "$lane2"
+assert_ok "lane 2's slug differs from lane 1's" test "$lane1" != "$lane2"
+assert_eq "${lane1%-*}" "${lane2%-*}" "the two lanes share every part of the slug but the hash"
+assert_ok "and the plan pairs the checkout with both lanes" contains "$TMP/lanes -> $lane1 $lane2" "$out"
+# The lanes verify asks the host to lock are the lanes gc keeps, byte for byte:
+# a lane verify may run in and gc does not keep is a live workspace deleted.
+assert_eq "$lane1 $lane2" "$(verify_lanes "$TMP/lanes")" "verify locks exactly the lanes gc keeps"
+assert_ok "the dry run asks the server about both lanes" \
+  grep -qF "gc --dry-run $(printf '%s\n' "$out" | sed -n 's/^machine: //p' | head -1) $lane1 $lane2" "$TMP/ssh.log"
+
+# An exported DEVBOX_LANES from an earlier shell does not narrow the keep-list:
+# a lane count from anywhere but the committed config deletes a live lane.
+DEVBOX_LANES=1 run_gc --dry-run "$TMP/lanes"
+assert_eq "$lane1 $lane2" "$(keep_words)" "an exported DEVBOX_LANES=1 is not read: both lanes are kept"
+
+# DEVBOX_LANES=1: lane 2 is above the count, so it leaves the keep-list and the
+# server collects its container, both volumes and its role. Lane 1 stays.
+printf 'DEVBOX_LANES=1\n' >>"$TMP/lanes/.devbox/config.env"
+run_gc --dry-run "$TMP/lanes"
+assert_eq "0" "$rc" "DEVBOX_LANES=1: the dry run exits 0"
+assert_eq "$lane1" "$(keep_words)" "DEVBOX_LANES=1 keeps lane 1 alone"
+assert_fail "and lane 2 is not on the keep-list the server is sent" grep -qF "$lane2" "$TMP/ssh.log"
+SERVER_PLAN="would remove ws-$lane2"
+run_gc --yes "$TMP/lanes"
+assert_ok "with --yes, the destructive verb keeps lane 1" \
+  grep -qE "devbox-gate@lanes-fixture-host gc [0-9a-f]+ $lane1\$" "$TMP/ssh.log"
+assert_fail "and names no lane 2" grep -qF "$lane2" "$TMP/ssh.log"
+SERVER_PLAN="would keep ws-fixture"
+
+# DEVBOX_LANES=4: four distinct slugs, lane 1 first.
+sed -i 's/^DEVBOX_LANES=1$/DEVBOX_LANES=4/' "$TMP/lanes/.devbox/config.env"
+run_gc --dry-run "$TMP/lanes"
+read -r -a four_lanes <<<"$(keep_words)"
+assert_eq "4" "${#four_lanes[@]}" "DEVBOX_LANES=4 keeps four lanes"
+assert_eq "$lane1" "${four_lanes[0]:-}" "lane 1 first"
+assert_eq "$lane2" "${four_lanes[1]:-}" "then lane 2, the same slug the default kept"
+assert_eq "4" "$(printf '%s\n' "${four_lanes[@]}" | sort -u | grep -c .)" "and the four slugs are distinct"
+assert_eq "${four_lanes[*]}" "$(verify_lanes "$TMP/lanes")" "and verify locks the same four"
+
+# A count outside 1 to 4 refuses the whole run before any target is contacted.
+# A guessed count is a keep-list that drops a live lane.
+for bad_lanes in 0 5 two; do
+  sed -i "s/^DEVBOX_LANES=.*/DEVBOX_LANES=$bad_lanes/" "$TMP/lanes/.devbox/config.env"
+  run_gc --dry-run "$TMP/lanes"
+  assert_eq "2" "$rc" "DEVBOX_LANES=$bad_lanes is refused with exit 2"
+  assert_ok "and the refusal names DEVBOX_LANES" contains "DEVBOX_LANES '$bad_lanes'" "$out"
+  assert_ok "and nothing was contacted" test ! -s "$TMP/ssh.log"
+done
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

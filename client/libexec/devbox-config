@@ -64,7 +64,7 @@ devbox_kv_parse() {
 # fails the run instead of silently running it with a default.
 DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
 DEVBOX_FORWARD_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR DEVBOX_RUNPOD_IMAGE \
-DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS "
+DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES "
 
 devbox_config_parse() {
   local file="$1" image="${DEVBOX_RUNPOD_IMAGE:-}" key
@@ -74,6 +74,21 @@ devbox_config_parse() {
   for key in DEVBOX_PROJECT DEVBOX_SETUP DEVBOX_VERIFY; do
     case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) echo "devbox: $file sets no $key" >&2; return 2 ;; esac
   done
+  # DEVBOX_LANES, the workspaces one worktree may hold on each target. MEASURED:
+  # several runs of one worktree waited on one host's lock for tens of minutes
+  # while that host ran at about a third of its CPU, because one worktree had
+  # one workspace per target. Each lane costs the project a container, two
+  # volumes and a Postgres role on every target, so the project sets it.
+  #
+  # Set here when the file does not, and never left to the environment: verify
+  # takes this many lane locks and gc keeps this many lanes, so an exported
+  # value would make the two disagree on which workspaces are live. The rule is
+  # the library's, which every caller of this parser loads first, in a
+  # subshell, because the guard exits and this parser returns its refusal.
+  case "$DEVBOX_KV_SEEN" in
+    *" DEVBOX_LANES "*) (require_lanes "$DEVBOX_LANES" "$file") || return 2 ;;
+    *) DEVBOX_LANES=2 ;;
+  esac
 }
 
 # Load the config of the checkout in $PWD. Sets DEVBOX_CONFIG, the file to name
@@ -106,7 +121,8 @@ devbox_config_load() {
 DEVBOX_ENV_KEYS=" DEVBOX_TARGETS DEVBOX_GATE_PASSWORD DEVBOX_RENT RUNPOD_KEY HCLOUD_TOKEN \
 DEVBOX_MAX_QUEUE_WAIT DEVBOX_QUEUE_FULL_ACTION DEVBOX_RUNPOD_IMAGE DEVBOX_RUNPOD_CPUS \
 DEVBOX_RUNPOD_IDLE_SECONDS DEVBOX_RUNPOD_MAX_HOURLY DEVBOX_RUNPOD_REGIONS \
-DEVBOX_HETZNER_SERVER_TYPE DEVBOX_HETZNER_LOCATION DEVBOX_HETZNER_IDLE_SECONDS "
+DEVBOX_HETZNER_SERVER_TYPE DEVBOX_HETZNER_LOCATION DEVBOX_HETZNER_IDLE_SECONDS \
+DEVBOX_AFFINITY_GRACE "
 DEVBOX_ENV_TARGET_RE='^DEVBOX_TARGET_[A-Z0-9]+(_HOSTKEY)?$'
 
 # A host key pin: the SHA256 fingerprint of an ed25519 host key, exactly as

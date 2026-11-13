@@ -90,6 +90,11 @@ case "$GATE_CMD" in
     [ "${FAKE_DOCKER_RC-0}" -eq 0 ] && echo "docker ok" || echo "docker missing"
     [ "${FAKE_RUNNER_RC-0}" -eq 0 ] && echo "devbox-runner ok" || echo "devbox-runner missing"
     [ "${FAKE_POOL_RC-0}" -eq 0 ] && echo "devbox-pool ok" || echo "devbox-pool missing"
+    # The host limits of protocol 3, each `ok` or `skipped <reason>`. A host
+    # before them answers none of the three lines.
+    if [ "${FAKE_NO_LIMITS-0}" -eq 0 ]; then
+      printf 'cpu-limit %s\nmemory-high %s\nswap %s\n' "${FAKE_CPU_LIMIT-ok}" "${FAKE_MEMORY_HIGH-ok}" "${FAKE_SWAP-ok 17179869184}"
+    fi
     exit 0 ;;
   version)           printf '%s\n' "${FAKE_VERSION-}"; exit 0 ;;
   pool-status)       printf '%s\n' "${FAKE_POOL_OUT-0/20 0/4}"; exit "${FAKE_POOL_STATUS_RC-0}" ;;
@@ -181,7 +186,8 @@ assert_eq "" "$(strays "$out")" "and every line it prints is still ok, FAIL or s
 assert_ok "the cause is read out of ssh's message rather than guessed from its exit code" \
   contains "FAIL ssh fixture (devbox-doctor-fixture) fails: DNS" "$out"
 for check in "docker on fixture" "devbox-runner on fixture" "devbox-pool on fixture" \
-             "protocol handshake" "library fingerprint" "devbox-pool status" "DEVBOX_REQUIRES"; do
+             "protocol handshake" "library fingerprint" "devbox-pool status" "DEVBOX_REQUIRES" \
+             "CPU limit on fixture" "soft memory limit on fixture" "swap on fixture"; do
   assert_ok "$check is skipped, not failed and not passed" \
     has_line_matching "^  skip $check" "$out"
 done
@@ -238,7 +244,8 @@ assert_ok "and the fix is a server install" contains "fix: devbox server install
 assert_fail "docker is not reported as down" contains "docker does not respond" "$out"
 assert_fail "and devbox-runner is not reported as missing" contains "devbox-runner is not on PATH" "$out"
 for check in "docker on fixture" "devbox-runner on fixture" "devbox-pool on fixture" \
-             "protocol handshake" "library fingerprint" "devbox-pool status" "DEVBOX_REQUIRES"; do
+             "protocol handshake" "library fingerprint" "devbox-pool status" "DEVBOX_REQUIRES" \
+             "CPU limit on fixture" "soft memory limit on fixture" "swap on fixture"; do
   assert_ok "$check is skipped because the verb failed" \
     has_line_matching "^  skip $check \\(the gate verb 'doctor' failed\\)" "$out"
 done
@@ -274,6 +281,10 @@ proto_line="$(status_line FAIL "protocol handshake" "$out")"
 assert_ok "the handshake fails on its own line" test -n "$proto_line"
 assert_ok "and that line names this client's number" contains "$proto" "$proto_line"
 assert_ok "and the server's" contains "99" "$proto_line"
+# A 1.x client met hosts already on 2.0.0 and told the operator to reinstall
+# them, while the stale half was the project's pin. Both repairs are named.
+assert_ok "the fix names the client pin" contains "move this project's devbox-client pin" "$out"
+assert_ok "and the server install" contains "Run 'devbox server install' for fixture (devbox-doctor-fixture)." "$out"
 assert_ok "and the fingerprint is skipped rather than compared across protocols" \
   has_line_matching '^  skip library fingerprint ' "$out"
 assert_fail "so it is never reported ok" contains "ok   library fingerprint" "$out"
@@ -490,6 +501,68 @@ doctor
 assert_ok "a degraded record is failed with its reason" \
   contains "FAIL health record: degraded (disk 93%); verify skips this target" "$out"
 unset FAKE_HEALTH
+
+# ── the CPU limit, the soft memory limit and swap (R18, R27) ─────────────────
+#
+# A token did not limit CPU, and a limit that silently does nothing reads as
+# green. The host's doctor verb says for each limit whether it is in force,
+# and a limit the host could not set is a skip row, never ok.
+doctor
+assert_eq "0" "$rc" "a host with every limit in force passes"
+assert_ok "the CPU limit is an ok row" contains "ok   CPU limit on fixture: a grant caps" "$out"
+assert_ok "the soft memory limit is an ok row" contains "ok   soft memory limit on fixture: every workspace has memory.high" "$out"
+assert_ok "swap is an ok row with its size" contains "ok   swap on fixture: 16G active" "$out"
+
+# R18: a host without cgroup v2, or with DEVBOX_CPU_LIMIT=0, runs the gate with
+# no limit, and doctor says so with the host's reason.
+export FAKE_CPU_LIMIT="skipped no cgroup v2 at /sys/fs/cgroup" FAKE_MEMORY_HIGH="skipped no cgroup v2 at /sys/fs/cgroup"
+doctor
+assert_eq "0" "$rc" "a skipped limit is not a failure: exit 0"
+assert_ok "the CPU limit is a skip row with the host's reason" \
+  contains "skip CPU limit on fixture (no cgroup v2 at /sys/fs/cgroup)" "$out"
+assert_ok "and so is the soft memory limit" \
+  contains "skip soft memory limit on fixture (no cgroup v2 at /sys/fs/cgroup)" "$out"
+assert_fail "the CPU limit is never an ok row" has_line_matching '^  ok   CPU limit' "$out"
+assert_fail "nor the soft memory limit" has_line_matching '^  ok   soft memory limit' "$out"
+assert_eq "2" "$(count '^  skip ' "$out")" "and those two are the only skips in the run"
+export FAKE_CPU_LIMIT="skipped"
+doctor
+assert_ok "a skip with no reason says so" contains "skip CPU limit on fixture (the host gave no reason)" "$out"
+unset FAKE_CPU_LIMIT FAKE_MEMORY_HIGH
+
+# R27: DEVBOX_SWAP_SIZE=0 adds no swap, and doctor reports it as skipped.
+export FAKE_SWAP="skipped DEVBOX_SWAP_SIZE=0 in /etc/devbox/config"
+doctor
+assert_eq "0" "$rc" "a host with DEVBOX_SWAP_SIZE=0 passes"
+assert_ok "and its swap is a skip row naming the key" \
+  contains "skip swap on fixture (DEVBOX_SWAP_SIZE=0 in /etc/devbox/config)" "$out"
+assert_fail "never an ok row" has_line_matching '^  ok   swap' "$out"
+export FAKE_SWAP="ok"
+doctor
+assert_eq "1" "$rc" "a swap ok that names no size fails the run"
+assert_ok "and the row says why" contains "FAIL swap on fixture: the host says ok and names no size" "$out"
+export FAKE_SWAP="ok 536870912"
+doctor
+assert_ok "a swap below 1G is named in megabytes" contains "ok   swap on fixture: 512M active" "$out"
+unset FAKE_SWAP
+
+# A host that answers none of the three lines predates them: each is a FAIL with
+# the install that repairs it, and never an ok or a silent skip.
+export FAKE_NO_LIMITS=1
+doctor
+assert_eq "1" "$rc" "a host with no limit lines fails the run"
+for check in "CPU limit" "soft memory limit" "swap"; do
+  assert_ok "$check: a missing line is a FAIL" \
+    has_line_matching "^  FAIL $check on fixture: its doctor answer has no [a-z-]+ line" "$out"
+done
+assert_eq "" "$(strays "$out")" "and every line is still ok, FAIL or skip"
+unset FAKE_NO_LIMITS
+export FAKE_CPU_LIMIT=$'maybe\033[2J'
+doctor
+assert_ok "a word that is neither ok nor skipped is a FAIL" \
+  contains "FAIL CPU limit on fixture: an answer this client cannot read: cpu-limit maybe[2J" "$out"
+assert_fail "and the control byte the host sent never reaches the terminal" contains $'\033' "$out"
+unset FAKE_CPU_LIMIT
 
 # ── one block per target ─────────────────────────────────────────────────────
 #

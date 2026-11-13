@@ -135,13 +135,20 @@ devbox_gate_private_dir() {
 # one file per run, <private dir>/runs/<pid>, and `devbox status` reads it:
 #
 #   <started-epoch> <phase-epoch> <phase> <target> <slug> <worktree path>
-#   <identity> <verify|run>
+#   <identity> <verify|run> <run-id>
 #
-# The second line is the pid's identity, devbox_pid_identity below, and the
-# command. A pid alone names whatever process holds that number now, so status
-# needs the identity to tell this run from a later process that got its pid.
-# The file holds a worktree path, so it lives in the private dir (mode 0700),
-# never in /tmp.
+# The second line is the pid's identity, devbox_pid_identity below, the
+# command, and the run id this run sends with `run`, `-` when it sends none. A
+# pid alone names whatever process holds that number now, so status needs the
+# identity to tell this run from a later process that got its pid.
+#
+# A run waits in the queue of every eligible target at once, so in the phases
+# `lock` and `queued` the target field names every target the run waits on,
+# joined by `+`, and the slug is lane 1's, the label of every ticket the run
+# holds. From the grant on it names the one target and the lane's slug. `lock`
+# is the wait for a free lane: it was part of `sync`, and runs that waited on
+# one worktree's lock for tens of minutes showed as syncing. The file holds a
+# worktree path, so it lives in the private dir (mode 0700), never in /tmp.
 #
 # The run never fails because of this file. A write that fails is said once on
 # stderr, and the run goes on without the file.
@@ -155,6 +162,7 @@ DEVBOX_RUNFILE_TARGET="-"
 DEVBOX_RUNFILE_SLUG="-"
 DEVBOX_RUNFILE_PATH="-"
 DEVBOX_RUNFILE_MODE="verify"
+DEVBOX_RUNFILE_RUN="-"
 
 # The pid's start time, the identity devbox-pool's _pid_starttime reads: field
 # 22 of /proc/<pid>/stat, in clock ticks since boot, cut at the LAST ')' because
@@ -185,6 +193,22 @@ devbox_pid_identity() {
   printf '%s' "$st"
 }
 
+# The first word of a run id: 16 hex characters of the sha256 of this machine's
+# id. The run id crosses to every target in a ticket, and the `status` verb
+# shows every ticket on a host to every gate user. It once carried the first 16
+# characters of the machine id itself: half of the id that `status` and `gc`
+# match a workspace's owner by, on every other developer's screen. The hash
+# still lets this laptop tell its own tickets on a target where it has no
+# workspace yet. verify writes it and status reads it, so it lives here once.
+devbox_run_id_prefix() {
+  local mid="${1-}" sum
+  [ -n "$mid" ] || return 1
+  sum="$(printf '%s' "${mid,,}" | sha256sum)" || return 1
+  sum="${sum:0:16}"
+  [[ "$sum" =~ ^[0-9a-f]{16}$ ]] || return 1
+  printf '%s' "$sum"
+}
+
 # The directory of the run files. It prints nothing and returns 1 when the
 # private dir is not one this user owns; devbox_gate_private_dir says why.
 devbox_runs_dir() {
@@ -200,9 +224,10 @@ _devbox_runfile_failed() {
 }
 
 # Write the run file for a new phase, by rename, so status never reads half of
-# one. $1 the phase: probe, rent, sync, setup, queued or gate. $2 the target,
-# when it changes; $3 the slug, $4 the worktree path and $5 verify or run, when
-# they are known. Always returns 0.
+# one. $1 the phase: probe, rent, lock, queued, sync, setup or gate. $2 the
+# target, when it changes; $3 the slug, $4 the worktree path and $5 verify or
+# run, when they are known. The caller sets DEVBOX_RUNFILE_RUN once it has a run
+# id. Always returns 0.
 devbox_runfile_phase() {
   local phase="${1-}" now dir tmp
   [ "$DEVBOX_RUNFILE_OFF" = 0 ] || return 0
@@ -220,9 +245,9 @@ devbox_runfile_phase() {
     DEVBOX_RUNFILE_IDENT="$(devbox_pid_identity "$$")" || DEVBOX_RUNFILE_IDENT="-"
   fi
   tmp="$DEVBOX_RUNFILE.$BASHPID.tmp"
-  if printf '%s %s %s %s %s %s\n%s %s\n' "$DEVBOX_RUNFILE_STARTED" "$now" "$phase" \
+  if printf '%s %s %s %s %s %s\n%s %s %s\n' "$DEVBOX_RUNFILE_STARTED" "$now" "$phase" \
        "$DEVBOX_RUNFILE_TARGET" "$DEVBOX_RUNFILE_SLUG" "$DEVBOX_RUNFILE_PATH" \
-       "$DEVBOX_RUNFILE_IDENT" "$DEVBOX_RUNFILE_MODE" >"$tmp" 2>/dev/null \
+       "$DEVBOX_RUNFILE_IDENT" "$DEVBOX_RUNFILE_MODE" "$DEVBOX_RUNFILE_RUN" >"$tmp" 2>/dev/null \
      && mv -f "$tmp" "$DEVBOX_RUNFILE" 2>/dev/null; then
     return 0
   fi
@@ -236,19 +261,6 @@ devbox_runfile_remove() {
   DEVBOX_RUNFILE_OFF=1
   [ -z "$DEVBOX_RUNFILE" ] || rm -f "$DEVBOX_RUNFILE" 2>/dev/null || true
   return 0
-}
-
-# Read a copy of the gate's stderr, and move the phase from queued to gate at
-# devbox-pool's `==> granted` line, the only sign of the grant this laptop
-# gets. It reads to the end of its input, because the tee that feeds it exits
-# on a write to a closed pipe, and that tee also carries the gate's stderr to
-# the developer.
-devbox_runfile_watch_grant() {
-  local line
-  while IFS= read -r line; do
-    case "$line" in "==> granted "*) devbox_runfile_phase gate; break ;; esac
-  done
-  cat >/dev/null
 }
 
 # A word that crosses to the host as one argument, or that sits in the rsync -e
@@ -414,6 +426,16 @@ devbox_gate_hostkey_repair() {
     "$(devbox_gate_known_name)" "$GATE_KNOWN_HOSTS"
 }
 
+# What a person does when the protocol integers differ: two sentences, then the
+# server repair the caller names. Every 1.x release spoke protocol 8, and 2.0.0
+# made the protocol the release major. A 1.x client then met hosts already on
+# 2.0.0, read "the server speaks 2", and doctor told the operator to reinstall
+# hosts that were current, while the stale half was the project's client pin.
+# The integer alone cannot say which half is behind, so both repairs are named.
+devbox_protocol_repair() {
+  printf "The protocol is the release major and every 1.x release spoke 8, so the integer alone does not say which half is older. Either move this project's devbox-client pin to the tag of the server's major, or bring the server to this client's major. %s" "$1"
+}
+
 # Make sure the known_hosts entry of this target is the pinned key, BEFORE any
 # ssh that could send the password.
 #
@@ -572,19 +594,52 @@ devbox_gate_close() {
 # one more password authentication per run. ControlPath=none comes before
 # GATE_OPTS, because ssh keeps the first value it reads for an option.
 devbox_gate() {
+  _gate_ready "$@" || return
+  # shellcheck disable=SC2029  # client-side expansion is the intent: each word is checked by _gate_ready, and devbox-gate splits them with read -ra, never a shell
+  SSH_ASKPASS="$GATE_ASKPASS" SSH_ASKPASS_REQUIRE=force DEVBOX_GATE_PASSWORD="${GATE_PASSWORD:-${DEVBOX_GATE_PASSWORD:-}}" \
+    _gate_limit ssh "${_GATE_MUX[@]}" "${GATE_OPTS[@]}" "$GATE_DEST" "$@"
+}
+
+# What every gate verb passes before it leaves this laptop, for devbox_gate and
+# devbox_gate_spawn alike: each word, the pin, and the mux options of the verb
+# in _GATE_MUX. Returns 2 for a word it refuses, and the pin's 255.
+_GATE_MUX=()
+_gate_ready() {
   local w
-  local -a mux=(-o ControlMaster=auto)
+  _GATE_MUX=(-o ControlMaster=auto)
   for w in "$@"; do
     _gate_word_ok "$w" || {
       _gate_refuse "refusing to send '$w' to $GATE_NAME: a gate word holds only A-Za-z0-9._:/+~=@%-"
       return 2
     }
   done
-  [ "${1-}" != run ] || mux=(-o ControlMaster=no -o ControlPath=none)
-  _gate_pin_or_refuse || return
-  # shellcheck disable=SC2029  # client-side expansion is the intent: each word is checked above, and devbox-gate splits them with read -ra, never a shell
+  [ "${1-}" != run ] || _GATE_MUX=(-o ControlMaster=no -o ControlPath=none)
+  _gate_pin_or_refuse
+}
+
+# Start one gate verb in the background, with ssh as the direct child, and set
+# GATE_SPAWN_PID to that ssh. The caller's redirections pass to it. Returns
+# what _gate_ready returns for a word or a pin it refuses, and starts nothing.
+#
+# A run waits in the queue of every eligible target, and every queue but the
+# one that grants first is left at once. A pool still waiting in its queue does
+# not read stdin, so closing it ends nothing: the session must drop, and that
+# takes the ssh's own pid. Started as `devbox_gate run ... &`, the pid is a
+# subshell's, and killing it leaves its ssh holding the ticket. No time limit
+# applies here: a lock and a queue wait as long as their own limits say.
+#
+# `<&0` is written out because bash gives an asynchronous command /dev/null for
+# stdin when that command names none, and the lock and the held run both read
+# the fifo their caller put on stdin.
+GATE_SPAWN_PID=""
+devbox_gate_spawn() {
+  GATE_SPAWN_PID=""
+  _gate_ready "$@" || return
+  # shellcheck disable=SC2029  # client-side expansion is the intent: each word is checked by _gate_ready, and devbox-gate splits them with read -ra, never a shell
   SSH_ASKPASS="$GATE_ASKPASS" SSH_ASKPASS_REQUIRE=force DEVBOX_GATE_PASSWORD="${GATE_PASSWORD:-${DEVBOX_GATE_PASSWORD:-}}" \
-    _gate_limit ssh "${mux[@]}" "${GATE_OPTS[@]}" "$GATE_DEST" "$@"
+    ssh "${_GATE_MUX[@]}" "${GATE_OPTS[@]}" "$GATE_DEST" "$@" <&0 &
+  # shellcheck disable=SC2034  # read by the scripts that source this file, never here
+  GATE_SPAWN_PID=$!
 }
 
 # rsync to one path under the gate's sync/ tree. Every argument but the last is

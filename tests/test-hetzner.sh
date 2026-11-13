@@ -15,6 +15,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# shellcheck source=tests/gate-stub-hold.sh
+source ./gate-stub-hold.sh
 command -v jq >/dev/null || { echo 'install jq to test the Hetzner provider' >&2; exit 1; }
 REPO="$(cd .. && pwd)"
 LIB="$REPO/lib/devbox-lib.sh"
@@ -33,7 +35,8 @@ ARGV_LOG="$TMP/argv.log"
 SSH_LOG="$TMP/ssh.log"
 export API ARGV_LOG SSH_LOG
 export FAKE_VERSION="$PROTO $FP"
-mkdir -p "$TMP/bin" "$TMP/fakehome" "$TMP/run"
+mkdir -p "$TMP/bin" "$TMP/fakehome" "$TMP/run" "$TMP/lanes"
+export FAKE_LANES="$TMP/lanes"
 
 # ── the fake API ─────────────────────────────────────────────────────────────
 cat >"$TMP/bin/curl" <<'STUB'
@@ -128,13 +131,14 @@ if [ -e "$API/selfdelete" ] && [[ " $* " == *" probe "* ]]; then
 fi
 PRE
   gate_stub_prelude
+  gate_stub_hold
   cat <<'STUB'
 case "$GATE_CMD" in
   version) printf '%s\n' "$FAKE_VERSION" ;;
   "queue-estimate "*) printf 'now 0 3 0/20 0/4 0\n' ;;
   "ensure-workspace "*) printf 'postgresql://fixture:fixture@fixture/fixture\n' ;;
-  "lock "*) printf 'LOCKED\n'; cat >/dev/null ;;
-  "run "*) cat >/dev/null; printf 'GATE RAN ON %s\n' "$GATE_HOST" ;;
+  "lock "*) _hold_lock ;;
+  "run "*) _hold_run; cat >/dev/null; printf 'GATE RAN ON %s\n' "$GATE_HOST" ;;
 esac
 exit 0
 STUB

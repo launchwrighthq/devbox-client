@@ -10,6 +10,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# shellcheck source=tests/gate-stub-hold.sh
+source ./gate-stub-hold.sh
 REPO="$(cd .. && pwd)"
 LIB="$REPO/lib/devbox-lib.sh"
 # shellcheck source=lib/devbox-lib.sh
@@ -34,12 +36,12 @@ fact() {
 }
 
 # The defaults every case starts from, one worked example: two deployed
-# targets in this order, no rental, a 600-second ceiling, the fail action.
+# targets in this order, no rental, the fail action.
 reset_select() {
   SELECT_TARGETS=(lan1 cloud1)
   SELECT_AFFINITY=""
+  SELECT_GRACE=0
   SELECT_RENT=()
-  SELECT_MAX_WAIT=600
   SELECT_ACTION=fail
   SELECT_LIB="$LIB"
   SELECT_MIN=4
@@ -48,6 +50,8 @@ out=""
 run_select() { out="$(printf '%s\n' "$@" | devbox_select)"; }
 decision() { printf '%s\n' "$out" | tail -n1; }
 skips() { printf '%s\n' "$out" | grep -c '^skip ' || true; }
+# The targets the run joins, in order, on one line.
+joins() { printf '%s\n' "$out" | awk '$1 == "join" { printf "%s%s", sep, $2; sep = " " }'; }
 
 # ── rule 1: the affinity target, when it can take the gate now ───────────────
 reset_select
@@ -56,6 +60,8 @@ run_select "$(fact lan1 now 0)" "$(fact cloud1 now 0)"
 assert_eq "pick cloud1 1 now 0 4/20 1/4 0" "$(decision)" \
   "example 1: at home, both free, the last target wins (rule 1)"
 assert_eq "0" "$(skips)" "and a target that only lost to affinity is not skipped"
+assert_eq "lan1 cloud1" "$(joins)" "the run joins both, in list order: the first grant wins"
+assert_ok "each join line carries what the probe answered" contains "join lan1 now 0 4/20 1/4 0" "$out"
 
 # ── rule 2: the first target in list order that fits now ─────────────────────
 reset_select
@@ -63,8 +69,9 @@ SELECT_AFFINITY=cloud1
 run_select "$(fact lan1 now 0)" "$(fact cloud1 wait 240)"
 assert_eq "pick lan1 2 now 0 4/20 1/4 0" "$(decision)" \
   "example 2: the last target has a 4-minute queue, the free one wins (rule 2)"
-assert_ok "and the busy last target gets a skip line with its wait" \
-  contains "skip cloud1 busy skipped: busy, about 240s of queuing" "$out"
+assert_ok "and the busy last target is still joined, with its wait" \
+  contains "join cloud1 wait 240 4/20 1/4 0" "$out"
+assert_eq "0" "$(skips)" "a busy target is never skipped: its queue may free first"
 
 reset_select
 run_select "$(fact lan1 now 0)" "$(fact cloud1 now 0)"
@@ -94,7 +101,7 @@ assert_ok "and the unreachable target is named with its reason" \
 reset_select
 run_select "$(fact lan1 wait 300)" "$(fact cloud1 wait 100)"
 assert_ok "the smallest wait wins, whatever the list order" contains "pick cloud1 3 wait 100" "$(decision)"
-assert_ok "and the longer queue is named" contains "skip lan1 busy skipped: busy, about 300s of queuing" "$out"
+assert_ok "and the longer queue is joined too" contains "join lan1 wait 300 4/20 1/4 0" "$out"
 
 reset_select
 SELECT_AFFINITY=cloud1
@@ -109,13 +116,45 @@ run_select "$(fact lan1 unknown -)" "cloud1 unreachable no answer in 3s"
 assert_ok "and is still taken when it is the only one left" contains "pick lan1 3 unknown -" "$(decision)"
 
 reset_select
-run_select "$(fact lan1 wait 600)" "$(fact cloud1 wait 900)"
-assert_ok "a wait equal to the ceiling is under it" contains "pick lan1 3 wait 600" "$(decision)"
-
-reset_select
-SELECT_MAX_WAIT=0
 run_select "$(fact lan1 wait 5000)" "$(fact cloud1 wait 9000)"
-assert_ok "a ceiling of 0 is no ceiling" contains "pick lan1 3 wait 5000" "$(decision)"
+assert_ok "a wait over the ceiling still ranks by rule 3" contains "pick lan1 3 wait 5000" "$(decision)"
+
+# ── the affinity grace: rule 1 within DEVBOX_AFFINITY_GRACE ─────────────────
+#
+# A warm workspace syncs only the changed files and skips most of the setup, so
+# the affinity target is preferred while its estimate is within the grace.
+reset_select
+SELECT_AFFINITY=cloud1
+SELECT_GRACE=60
+run_select "$(fact lan1 now 0)" "$(fact cloud1 wait 60)"
+assert_eq "pick cloud1 1 wait 60 4/20 1/4 0" "$(decision)" \
+  "an affinity target that estimates the grace or less is rule 1, over a target free now"
+assert_eq "lan1 cloud1" "$(joins)" "and the other target is still joined, after the grace"
+run_select "$(fact lan1 now 0)" "$(fact cloud1 wait 61)"
+assert_eq "pick lan1 2 now 0 4/20 1/4 0" "$(decision)" "one second over the grace is not rule 1"
+run_select "$(fact lan1 now 0)" "$(fact cloud1 unknown -)"
+assert_ok "an estimate the pool could not make is not within any grace" contains "pick lan1 2" "$(decision)"
+SELECT_GRACE=0
+run_select "$(fact lan1 now 0)" "$(fact cloud1 wait 10)"
+assert_ok "a grace of 0 keeps rule 1 to a target that fits now" contains "pick lan1 2" "$(decision)"
+unset SELECT_GRACE
+run_select "$(fact lan1 now 0)" "$(fact cloud1 wait 10)"
+assert_ok "and an unset grace is 0" contains "pick lan1 2" "$(decision)"
+
+# ── a target over the ceiling is joined ──────────────────────────────────────
+#
+# The estimate is an upper bound, so a target over the ceiling may still grant
+# first. Only the client's ceiling ends the wait (spec D1).
+reset_select
+run_select "$(fact lan1 wait 900)" "$(fact cloud1 wait 30)"
+assert_eq "lan1 cloud1" "$(joins)" "a target that estimates more than the ceiling is joined too"
+assert_eq "0" "$(skips)" "and it is not skipped"
+assert_ok "the smaller wait is still the pick" contains "pick cloud1 3 wait 30" "$(decision)"
+reset_select
+run_select "$(fact lan1 wait 900)" "$(fact cloud1 wait 700)"
+assert_eq "pick cloud1 3 wait 700 4/20 1/4 0" "$(decision)" \
+  "every target over the ceiling: the run joins them all, and the ceiling ends the wait"
+assert_eq "lan1 cloud1" "$(joins)" "both are joined"
 
 # ── rule 4: the first rented target ──────────────────────────────────────────
 reset_select
@@ -129,30 +168,28 @@ assert_ok "and the unreachable one too" contains "skip lan1 unreachable" "$out"
 reset_select
 SELECT_RENT=(runpod)
 SELECT_ACTION=local
-run_select "$(fact lan1 wait 900)" "$(fact cloud1 wait 700)"
+HEALTH=degraded REASON="disk 93%" run_select "$(HEALTH=degraded REASON="disk 93%" fact lan1 now 0)" "cloud1 unreachable no answer in 3s"
 assert_eq "rent runpod" "$(decision)" "a rental comes before the laptop"
 
 reset_select
-run_select "$(fact lan1 wait 900)" "$(fact cloud1 wait 700)"
+run_select "$(HEALTH=degraded REASON="disk 93%" fact lan1 now 0)" "cloud1 unreachable no answer in 3s"
 assert_eq "fail 8 none" "$(decision)" "with no DEVBOX_RENT, nothing is rented"
 
 # ── rule 5: the laptop, with DEVBOX_QUEUE_FULL_ACTION=local ──────────────────
 reset_select
 SELECT_ACTION=local
 run_select "$(fact lan1 wait 900)" "$(fact cloud1 wait 700)"
-assert_eq "local cloud1" "$(decision)" \
-  "the laptop, naming the shortest queue over the ceiling in case it cannot run the gate"
-assert_ok "and each target over the ceiling is named with both numbers" \
-  contains "skip lan1 over skipped: busy, about 900s of queuing, over the DEVBOX_MAX_QUEUE_WAIT of 600s" "$out"
+assert_ok "targets over the ceiling are joined before the laptop is considered" \
+  contains "pick cloud1 3" "$(decision)"
 reset_select
 SELECT_ACTION=local
 run_select "lan1 unreachable no answer in 3s" "cloud1 unreachable no answer in 3s"
-assert_eq "local" "$(decision)" "with nothing over the ceiling to wait on, the laptop alone"
+assert_eq "local" "$(decision)" "with no eligible target, the laptop"
 
 # ── rule 6: no target can take this gate ─────────────────────────────────────
 reset_select
-run_select "$(fact lan1 wait 900)" "$(HEALTH=degraded REASON="disk 93%" fact cloud1 now 0)"
-assert_eq "fail 8 none" "$(decision)" "a busy target and a degraded one exit 8"
+run_select "lan1 unreachable no answer in 3s" "$(HEALTH=degraded REASON="disk 93%" fact cloud1 now 0)"
+assert_eq "fail 8 none" "$(decision)" "an unreachable target and a degraded one exit 8"
 assert_eq "2" "$(skips)" "with one line per target"
 assert_ok "the degraded one names the watchdog's reason" \
   contains "skip cloud1 unhealthy skipped: degraded (disk 93%)" "$out"
@@ -162,7 +199,8 @@ assert_eq "fail 3 unreachable" "$(decision)" \
   "every target unreachable, and nothing to rent or fall back to, keeps the unreachable code 3"
 reset_select
 run_select "lan1 unreachable no answer in 3s" "$(fact cloud1 wait 900)"
-assert_eq "fail 8 none" "$(decision)" "an unreachable target and a busy one are 8"
+assert_ok "an unreachable target and a busy one over the ceiling: the busy one is joined" \
+  contains "pick cloud1 3 wait 900" "$(decision)"
 
 # ── a failure on EVERY target keeps its old code ─────────────────────────────
 reset_select
@@ -296,15 +334,18 @@ assert_eq "" "$(cd "$TMP/aff" && devbox_affinity_read)" "a record that is not a 
 #
 # lan1 sits at lan-fixture and cloud1 at cloud-fixture. FAKE_UNREACHABLE
 # makes one of them time out at the master open, and FAKE_PROBE_DIR holds a
-# probe line per address when a case needs one target busy.
-mkdir -p "$TMP/bin" "$TMP/fakehome" "$TMP/run" "$TMP/probes"
-{ gate_stub_head; cat <<'STUB'
+# probe line per address when a case needs one target busy. Since protocol 3 a
+# run joins every eligible target and runs on the first that grants, so a case
+# that needs one winner makes the other wait with FAKE_GRANT.
+mkdir -p "$TMP/bin" "$TMP/fakehome" "$TMP/run" "$TMP/probes" "$TMP/lanes"
+export FAKE_LANES="$TMP/lanes"
+{ gate_stub_head; gate_stub_hold; cat <<'STUB'
 case "$GATE_CMD" in
   version) printf '%s\n' "$FAKE_VERSION" ;;
   "queue-estimate "*) printf 'now 0 3 0/20 0/4 0\n' ;;
   "ensure-workspace "*) printf 'postgresql://fixture:fixture@fixture/fixture\n' ;;
-  "lock "*) printf 'LOCKED\n'; cat >/dev/null ;;
-  "run "*) cat >"${RUN_STDIN:-/dev/null}"; printf 'GATE RAN ON %s\n' "$GATE_HOST" ;;
+  "lock "*) _hold_lock ;;
+  "run "*) _hold_run; cat >/dev/null; printf 'GATE RAN ON %s\n' "$GATE_HOST" ;;
 esac
 exit 0
 STUB
@@ -334,11 +375,15 @@ verify() {
 last_target() { cat "$CO/.git/devbox/last-target" 2>/dev/null || true; }
 opened() { grep -F -- "-f -N" "$SSH_LOG" | grep -cF "devbox-gate@$1" || true; }
 
-verify
+FAKE_GRANT="cloud-fixture:3" verify
 assert_eq "0" "$rc" "two healthy targets: the gate runs"
-assert_ok "on the first in DEVBOX_TARGETS, by rule 2" \
-  contains "==> devbox: running on lan1 (the first target in DEVBOX_TARGETS that can take it now)" "$out"
+assert_ok "the run joins the first in DEVBOX_TARGETS" \
+  contains "==> devbox: queuing on lan1: 0/20 tokens, 0/4 jobs, 0 waiting: this ask fits now" "$out"
+assert_ok "and the second" contains "==> devbox: queuing on cloud1: " "$out"
+assert_ok "and runs on the one that granted first" \
+  contains "==> devbox: granted 2 tokens on lan1 lane 1 after " "$out"
 assert_ok "and the gate really ran there" contains "GATE RAN ON lan-fixture" "$out"
+assert_fail "and only there" contains "GATE RAN ON cloud-fixture" "$out"
 assert_eq "lan1" "$(last_target)" "the run records lan1 as this worktree's last target"
 assert_eq "1" "$(opened lan-fixture)" "every target was probed: lan1"
 assert_eq "1" "$(opened cloud-fixture)" "and cloud1"
@@ -352,17 +397,21 @@ assert_ok "the run verb's ssh sends a keepalive every 15 seconds" \
 # Affinity: the next run prefers the target that ran this worktree last.
 printf 'cloud1\n' >"$CO/.git/devbox/last-target"
 verify
-assert_ok "a worktree that last ran on cloud1 runs there again, by rule 1" \
-  contains "==> devbox: running on cloud1 (the last run of this worktree was here)" "$out"
+assert_ok "a worktree that last ran on cloud1 waits on cloud1 alone first, by rule 1" \
+  contains "==> devbox: waiting up to 60s on cloud1 alone, where this worktree's workspace is warm, before joining lan1" "$out"
+assert_ok "naming why" contains "==> devbox: queuing on cloud1 (the last run of this worktree was here): " "$out"
+assert_fail "and lan1 was never joined, because cloud1 granted within the grace" \
+  contains "queuing on lan1" "$out"
 assert_ok "and the gate ran there" contains "GATE RAN ON cloud-fixture" "$out"
 
 # Example 2 end to end: the last target is busy, the other is free.
 printf '%s\n' "$(devbox_probe_line "$PROTO $FP" "wait 240 4 20/20 4/4 2" "$(date +%s) ok" "$(date +%s)")" \
   >"$TMP/probes/cloud-fixture.probe"
 export FAKE_PROBE_DIR="$TMP/probes"
-verify
-assert_ok "the busy last target is skipped with one named line" \
-  contains "==> devbox: cloud1 skipped: busy, about 240s of queuing" "$out"
+FAKE_GRANT="cloud-fixture:never" verify
+assert_ok "the busy last target, over the grace, is joined at once with its wait" \
+  contains "==> devbox: queuing on cloud1 (the last run of this worktree was here): 20/20 tokens, 4/4 jobs, 2 waiting: about 240s of queuing" "$out"
+assert_fail "with no head start" contains "alone, where" "$out"
 assert_ok "and the gate runs on the free one" contains "GATE RAN ON lan-fixture" "$out"
 assert_eq "lan1" "$(last_target)" "which is now this worktree's last target"
 rm -f "$TMP/probes/cloud-fixture.probe"
@@ -391,7 +440,7 @@ unset FAKE_UNREACHABLE
 verify --target lan1
 assert_eq "0" "$rc" "--target lan1 runs while the cache still holds it"
 assert_ok "on lan1" contains "GATE RAN ON lan-fixture" "$out"
-assert_ok "naming why" contains "==> devbox: running on lan1 (--target lan1)" "$out"
+assert_ok "naming why" contains "==> devbox: queuing on lan1 (--target lan1): " "$out"
 assert_eq "0" "$(opened cloud-fixture)" "and cloud1 is not even probed"
 assert_fail "and a target that answered clears its cache record" test -f "$TMP/run/devbox/unreachable-lan1"
 
@@ -489,19 +538,20 @@ assert_fail "and no connection was opened, and no verb sent" grep -qE -- "-f -N|
 # forwarded name, `${!name+x}`, matched it anyway, so the password crossed into
 # the env file of every target's gate.
 printf 'DEVBOX_FORWARD_ENV=FIXTURE_SWITCH DEVBOX_GATE_PASSWORD\n' >>"$CO/.devbox/config.env"
-FIXTURE_SWITCH=on RUN_STDIN="$TMP/run.stdin" verify
+FIXTURE_SWITCH=on FAKE_HEADER_FILE="$TMP/run.stdin" verify
 cp "$TMP/config.keep" "$CO/.devbox/config.env"
 assert_eq "2" "$rc" "DEVBOX_FORWARD_ENV naming the gate password is refused"
 assert_ok "by name" \
   contains "refusing DEVBOX_GATE_PASSWORD in DEVBOX_FORWARD_ENV from $CO/.devbox/config.env: it is a .devbox.env key" "$out"
 assert_fail "and no gate ran" contains "GATE RAN" "$out"
-assert_fail "so no run stdin carried the password" grep -qF fixture-gate-password "$TMP/run.stdin"
+assert_fail "so no env header carried the password" grep -qF fixture-gate-password "$TMP/run.stdin"
+assert_fail "and no target was joined" grep -qE " lock | run " "$SSH_LOG"
 assert_fail "and the output never shows it" contains fixture-gate-password "$out"
 printf 'DEVBOX_FORWARD_ENV=FIXTURE_SWITCH\n' >>"$CO/.devbox/config.env"
-FIXTURE_SWITCH=on RUN_STDIN="$TMP/run.stdin" verify
+FIXTURE_SWITCH=on FAKE_HEADER_FILE="$TMP/run.stdin" verify
 cp "$TMP/config.keep" "$CO/.devbox/config.env"
 assert_eq "0" "$rc" "an exported switch named in DEVBOX_FORWARD_ENV still runs"
-assert_ok "and crosses on the run verb's stdin" grep -qxF "FIXTURE_SWITCH=on" "$TMP/run.stdin"
+assert_ok "and crosses in the env header after go" grep -qxF "FIXTURE_SWITCH=on" "$TMP/run.stdin"
 assert_fail "with no password beside it" grep -qF fixture-gate-password "$TMP/run.stdin"
 rm -f "$TMP/run.stdin"
 
@@ -510,16 +560,20 @@ assert_eq "2" "$rc" "a probe limit that is not a number is refused"
 assert_ok "by name" contains "DEVBOX_PROBE_ANSWER_SECONDS is 'soon' in the environment" "$out"
 assert_eq "0" "$(opened lan-fixture)" "before any target is asked"
 
-# Rule 6 end to end: both over the ceiling, no rental, the fail action.
+# Rule 6 end to end: both over the ceiling, neither grants within it, no
+# rental, the fail action. Both are joined, and the ceiling ends the wait.
 printf '%s\n' "$(devbox_probe_line "$PROTO $FP" "wait 900 4 20/20 4/4 2" "$(date +%s) ok" "$(date +%s)")" \
   | tee "$TMP/probes/lan-fixture.probe" >"$TMP/probes/cloud-fixture.probe"
-verify
-assert_eq "8" "$rc" "no target can take the gate: exit 8"
-assert_ok "with the sentence that says no target can take it" contains "devbox verify: no target can take this gate:" "$out"
-assert_ok "and one line per target" \
-  contains "  lan1 skipped: busy, about 900s of queuing, over the DEVBOX_MAX_QUEUE_WAIT of 600s" "$out"
-assert_ok "the second target too" \
-  contains "  cloud1 skipped: busy, about 900s of queuing, over the DEVBOX_MAX_QUEUE_WAIT of 600s" "$out"
+cp "$CO/.devbox.env" "$TMP/env.keep"
+sed -i 's/^DEVBOX_MAX_QUEUE_WAIT=600$/DEVBOX_MAX_QUEUE_WAIT=2/' "$CO/.devbox.env"
+FAKE_GRANT="lan-fixture:never cloud-fixture:never" verify
+cp "$TMP/env.keep" "$CO/.devbox.env"
+assert_eq "8" "$rc" "no target grants within the ceiling: exit 8"
+assert_ok "both targets over the ceiling were joined" \
+  contains "==> devbox: queuing on lan1: 20/20 tokens, 4/4 jobs, 2 waiting: about 900s of queuing" "$out"
+assert_ok "the second target too" contains "==> devbox: queuing on cloud1 " "$out"
+assert_ok "with the sentence that names the ceiling and both queues" \
+  contains "gave up waiting for tokens on lan1 cloud1 after 2s. The gate did not run, here or there." "$out"
 assert_fail "and nothing ran, here or there" contains "GATE RAN" "$out"
 assert_fail "not even locally" contains "LOCAL GATE RAN" "$out"
 rm -f "$TMP/probes/"*.probe

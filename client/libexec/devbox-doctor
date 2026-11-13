@@ -170,7 +170,7 @@ if [ "$env_ok" -eq 1 ]; then
   done
   last="$(devbox_affinity_read)"
   if [ -n "$last" ]; then
-    ok "this worktree last ran on $last, so verify prefers it while it can take the gate now"
+    ok "this worktree last ran on $last, so verify joins its queue alone first while its estimate is within DEVBOX_AFFINITY_GRACE"
   elif [ "${#DEVBOX_DEPLOYED[@]}" -gt 0 ]; then
     ok "this worktree has not run on a deployed target yet"
   fi
@@ -295,6 +295,51 @@ doctor_target() {
     fi
   fi
   remote_has() { printf '%s\n' "$remote_state" | grep -qx "$1 ok"; }
+  # One host limit as one row. $1 its name in the report, $2 its line's name in
+  # the doctor answer, $3 what an ok row says. The row is ok, skip with the
+  # host's reason, or FAIL for a line that is missing or that this client
+  # cannot read: a FAIL of an unread line rather than an ok, for the reason the
+  # DEVBOX_REQUIRES check below gives.
+  host_limit() {
+    local label="$1" key="$2" what="$3" l line="" rest word bytes
+    if [ "$reachable" -eq 0 ]; then
+      skip "$label on $TARGET ($no_remote)"
+      return 0
+    fi
+    while IFS= read -r l; do
+      case "$l" in "$key "*) line="${l//[^[:print:]]/}"; break ;; esac
+    done <<<"$remote_state"
+    rest="${line#"$key "}"
+    word="${rest%% *}"
+    case "$word" in
+      ok)
+        if [ "$key" != swap ]; then
+          ok "$label on $TARGET: $what"
+          return 0
+        fi
+        bytes="${rest#ok}"; bytes="${bytes# }"
+        if [[ "$bytes" =~ ^[1-9][0-9]*$ ]]; then
+          if [ "$bytes" -ge 1073741824 ]; then
+            ok "$label on $TARGET: $(( (bytes + 536870912) / 1073741824 ))G $what"
+          else
+            ok "$label on $TARGET: $(( (bytes + 524288) / 1048576 ))M $what"
+          fi
+        else
+          bad "$label on $TARGET: the host says ok and names no size: $line"
+          say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+        fi ;;
+      skipped)
+        rest="${rest#skipped}"; rest="${rest# }"
+        skip "$label on $TARGET (${rest:-the host gave no reason})" ;;
+      *)
+        if [ -z "$line" ]; then
+          bad "$label on $TARGET: its doctor answer has no $key line, so it predates protocol $DEVBOX_PROTOCOL_VERSION"
+        else
+          bad "$label on $TARGET: an answer this client cannot read: $line"
+        fi
+        say "fix: devbox server install for $TARGET ($TARGET_ADDR)" ;;
+    esac
+  }
 
   if [ "$reachable" -eq 0 ]; then
     skip "docker on $TARGET ($no_remote)"
@@ -377,7 +422,7 @@ doctor_target() {
         ;;
       6)
         bad "protocol handshake: $verdict"
-        say "fix: devbox server install for $TARGET ($TARGET_ADDR)"
+        say "fix: $(devbox_protocol_repair "Run 'devbox server install' for $TARGET ($TARGET_ADDR).")"
         ;;
       *)
         ok "protocol handshake: both halves speak protocol $DEVBOX_PROTOCOL_VERSION"
@@ -451,6 +496,22 @@ doctor_target() {
       bad "devbox-pool status exited $pool_rc: $pool_out"
     fi
   fi
+
+  # ── the CPU limit, the soft memory limit and swap ───────────────────────────
+  #
+  # A token did not limit CPU: every workspace container on one host read `max`
+  # in cpu.max, and a gate used more cores than its granted tokens. A host with no
+  # swap paid a memory peak with a killed process. The host now writes a grant's
+  # CPU limit and each workspace's memory.high, and has swap, and its `doctor`
+  # verb says for each one whether it is in force: `<name> ok`, `swap ok <bytes>`,
+  # or `<name> skipped <reason>`. A host that cannot write the limit runs the
+  # gate without it and prints one line, so a limit that silently does nothing
+  # would read as green here. Skipped is reported as skip, never as ok, with the
+  # host's reason (docs/specs/2026-11-13-late-binding-queue-design.md sections
+  # 6.3, 7.2 and 7.3). A line the answer lacks is a host that predates them.
+  host_limit "CPU limit" cpu-limit "a grant caps its workspace's cpu.max at the granted tokens"
+  host_limit "soft memory limit" memory-high "every workspace has memory.high below its cap"
+  host_limit "swap" swap "active"
 
   # ── the memory budget ────────────────────────────────────────────────────────
   #

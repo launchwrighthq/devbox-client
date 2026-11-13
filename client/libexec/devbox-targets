@@ -289,32 +289,47 @@ devbox_probe_lost() {
 #
 #   SELECT_TARGETS    array, the deployed targets in DEVBOX_TARGETS order
 #   SELECT_AFFINITY   the target this worktree last ran on, or empty
+#   SELECT_GRACE      DEVBOX_AFFINITY_GRACE in seconds; unset or 0 is no grace
 #   SELECT_RENT       array, the rented targets in DEVBOX_RENT order
-#   SELECT_MAX_WAIT   DEVBOX_MAX_QUEUE_WAIT; 0 is no ceiling
 #   SELECT_ACTION     DEVBOX_QUEUE_FULL_ACTION, local or fail
 #   SELECT_LIB        the library this client loaded, for the handshake
 #   SELECT_MIN        DEVBOX_MIN_TOKENS, for the line that names a pool too small
 #
-# It prints one `skip` line for each target that is not chosen and fails a
-# condition, in list order, and then ONE decision:
+# It prints one `skip` line for each target that is not eligible, in list
+# order, then one `join` line for each eligible target, in list order, and then
+# ONE decision:
 #
 #   skip <name> <class> <text>
+#   join <name> <verdict> <seconds> <tokens> <jobs> <queued>
 #   pick <name> <rule> <verdict> <seconds> <tokens> <jobs> <queued>
 #   rent <provider>
-#   local [<name>]       the laptop; the name is a target over the ceiling that
-#                        the caller may still wait on if this laptop cannot run
-#                        the gate
+#   local                the laptop
 #   fail <code> <class>
 #
+# A run waits in the queue of EVERY eligible target and runs on the first whose
+# pool grants (docs/specs/2026-11-13-late-binding-queue-design.md, D1).
+# MEASURED: tickets waited up to tens of minutes in a full target's queue
+# while another target ran at about a third of its CPU. They had queued where the probe pointed, and nothing asked again. An
+# eligible target passes every check except "fits now": it answered, its
+# handshake and DEVBOX_REQUIRES pass, it is healthy, and its estimate is not
+# `never`. An estimate over DEVBOX_MAX_QUEUE_WAIT is joined too. The estimate
+# is an upper bound: it counts tickets that another target will grant first.
+# A selection that skipped such a target left a 400s estimate unjoined under
+# a 300s ceiling while the run waited on a 200s one, and exited 8 at once when
+# every target was over the ceiling, with no wait at all. The client's own
+# ceiling ends the wait. `pick` tells the caller to join every
+# target of a `join` line. Its name is the target the rules below prefer: the
+# caller names it, and gives it alone the affinity grace when its rule is 1.
+#
 # A class is what a skip means and which code it carries alone: unreachable 3,
-# auth 3, handshake 5, client 5, requires 6, unhealthy 8, never 8, busy 8,
-# over 8.
+# auth 3, handshake 5, client 5, requires 6, unhealthy 8, never 8.
 #
 # The rules, the first that matches:
-#   1. the affinity target, when it passes every check and fits now
-#   2. the first target in list order that does
-#   3. among targets that fail only "fits now", the smallest wait under the
-#      ceiling; a wait the host could not estimate ranks after every number
+#   1. the affinity target, when it is eligible and fits now, or estimates at
+#      most SELECT_GRACE seconds of queuing
+#   2. the first target in list order that fits now
+#   3. among eligible targets that do not fit now, the smallest wait; a wait
+#      the host could not estimate ranks after every number
 #   4. the first rented target
 #   5. the laptop, with DEVBOX_QUEUE_FULL_ACTION=local
 #   6. none
@@ -331,9 +346,9 @@ devbox_probe_lost() {
 # or the laptop is its answer, so "every target is unreachable" is read only at
 # rule 6, and exits 3 there.
 devbox_select() {
-  local line name kind rest verdict vrc proto lib n
-  local -A open=() refused=() hostkey=() probe=() requires=() class=() text=()
-  local -a fit=() busy=() over=()
+  local line name kind rest verdict vrc proto lib n grace="${SELECT_GRACE:-0}"
+  local -A open=() refused=() hostkey=() probe=() requires=() class=() text=() secs=()
+  local -a fit=() busy=()
   while IFS= read -r line; do
     name="${line%% *}"
     rest="${line#"$name"}"; rest="${rest# }"
@@ -401,22 +416,19 @@ devbox_select() {
         # line names two numbers.
         text[$name]="skipped: its pool holds ${PROBE_TOKENS#*/} token(s) in all, and can never grant DEVBOX_MIN_TOKENS=$SELECT_MIN" ;;
       wait)
-        if [ "$SELECT_MAX_WAIT" -eq 0 ] || [ "$PROBE_SECS" -le "$SELECT_MAX_WAIT" ]; then
-          busy+=("$PROBE_SECS $name"); class[$name]=busy
-          text[$name]="skipped: busy, about ${PROBE_SECS}s of queuing"
-        else
-          over+=("$PROBE_SECS $name"); class[$name]=over
-          text[$name]="skipped: busy, about ${PROBE_SECS}s of queuing, over the DEVBOX_MAX_QUEUE_WAIT of ${SELECT_MAX_WAIT}s"
-        fi ;;
+        busy+=("$PROBE_SECS $name"); class[$name]=busy; secs[$name]="$PROBE_SECS" ;;
       *)
-        busy+=("- $name"); class[$name]=busy
-        text[$name]="skipped: busy, and its pool could not estimate the wait" ;;
+        busy+=("- $name"); class[$name]=busy ;;
     esac
     probe[$name]="$PROBE_VERDICT $PROBE_SECS $PROBE_TOKENS $PROBE_JOBS $PROBE_QUEUED"
   done
 
+  # Rule 1 reaches past "fits now" by the grace, because a warm workspace syncs
+  # only the changed files and skips most of the setup, and a cold one on another
+  # target uploads the whole checkout and runs the full setup (spec section 3.2).
   local pick="" rule=""
-  if [ -n "$SELECT_AFFINITY" ] && [ "${class[$SELECT_AFFINITY]-}" = fit ]; then
+  if [ -n "$SELECT_AFFINITY" ] && { [ "${class[$SELECT_AFFINITY]-}" = fit ] \
+       || { [ "$grace" -gt 0 ] && [ -n "${secs[$SELECT_AFFINITY]-}" ] && [ "${secs[$SELECT_AFFINITY]}" -le "$grace" ]; }; }; then
     pick="$SELECT_AFFINITY"; rule=1
   elif [ "${#fit[@]}" -gt 0 ]; then
     pick="${fit[0]}"; rule=2
@@ -424,13 +436,15 @@ devbox_select() {
     pick="$(_devbox_select_least "${busy[@]}")"; rule=3
   fi
 
-  # The skip lines, before the decision, for every target that is not the pick
-  # and failed a check. A target that passed every check and lost only to the
-  # affinity target or to list order is not skipped, so it has no line.
+  # The skip lines, for every target that is not eligible, then a join line for
+  # every one that is. A busy target is joined, never skipped: the queue it is
+  # in may free first.
   for name in "${SELECT_TARGETS[@]}"; do
-    [ "$name" != "$pick" ] || continue
-    [ "${class[$name]}" != fit ] || continue
+    case "${class[$name]}" in fit|busy) continue ;; esac
     printf 'skip %s %s %s\n' "$name" "${class[$name]}" "${text[$name]}"
+  done
+  for name in "${SELECT_TARGETS[@]}"; do
+    case "${class[$name]}" in fit|busy) printf 'join %s %s\n' "$name" "${probe[$name]}" ;; esac
   done
 
   if [ -n "$pick" ]; then
@@ -459,11 +473,7 @@ devbox_select() {
     return 0
   fi
   if [ "$SELECT_ACTION" = local ]; then
-    if [ "${#over[@]}" -gt 0 ]; then
-      printf 'local %s\n' "$(_devbox_select_least "${over[@]}")"
-    else
-      echo "local"
-    fi
+    echo "local"
     return 0
   fi
   if [ "${#SELECT_TARGETS[@]}" -gt 0 ] && [ "$all" -eq 1 ] && [ "$hard" = unreachable ]; then

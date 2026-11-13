@@ -60,8 +60,8 @@ src="$(cat "$VERIFY")"
 assert_ok "the client quotes the command with %q" contains "RUN_SCRIPT=\"\$(printf '%q ' \"\$@\")\"" "$src"
 # RUN_SCRIPT is the literal source expression being checked.
 # shellcheck disable=SC2016
-assert_ok "the command travels on stdin, never in the ssh argv" \
-  contains '<<< "$GATE_HEADER"$'"'"'\n'"'"'"$GATE_STDIN"' "$src"
+assert_ok "the command travels on stdin after go, never in the ssh argv" \
+  contains "printf 'go\\n%s\\n%s\\n' \"\$GATE_HEADER\" \"\$GATE_STDIN\"" "$src"
 # shellcheck disable=SC2016
 assert_ok "and stdin carries it after the hooks" \
   contains '"devbox_environment && $RUN_SCRIPT"' "$src"
@@ -70,7 +70,7 @@ assert_ok "a run sends the command mode, not the verify mode" \
 # Both are source text to find, not expansions.
 # shellcheck disable=SC2016
 assert_ok "a run asks the pool for its floor, not the gate's want" \
-  contains 'devbox_gate run "$SLUG" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS"' "$src"
+  contains 'devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS"' "$src"
 # shellcheck disable=SC2016
 assert_ok "and GRANT_WANT is the floor in a run" \
   contains '[ "$RUN_MODE" = "1" ] && GRANT_WANT="$DEVBOX_MIN_TOKENS"' "$src"

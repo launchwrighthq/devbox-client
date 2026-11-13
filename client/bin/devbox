@@ -31,8 +31,9 @@ usage() {
 usage: devbox <command> [args]
 
   verify [--local | --target <name>]
-                         run this checkout's gate on a target; --local runs it here,
-                         --target names one target from .devbox.env, runpod or hetzner
+                         run this checkout's gate on the first target whose pool grants;
+                         --local runs it here, --target joins one target from
+                         .devbox.env, runpod or hetzner
   run [--target <name>] -- <command>
                          run one command in this checkout's workspace on a target, never here
   runpod up|status|down   manage this checkout's temporary CPU rental

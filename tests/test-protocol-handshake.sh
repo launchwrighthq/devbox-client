@@ -17,6 +17,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# shellcheck source=tests/gate-stub-hold.sh
+source ./gate-stub-hold.sh
 REPO="$(cd .. && pwd)"
 VERIFY="$REPO/client/libexec/devbox-verify"
 
@@ -28,13 +30,20 @@ trap 'rm -rf "$TMP"' EXIT
 # Answers the two things devbox-verify asks before it syncs anything, and
 # nothing else. The master open (`-f -N`) is the reachability probe, which must
 # succeed or the run exits 3 long before the handshake. The version verb answers
-# whatever the scenario chose. Every later call (ensure-workspace, the lock)
-# gets a silent exit 0, so a run that passes the handshake stops at the next
-# step instead of reaching rsync or docker.
-mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run"
-{ gate_stub_head; cat <<'FAKE'
+# whatever the scenario chose. The lane lock and the held run are played as a
+# host plays them, and every later call (ensure-workspace first) gets a silent
+# exit 0, so a run that passes the handshake stops at the next step instead of
+# reaching rsync or docker.
+mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run" "$TMP/lanes"
+export FAKE_LANES="$TMP/lanes"
+# A run that passed the handshake takes a lane and a grant first (protocol 3),
+# so the lane lock and the held run are played, and ensure-workspace, the next
+# call, then gets the silent exit 0.
+{ gate_stub_head; gate_stub_hold; cat <<'FAKE'
 case "$GATE_CMD" in
   version) printf '%s\n' "${FAKE_SERVER_VERSION-}" ;;
+  "lock "*) _hold_lock ;;
+  "run "*) _hold_run; cat >/dev/null ;;
   *) exit 0 ;;
 esac
 FAKE
@@ -111,6 +120,9 @@ assert_ok "the refusal names this client's version" \
   contains "client speaks $proto" "$out"
 assert_ok "the refusal names the server's version" \
   contains "server speaks 99" "$out"
+assert_ok "the refusal names the client pin repair" \
+  contains "move this project's devbox-client pin" "$out"
+assert_ok "and the server repair" contains "Run 'devbox server install' for" "$out"
 assert_ok "and nothing was synced: the refusal comes before the workspace step" \
   not_contains "==> workspace" "$out"
 

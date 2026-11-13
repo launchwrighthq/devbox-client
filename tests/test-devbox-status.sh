@@ -133,18 +133,18 @@ GIB=1073741824
 reply_lan1() {  # $1 the host epoch; every other epoch is relative to it
   local e="$1"
   printf '%s %s %s\n' "$PROTO" "$FP" "$e"
-  printf 'host ok 12 28 32 2 3 1 21.4 32 %s %s\n' "$((24 * GIB))" "$((64 * GIB))"
+  printf 'host ok 12 28 32 2 3 1 21.4 32 %s %s %s %s\n' "$((24 * GIB))" "$((64 * GIB))" 0 "$((16 * GIB))"
   # mine: 6m12s in, a median of 9m12s, 60m limit, 7.1G of 12G.
   printf 'run 1234.5678 me %s 20 %s 3600 552 5 1830 %s %s 0 running\n' "$SLUG_FEAT" "$((e - 372))" "7623566950" "$((12 * GIB))"
   # other: 1m03s in, a median of 12m03s, one OOM kill.
   printf 'run 2345.6789 other - 8 %s - 723 3 710 %s %s 1 running\n' "$((e - 63))" "$((4 * GIB))" "$((12 * GIB))"
-  printf 'ticket 1 me %s 20 10 %s 180\n' "$SLUG_MAIN" "$((e - 50))"
+  printf 'ticket 1 me %s 20 10 %s 180 0123456789abcdef.4242\n' "$SLUG_MAIN" "$((e - 50))"
   printf 'end\n'
 }
 reply_cloud1() {
   local e="$1"
   printf '%s %s %s\n' "$PROTO" "$FP" "$e"
-  printf 'host ok 5 0 20 0 3 0 0.31 8 %s %s\n' "$((30 * GIB))" "$((32 * GIB))"
+  printf 'host ok 5 0 20 0 3 0 0.31 8 %s %s 0 0\n' "$((30 * GIB))" "$((32 * GIB))"
   printf 'end\n'
 }
 reply_lan1 "$E" >"$TMP/replies/lan1.invalid.status"
@@ -176,7 +176,7 @@ STATUS_ARGS=()
 # named <repository>/<worktree>, and the main checkout by its repository alone.
 expected_view="$(cat <<EOF
 lan1      ok        tokens #######. 28/32    load #####... 21/32    mem #####... 40G/64G    jobs 2/3
-cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3
+cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap
 
   STATE      TASK                  TARGET  TOKENS   TIME  LEFT        CORES  MEM
 > running    fix-cache/feat-login  lan1        20  6m12s  ~3m          18.3  7.1G/12G
@@ -223,12 +223,12 @@ STATUS_ARGS=()
 # not read.
 {
   printf '%s %s %s\n' "$PROTO" "$FP" "$E"
-  printf 'host degraded 12 28 32 3 3 2 9.5 32 - - disk 91%%\n'
+  printf 'host degraded 12 28 32 3 3 2 9.5 32 - - %s %s disk 91%%\n' "$((3 * GIB / 2))" "$((16 * GIB))"
   printf 'run 11.12 me %s 8 %s 3600 540 4 90 %s max 0 running\n' "$SLUG_FEAT" "$((E - 3360))" "$((512 * 1048576))"
   printf 'run 13.14 me %s 8 %s - - 0 - - - - running\n' "$SLUG_GONE" "$((E - 30))"
   printf 'run 15.16 other - 8 %s 3600 600 2 0 %s %s 2 stopping no work for 1200s\n' "$((E - 4000))" "$GIB" "$((2 * GIB))"
-  printf 'ticket 1 other - 32 16 %s -\n' "$((E - 3725))"
-  printf 'ticket 2 me %s 4 2 - 0\n' "$SLUG_MAIN"
+  printf 'ticket 1 other - 32 16 %s - -\n' "$((E - 3725))"
+  printf 'ticket 2 me %s 4 2 - 0 -\n' "$SLUG_MAIN"
   printf 'end\n'
 } >"$TMP/replies/lan1.invalid.status"
 run_status
@@ -240,8 +240,8 @@ tw=20
 [ "${#gone}" -le "$tw" ] || tw="${#gone}"
 row() { printf '%s %-9s  %-*s  %s\n' "$1" "$2" "$tw" "$3" "$4" | sed 's/ *$//'; }
 expected_other="$(
-  echo "lan1      degraded  tokens #######. 28/32    load ##...... 9.5/32   mem ........ -          jobs 3/3  disk 91%"
-  echo "cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3"
+  echo "lan1      degraded  tokens #######. 28/32    load ##...... 9.5/32   mem ........ -          jobs 3/3  swap 1.5G/16G  disk 91%"
+  echo "cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap"
   echo
   row " " STATE TASK "TARGET  TOKENS    TIME  LEFT           CORES  MEM"
   row " " stopping "other laptop" "lan1         8   1h06m                   0.0  1.0G/2.0G  no work for 1200s, 2 OOM kills"
@@ -255,13 +255,62 @@ assert_eq "$expected_other" "$out" \
 assert_eq "0" "$rc" "a degraded host is still an answer: exit 0"
 reply_lan1 "$E" >"$TMP/replies/lan1.invalid.status"
 
+# ═══ R9: one run queued on several targets is one row ════════════════════════
+#
+# A run waits in the queue of every eligible target and takes the first grant
+# (docs/specs/2026-11-13-late-binding-queue-design.md section 3). Its tickets
+# carry one run id on every target, and the view shows them as one row with
+# every target the run waits on. The row is the ticket that starts soonest:
+# cloud1's, at 1 minute, over lan1's at 5.
+RUN_A=0123456789abcdef.4242
+RUN_B=0123456789abcdef.4343
+two_snapshots() {  # $1 the run id of cloud1's ticket
+  {
+    printf '%s %s %s\n' "$PROTO" "$FP" "$E"
+    printf 'host ok 12 28 32 2 3 1 21.4 32 %s %s 0 %s\n' "$((24 * GIB))" "$((64 * GIB))" "$((16 * GIB))"
+    printf 'ticket 2 other - 8 4 %s 300 %s\n' "$((E - 90))" "$RUN_A"
+    printf 'end\n'
+  } >"$TMP/replies/lan1.invalid.status"
+  {
+    printf '%s %s %s\n' "$PROTO" "$FP" "$E"
+    printf 'host ok 5 0 20 0 3 0 0.31 8 %s %s 0 0\n' "$((30 * GIB))" "$((32 * GIB))"
+    printf 'ticket 1 other - 8 4 %s 60 %s\n' "$((E - 85))" "$1"
+    printf 'end\n'
+  } >"$TMP/replies/cloud1.invalid.status"
+}
+two_snapshots "$RUN_A"
+run_status
+assert_eq "0" "$rc" "two snapshots with one run id: exit 0"
+assert_eq "1" "$(printf '%s\n' "$out" | grep -c '^  queued')" "the run's two tickets are one row"
+assert_ok "naming both targets, in DEVBOX_TARGETS order, with the soonest ticket's place and estimate" \
+  grep -qE '^  queued #1  other laptop  lan1\+cloud1     4-8  1m25s  starts ~1m$' <<<"$out"
+two_snapshots "$RUN_B"
+run_status
+assert_eq "2" "$(printf '%s\n' "$out" | grep -c '^  queued')" "two run ids on two targets are two rows"
+assert_fail "and no row joins their targets" contains "lan1+cloud1" "$out"
+
+# A ticket whose run id is this laptop's is this laptop's row, though the host
+# could not prove it: a run joins a target's queue before its workspace there
+# exists, and the host proves an owner only from that workspace's label.
+# The prefix is a hash of the machine id, computed here on its own, so a client
+# that sent the machine id itself again would fail this case.
+MINE_RUN="$(printf '%s' "${MID,,}" | sha256sum | cut -c1-16).4242"
+two_snapshots "$MINE_RUN"
+sed -i "s/ $RUN_A\$/ $MINE_RUN/" "$TMP/replies/lan1.invalid.status"
+run_status
+assert_eq "1" "$(printf '%s\n' "$out" | grep -c '^  queued')" "this laptop's run on two targets is one row"
+assert_fail "and it is never called another laptop's" contains "other laptop" "$out"
+assert_ok "it waits on both targets" grep -qE '^  queued #1  - +lan1\+cloud1 ' <<<"$out"
+reply_lan1 "$E" >"$TMP/replies/lan1.invalid.status"
+reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
+
 # ═══ R13, R14: the lines that replace a block, and the exit code ═════════════
 #
 # Each case breaks lan1 alone. cloud1 answers, so its line must follow lan1's
 # one line, in its place. cloud1 runs nothing, and it answered, so the table
 # says that no gate runs or waits. The gates of lan1 are not in the table:
 # nothing this client could read said they exist.
-cloud1_block="$(printf '%s\n\n%s' "cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3" "no gate runs or waits")"
+cloud1_block="$(printf '%s\n\n%s' "cloud1    ok        tokens ........ 0/20     load #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap" "no gate runs or waits")"
 case_line() {  # $1 the expected lan1 line, $2 the expected exit code, $3 the case
   assert_eq "$2" "$rc" "$3: exit $2"
   assert_eq "$1" "$(printf '%s\n' "$out" | head -1)" "$3: lan1 keeps its place, with its reason"
@@ -543,7 +592,7 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
   assert_ok "the old lan1 line ends with the time it is from" \
     grep -qE '^lan1      ok        tokens .* jobs 2/3 \(as of [0-9]{2}:[0-9]{2}:[0-9]{2}\)$' <<<"$(plain "$out")"
   assert_ok "and cloud1, which answers, has no such mark" \
-    grep -qxF 'cloud1    ok        tokens ░░░░░░░░ 0/20     load █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3' <<<"$(plain "$out")"
+    grep -qxF 'cloud1    ok        tokens ░░░░░░░░ 0/20     load █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3  no swap' <<<"$(plain "$out")"
   # The rows of the old answer stay in the table, under the line that dates them.
   assert_ok "lan1's gates stay in the table" grep -qE '^▶ running    fix-cache/feat-login  lan1 ' <<<"$(plain "$out")"
   # The spinner turns in the header alone, while a refresh is out. One beside

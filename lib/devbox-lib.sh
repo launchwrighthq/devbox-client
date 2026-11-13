@@ -111,6 +111,16 @@ devbox_sanitize() {
 # so 2.0.0 is a major release. The earlier protocol 2 predates every host a
 # client of today reaches.
 #
+# 3 moves the choice of target to the moment a pool grants. A run waited in the
+# queue of the one target it chose, and stayed there while another target it
+# listed sat idle, so the host gains a hold mode of `run` whose words the client
+# sends, a `lock` verb that takes a lane slug per lane, and a run id on the
+# ticket. devbox_slug gains the lane as an input of its hash, so both halves
+# must compute one slug for lane 2 of one worktree, or two lanes land on one
+# Postgres role. The status reply gains the host's swap and the ticket's run id,
+# and a client on 2 reads that reply as malformed. A host on 2 refuses the
+# nine-word `run` after the lock; the handshake refuses it at the probe.
+#
 # This assignment sits BELOW devbox_sanitize, and only for the directive under
 # this line. A shellcheck directive placed before the first command of a file
 # applies to the whole file and to every line added to it later, so a genuinely
@@ -121,7 +131,7 @@ devbox_sanitize() {
 # file is SOURCED, so every line here runs before the sourcing script
 # continues, and the variable is set long before any consumer reads it.
 # shellcheck disable=SC2034  # read by whatever sources this file, never here
-DEVBOX_PROTOCOL_VERSION=2
+DEVBOX_PROTOCOL_VERSION=3
 
 # The handshake's second field: the sha256 of a library file, hex only, with no
 # filename beside it. It is handed the path rather than reading its own, so it
@@ -245,8 +255,27 @@ devbox_handshake_verdict() {
 #
 # Component widths (8, 18, 18) are chosen so `ws_` plus the slug is 56 bytes,
 # comfortably inside Postgres's 63-byte identifier limit.
+#
+# $5 is the lane, from 1 to 4
+# (docs/specs/2026-11-13-late-binding-queue-design.md section 5). One worktree
+# ran one gate per target at a time: MEASURED, several runs of one worktree
+# waited on one host's lock for tens of minutes while that host ran at about a
+# third of its CPU. A lane is a second full workspace, and its own slug names
+# its container, volumes and Postgres role.
+#
+# Lane 1, or no lane, hashes exactly what protocols 2 and 8 hashed, so every warm
+# workspace keeps its slug across the upgrade. Lane 2 to 4 puts the lane INSIDE
+# the hash rather than after it. A suffix such as `-l2` would push hash
+# characters out of the last seven that devbox_pg_ident keeps, and two
+# worktrees whose project and basename agree would then share one Postgres role,
+# the collision devbox_pg_ident's comment records.
 devbox_slug() {
-  local machine="$1" machine_id="$2" project="$3" path="$4" mach proj base hash
+  local machine="$1" machine_id="$2" project="$3" path="$4" lane="${5-}" mach proj base hash
+  case "$lane" in
+    ""|1|2|3|4) ;;
+    *) echo "devbox_slug: lane '$lane' is not a lane from 1 to 4" >&2
+       return 1 ;;
+  esac
   # Every component is sanitized, truncated and dash-trimmed the same way. An
   # earlier version returned exit 0 for a project or machine that sanitized to
   # empty (project comes from a project's committed .devbox/profile.sh, so a
@@ -270,8 +299,30 @@ devbox_slug() {
   # The machine id rather than the hostname, because two laptops can both
   # carry the same vendor default hostname. The hostname is the readable
   # component only.
-  hash="$(printf '%s\0%s' "$machine_id" "$path" | sha256sum | cut -c1-6)"
+  if [ -z "$lane" ] || [ "$lane" = 1 ]; then
+    hash="$(printf '%s\0%s' "$machine_id" "$path" | sha256sum | cut -c1-6)"
+  else
+    hash="$(printf '%s\0%s\0lane%s' "$machine_id" "$path" "$lane" | sha256sum | cut -c1-6)"
+  fi
   printf '%s-%s-%s-%s' "$mach" "$proj" "$base" "$hash"
+}
+
+# The slug of every lane of one worktree, lane 1 first, one per line. The `lock`
+# verb takes them in this order and tries lane 1 first, so a worktree uses
+# lane 2 only while lane 1 is busy, and gc keeps every one of them. Two callers
+# that built this list in two loops could disagree on which lanes exist, and gc
+# would then remove a live lane's workspace.
+devbox_lane_slugs() {
+  local machine="$1" machine_id="$2" project="$3" path="$4" lanes="${5-}" k
+  case "$lanes" in
+    1|2|3|4) ;;
+    *) echo "devbox_lane_slugs: '$lanes' is not a lane count from 1 to 4" >&2
+       return 1 ;;
+  esac
+  for ((k = 1; k <= lanes; k++)); do
+    devbox_slug "$machine" "$machine_id" "$project" "$path" "$k" || return 1
+    printf '\n'
+  done
 }
 
 # The two impure readers. Kept out of devbox_slug so that stays a pure function
@@ -545,6 +596,32 @@ require_gate_max_seconds() {
   echo "${DEVBOX_GUARD_WHO:-devbox}: refusing DEVBOX_GATE_MAX_SECONDS '$value' from $origin: write a whole number of seconds from 1 to $DEVBOX_GATE_MAX_SECONDS_CEILING, as in 3600" >&2
   devbox_guard_exit
 }
+# DEVBOX_LANES, the number of workspaces one worktree may hold on each target.
+# The project sets it in a committed file, and each lane costs that project a
+# container, two volumes and a Postgres role on every target it ran on. Four is
+# the ceiling: the `lock` verb takes at most four slugs, and a waiting run holds
+# two ssh sessions per target whatever its lane count. Zero is refused with the
+# rest, because a worktree with no lane has no workspace to run in.
+require_lanes() {
+  local value="$1" origin="$2"
+  case "$value" in
+    1|2|3|4) return 0 ;;
+  esac
+  echo "${DEVBOX_GUARD_WHO:-devbox}: refusing DEVBOX_LANES '$value' from $origin: write a whole number of lanes from 1 to 4, as in 2" >&2
+  devbox_guard_exit
+}
+# A run id, `<machine id hash>.<client pid>`, the hash 16 hex characters of the
+# sha256 of the machine id (devbox_run_id_prefix). The pool writes it into the
+# ticket and `devbox status` joins one run's tickets on several targets by it.
+# It crosses to the host as a word of `run`, and the host writes it into a file
+# that a root process reads, so it is hex, one dot and digits, and nothing a
+# file line or a status record could split on.
+require_run_id() {
+  local value="$1" origin="$2"
+  [[ "$value" =~ ^[0-9a-f]{8,32}\.[0-9]{1,10}$ ]] && return 0
+  echo "${DEVBOX_GUARD_WHO:-devbox}: refusing run id '$value' from $origin: a run id is 8 to 32 hex characters, a dot, then a process id" >&2
+  devbox_guard_exit
+}
 # The same policy for a DEVBOX_REQUIRES token. The class is wider than
 # require_safe_name's by five characters, and every one of them is required by a
 # token form the server defines: `/` by an absolute path, `=` by name=version,
@@ -623,6 +700,76 @@ for d in .venv node_modules; do
   if [ -L "$dir/$d" ]; then rm -f "$dir/$d"; fi
 done
 SCRIPT
+}
+
+# ── a container's cgroup ─────────────────────────────────────────────────────
+#
+# Moved here from devbox-runner in protocol 3, because devbox-pool now writes a
+# grant's CPU limit into the same container's cgroup that the runner reads. A
+# second copy of the lookup in the pool is the drift the comment below records,
+# one level up: two programs that disagree on where a container's cgroup is
+# would read figures from one place and write a limit to another.
+#
+# The directory is the one DEVBOX_CGROUP_ROOT names, /sys/fs/cgroup by default,
+# read at each call. That is the directory this function is handed, in the
+# sense of this file's header: tests point it at a fixture tree, because a test
+# cannot write under /sys/fs/cgroup.
+
+# The path of one file in a container's cgroup, the first layout in which it is
+# readable, or a refusal that prints nothing.
+#
+# Two layouts, because the path is decided by docker's cgroup driver rather than
+# by anything this file controls. The systemd form is what a deployed host had
+# (measured); the second is the cgroupfs form.
+#
+# ONE function for every reader. oom-count tried both layouts while
+# workspace_cpu_usec built the systemd form inline, so on a cgroupfs host the
+# watchdog's stall rule read nothing while oom-count read the same container
+# fine. `status` reads CPU, memory and OOM kills from one container, and three
+# readers that disagree on where its cgroup is would put figures from two places
+# on one line.
+#
+# The id becomes part of a path, so it is checked here as well as by the caller.
+container_cgroup_file() {
+  local id="${1-}" file="${2-}" d
+  case "$file" in ""|*/*) return 1 ;; esac
+  while IFS= read -r d; do
+    if [ -r "$d/$file" ]; then
+      printf '%s' "$d/$file"
+      return 0
+    fi
+  done < <(_container_cgroup_layouts "$id")
+  return 1
+}
+
+# The directory of a container's cgroup, in the same two layouts and the same
+# order as container_cgroup_file, for a caller that WRITES a file there: the
+# pool's cpu.max and cpu.weight, the runner's memory.high. One lookup for the
+# reader and the writer, so a limit is written where status reads it back.
+# MEASURED: every workspace container on one host read `max` in cpu.max, and a
+# gate used more cores than its granted tokens. A limit written to a path nobody
+# reads is that same failure with a green log, so the writer names this
+# directory in its own refusal line when a write fails.
+container_cgroup_dir() {
+  local id="${1-}" d
+  while IFS= read -r d; do
+    if [ -d "$d" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done < <(_container_cgroup_layouts "$id")
+  return 1
+}
+
+# The candidate directories of a container's cgroup, one per line, in the
+# order both functions above try them. The list lives here alone: with one list
+# in each function, a third layout added to one of them gave a reader and a
+# writer that disagree, the failure the comments above record. An id that is
+# not a container id prints nothing, so both functions refuse it.
+_container_cgroup_layouts() {
+  local id="${1-}" root="${DEVBOX_CGROUP_ROOT:-/sys/fs/cgroup}"
+  [[ "$id" =~ ^[0-9a-f]{12,}$ ]] || return 0
+  printf '%s\n' "$root/system.slice/docker-$id.scope" "$root/docker/$id"
 }
 
 # ── the probe line ───────────────────────────────────────────────────────────
@@ -751,10 +898,19 @@ devbox_probe_parse() {
 # The answer of the `status` verb, one record per line:
 #
 #   <protocol> <lib-sha256> <host-epoch>
-#   host <health> <health-age> <held> <total> <jobs> <max-jobs> <queued> <load1> <cores> <mem-avail> <mem-total> [<health reason>...]
+#   host <health> <health-age> <held> <total> <jobs> <max-jobs> <queued> <load1> <cores> <mem-avail> <mem-total> <swap-used> <swap-total> [<health reason>...]
 #   run <run-id> <owner> <slug> <tokens> <granted-epoch> <max-seconds> <median> <samples> <cpu-pct> <mem-bytes> <mem-max-bytes> <oom-kills> <state> [<stop reason>...]
-#   ticket <position> <owner> <slug> <want> <min> <queued-epoch> <start-seconds>
+#   ticket <position> <owner> <slug> <want> <min> <queued-epoch> <start-seconds> <client-run>
 #   end
+#
+# Protocol 3 added <swap-used> and <swap-total>, in bytes, and <client-run>,
+# the run id `<machine id hash>.<client pid>` that require_run_id checks. A
+# host with no swap pays a gate's memory peak with a killed process, so the view
+# shows swap in use beside free memory. One run waits in the queue of every
+# eligible target, and `devbox status` joins its tickets on several targets by
+# that id, so the run shows once in the laptop's list. A ticket of a pool that
+# names no run is `-`. <client-run> is not the run record's <run-id>, which is
+# the pool's `<pid>.<starttime>` of one grant.
 #
 # The host writes it with devbox_status_line and the laptop reads it with
 # devbox_status_parse, and both take every field's shape from
@@ -781,10 +937,10 @@ _devbox_status_shapes() {
   case "${1-}" in
     head)   printf '%s\n' '[A-Za-z0-9._:+-]+' '[A-Za-z0-9._:+-]+' "$n" ;;
     host)   printf '%s\n' 'ok|degraded|down|missing|invalid' '-1|[0-9]+' "$n" "$n" "$n" "$n" "$n" \
-              '[0-9]+(\.[0-9]+)?' "$n" "$n" "$n" '+' ;;
+              '[0-9]+(\.[0-9]+)?' "$n" "$n" "$n" "$n" "$n" '+' ;;
     run)    printf '%s\n' '[0-9]+\.([0-9]+|-)' 'me|other' '[A-Za-z0-9._-]+' "$n" "$n" "$n" "$n" "$n" \
               "$n" "$n" 'max|[0-9]+' "$n" 'running|stopping' '+' ;;
-    ticket) printf '%s\n' "$n" 'me|other' '[A-Za-z0-9._-]+' "$n" "$n" "$n" "$n" ;;
+    ticket) printf '%s\n' "$n" 'me|other' '[A-Za-z0-9._-]+' "$n" "$n" "$n" "$n" '[0-9a-f]+\.[0-9]+' ;;
     end)    ;;
     *)      return 1 ;;
   esac
@@ -872,14 +1028,15 @@ devbox_status_line() {
 #
 #   STATUS_EPOCH, and STATUS_HEALTH, STATUS_HEALTH_AGE, STATUS_HELD,
 #   STATUS_TOTAL, STATUS_JOBS, STATUS_MAX_JOBS, STATUS_QUEUED, STATUS_LOAD1,
-#   STATUS_CORES, STATUS_MEM_AVAIL, STATUS_MEM_TOTAL, STATUS_HEALTH_REASON
+#   STATUS_CORES, STATUS_MEM_AVAIL, STATUS_MEM_TOTAL, STATUS_SWAP_USED,
+#   STATUS_SWAP_TOTAL, STATUS_HEALTH_REASON
 #   STATUS_RUN_COUNT and the arrays STATUS_RUN_ID, STATUS_RUN_OWNER,
 #   STATUS_RUN_SLUG, STATUS_RUN_TOKENS, STATUS_RUN_GRANTED, STATUS_RUN_MAX,
 #   STATUS_RUN_MEDIAN, STATUS_RUN_SAMPLES, STATUS_RUN_CPU, STATUS_RUN_MEM,
 #   STATUS_RUN_MEM_MAX, STATUS_RUN_OOM, STATUS_RUN_STATE, STATUS_RUN_REASON
 #   STATUS_TICKET_COUNT and the arrays STATUS_TICKET_POS, STATUS_TICKET_OWNER,
 #   STATUS_TICKET_SLUG, STATUS_TICKET_WANT, STATUS_TICKET_MIN,
-#   STATUS_TICKET_QUEUED, STATUS_TICKET_START
+#   STATUS_TICKET_QUEUED, STATUS_TICKET_START, STATUS_TICKET_RUN
 # shellcheck disable=SC2034  # every STATUS_ variable is read by the caller
 devbox_status_parse() {
   local reply="${1-}" line kind i last="" n_host=0 rest
@@ -887,13 +1044,14 @@ devbox_status_parse() {
   STATUS_PROTOCOL=""; STATUS_LIB=""; STATUS_EPOCH=""
   STATUS_HEALTH=""; STATUS_HEALTH_AGE=""; STATUS_HELD=""; STATUS_TOTAL=""; STATUS_JOBS=""
   STATUS_MAX_JOBS=""; STATUS_QUEUED=""; STATUS_LOAD1=""; STATUS_CORES=""; STATUS_MEM_AVAIL=""
-  STATUS_MEM_TOTAL=""; STATUS_HEALTH_REASON=""
+  STATUS_MEM_TOTAL=""; STATUS_SWAP_USED=""; STATUS_SWAP_TOTAL=""; STATUS_HEALTH_REASON=""
   STATUS_RUN_COUNT=0; STATUS_RUN_ID=(); STATUS_RUN_OWNER=(); STATUS_RUN_SLUG=(); STATUS_RUN_TOKENS=()
   STATUS_RUN_GRANTED=(); STATUS_RUN_MAX=(); STATUS_RUN_MEDIAN=(); STATUS_RUN_SAMPLES=()
   STATUS_RUN_CPU=(); STATUS_RUN_MEM=(); STATUS_RUN_MEM_MAX=(); STATUS_RUN_OOM=()
   STATUS_RUN_STATE=(); STATUS_RUN_REASON=()
   STATUS_TICKET_COUNT=0; STATUS_TICKET_POS=(); STATUS_TICKET_OWNER=(); STATUS_TICKET_SLUG=()
   STATUS_TICKET_WANT=(); STATUS_TICKET_MIN=(); STATUS_TICKET_QUEUED=(); STATUS_TICKET_START=()
+  STATUS_TICKET_RUN=()
   [ -n "$reply" ] || return 2
   mapfile -t lines <<<"$reply"
   # A trailing newline is not a record.
@@ -951,7 +1109,8 @@ devbox_status_parse() {
         STATUS_HEALTH="${words[0]}"; STATUS_HEALTH_AGE="${words[1]}"; STATUS_HELD="${words[2]}"
         STATUS_TOTAL="${words[3]}"; STATUS_JOBS="${words[4]}"; STATUS_MAX_JOBS="${words[5]}"
         STATUS_QUEUED="${words[6]}"; STATUS_LOAD1="${words[7]}"; STATUS_CORES="${words[8]}"
-        STATUS_MEM_AVAIL="${words[9]}"; STATUS_MEM_TOTAL="${words[10]}"; STATUS_HEALTH_REASON="$rest" ;;
+        STATUS_MEM_AVAIL="${words[9]}"; STATUS_MEM_TOTAL="${words[10]}"
+        STATUS_SWAP_USED="${words[11]}"; STATUS_SWAP_TOTAL="${words[12]}"; STATUS_HEALTH_REASON="$rest" ;;
       run)
         STATUS_RUN_ID+=("${words[0]}"); STATUS_RUN_OWNER+=("${words[1]}"); STATUS_RUN_SLUG+=("${words[2]}")
         STATUS_RUN_TOKENS+=("${words[3]}"); STATUS_RUN_GRANTED+=("${words[4]}"); STATUS_RUN_MAX+=("${words[5]}")
@@ -962,7 +1121,7 @@ devbox_status_parse() {
       ticket)
         STATUS_TICKET_POS+=("${words[0]}"); STATUS_TICKET_OWNER+=("${words[1]}"); STATUS_TICKET_SLUG+=("${words[2]}")
         STATUS_TICKET_WANT+=("${words[3]}"); STATUS_TICKET_MIN+=("${words[4]}"); STATUS_TICKET_QUEUED+=("${words[5]}")
-        STATUS_TICKET_START+=("${words[6]}")
+        STATUS_TICKET_START+=("${words[6]}"); STATUS_TICKET_RUN+=("${words[7]}")
         STATUS_TICKET_COUNT=$((STATUS_TICKET_COUNT + 1)) ;;
     esac
   done

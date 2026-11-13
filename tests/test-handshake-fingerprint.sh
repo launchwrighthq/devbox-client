@@ -22,6 +22,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# shellcheck source=tests/gate-stub-hold.sh
+source ./gate-stub-hold.sh
 # shellcheck source=lib/devbox-lib.sh
 source ../lib/devbox-lib.sh
 REPO="$(cd .. && pwd)"
@@ -89,10 +91,16 @@ assert_ok "and carries no filename beside the digest" \
 # same log, because the remote sync is the first thing that would write to
 # another machine, and a handshake that ran after it would already have done
 # the damage the handshake exists to prevent.
-mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run"
-{ GATE_STUB_PREFIX='ssh ' gate_stub_head; cat <<'FAKE'
+mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run" "$TMP/lanes"
+export FAKE_LANES="$TMP/lanes"
+# A run that passed the handshake takes a lane and a grant first (protocol 3),
+# so the lane lock and the held run are played, and ensure-workspace, the next
+# call, then gets the silent exit 0.
+{ GATE_STUB_PREFIX='ssh ' gate_stub_head; gate_stub_hold; cat <<'FAKE'
 case "$GATE_CMD" in
   version) printf '%s\n' "${FAKE_SERVER_VERSION-}" ;;
+  "lock "*) _hold_lock ;;
+  "run "*) _hold_run; cat >/dev/null ;;
   *) exit 0 ;;
 esac
 FAKE

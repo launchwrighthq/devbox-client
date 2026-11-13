@@ -159,11 +159,30 @@ for root in "${roots[@]}"; do
   # becoming this script's own for the next root in the run. Its stdout goes to
   # stderr because anything the loader prints would otherwise be captured as
   # part of the project name.
-  project="$(
-    cd "$top"
-    devbox_config_load 1>&2
-    printf '%s' "${DEVBOX_PROJECT:-}"
-  )" || project=""
+  #
+  # DEVBOX_LANES comes out of the same load, on the first line. A worktree holds
+  # one workspace per lane on each target, each with its own slug, and the
+  # server deletes every slug this keep-list does not name. A lane count read
+  # from anywhere but the committed config is a live lane's workspace, volumes
+  # and Postgres role deleted, so a value an earlier shell exported is unset
+  # before the load. devbox_config_parse sets the count verify locks when the
+  # config sets none, and refuses one outside 1 to 4; a gc that kept fewer
+  # lanes than verify locks would collect a lane while a run holds it.
+  #
+  # The load's own status ends the subshell. set -e does not reach into a
+  # command substitution, and the parser sets each key as it reads it, so a
+  # config that failed at line 6 on a key this client does not know still
+  # handed back the project from line 1, and gc built a keep-list from a config
+  # verify refuses.
+  loaded="$(
+    cd "$top" || exit 2
+    unset DEVBOX_LANES
+    devbox_config_load 1>&2 || exit 2
+    printf '%s\n%s' "${DEVBOX_LANES-}" "${DEVBOX_PROJECT:-}"
+  )" || loaded=""
+  lanes="${loaded%%$'\n'*}"
+  project="${loaded#*$'\n'}"
+  [ "$project" != "$loaded" ] || project=""
   # Refuse the whole run rather than skip this root. A root dropped from the
   # keep-list is a workspace the server then deletes, which is the failure this
   # command must never cause, so name the root and stop.
@@ -171,16 +190,27 @@ for root in "${roots[@]}"; do
     echo "devbox-gc: no DEVBOX_PROJECT from $top/.devbox (unset, empty, or the config failed to load)." >&2
     exit 2
   }
+  # The parser already refused a count outside 1 to 4. This guard is the
+  # destructive command failing closed on any count that reaches it: a guessed
+  # or empty count is a keep-list that drops a live lane. Exit 2, naming the
+  # config.
+  require_lanes "$lanes" "$top/.devbox/config.env"
   # devbox_slug refuses a machine, project or path that sanitizes to empty, and
   # that refusal used to end the run through set -e with nothing printed: the
   # keep-list simply stopped being built. Name the root and every component, so
   # the operator can see which one is empty.
-  slug="$(devbox_slug "$MACHINE" "$MACHINE_ID" "$project" "$top")" || {
+  #
+  # Every lane from 1 to DEVBOX_LANES, lane 1 first, from the one function the
+  # `lock` verb's slug list also comes from. A lane above a lowered count is
+  # left off, so the server collects it (docs/specs/2026-11-13-late-binding-queue-design.md
+  # section 5.3).
+  slugs="$(devbox_lane_slugs "$MACHINE" "$MACHINE_ID" "$project" "$top" "$lanes")" || {
     echo "devbox-gc: no slug for $root: devbox_slug refused machine '$MACHINE', project '$project', path '$top'. One of them sanitizes to empty." >&2
     exit 2
   }
-  keep+=("$slug")
-  plan+=("$top -> $slug")
+  mapfile -t lane_slugs <<<"$slugs"
+  keep+=("${lane_slugs[@]}")
+  plan+=("$top -> ${lane_slugs[*]}")
 done
 
 if [ "${#keep[@]}" -eq 0 ]; then
@@ -320,7 +350,7 @@ collect_target() {
     # it differently maps this keep-list onto another worktree's Postgres role
     # and gc drops that one instead.
     *)
-      not_collected 5 "$verdict. Run 'devbox server install' for $TARGET."
+      not_collected 5 "$verdict. $(devbox_protocol_repair "Run 'devbox server install' for $TARGET.")"
       return ;;
   esac
 

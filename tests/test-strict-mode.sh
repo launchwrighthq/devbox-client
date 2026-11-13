@@ -20,12 +20,15 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# shellcheck source=tests/gate-stub-hold.sh
+source ./gate-stub-hold.sh
 REPO="$(cd .. && pwd)"
 VERIFY="$REPO/client/libexec/devbox-verify"
 
 TMP="$(mktemp -d)" || { echo "mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run"
+mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run" "$TMP/lanes"
+export FAKE_LANES="$TMP/lanes"
 
 contains() { case "$2" in *"$1"*) return 0 ;; esac; return 1; }
 
@@ -37,8 +40,9 @@ SSH_LOG="$TMP/ssh.log"
 CURL_LOG="$TMP/curl.log"
 PW_LOG="$TMP/pw.log"
 OOM_N="$TMP/oom.n"
+HOLD_LOG="$TMP/hold.log"
 LOCAL_MARK="$TMP/local-gate-ran"
-export FAKE_PROTO FAKE_FP SSH_LOG CURL_LOG PW_LOG OOM_N TMP
+export FAKE_PROTO FAKE_FP SSH_LOG CURL_LOG PW_LOG OOM_N TMP HOLD_LOG
 
 # ── the fake gate account ────────────────────────────────────────────────────
 #
@@ -61,6 +65,7 @@ case " $* " in *" ControlPath=none "*)
 esac
 HEAD
   gate_stub_prelude
+  gate_stub_hold
   cat <<'FAKE'
 case "$GATE_CMD" in
   version) printf '%s %s\n' "$FAKE_PROTO" "$FAKE_FP"; exit 0 ;;
@@ -72,19 +77,20 @@ case "$GATE_CMD" in
     exit 0 ;;
   "setup "*) cat >/dev/null; exit "${FAKE_SETUP_RC:-0}" ;;
   # The fifth word of `run` is the max wait: a ceiling asks the pool with one,
-  # and 0 is the gate with none. FAKE_WATCHDOG is a stop reason, printed as
-  # devbox-pool prints it when the watchdog stopped the gate.
+  # and 0 is the gate with none. FAKE_ACQ is the pool's exit under a ceiling
+  # before any grant, and FAKE_PRE_RC (gate_stub_hold) its exit before any grant
+  # with or without one. FAKE_GATE_RC is the gate's own exit after `go`.
+  # FAKE_WATCHDOG is a stop reason, printed as devbox-pool prints it when the
+  # watchdog stopped the gate.
   "run "*)
+    read -r _ _ _ _ _ _mw _ <<<"$GATE_CMD"
+    if [ "$_mw" != 0 ] && [ "${FAKE_ACQ:-0}" != 0 ]; then exit "$FAKE_ACQ"; fi
+    _hold_run
     cat >/dev/null
     [ -z "${FAKE_WATCHDOG-}" ] || echo "devbox-pool: the watchdog stopped this gate: $FAKE_WATCHDOG" >&2
-    [ -z "${FAKE_TICKET-}" ] || echo "devbox-pool: lost its queue ticket $FAKE_TICKET" >&2
-    read -r _ _ _ _ _ _mw _ <<<"$GATE_CMD"
-    case "$_mw" in
-      0) exit "${FAKE_GATE_RC:-0}" ;;
-      *) exit "${FAKE_ACQ:-0}" ;;
-    esac ;;
+    exit "${FAKE_GATE_RC:-0}" ;;
   "ensure-workspace "*) printf '%s\n' "${FAKE_DSN-postgresql://fixture:fixture@fixture/fixture}"; exit 0 ;;
-  "lock "*) printf 'LOCKED\n'; cat >/dev/null; exit 0 ;;
+  "lock "*) _hold_lock ;;
   *) exit 0 ;;
 esac
 FAKE
@@ -140,7 +146,7 @@ out=""; rc=0; ssh_log=""; curl_log=""; pw_log=""
 # $TMP/run/devbox and is removed per run: a case that makes a target unreachable
 # must not decide the next one.
 run_verify() {
-  : >"$SSH_LOG"; : >"$CURL_LOG"; : >"$PW_LOG"; printf 0 >"$OOM_N"; rm -f "$LOCAL_MARK"
+  : >"$SSH_LOG"; : >"$CURL_LOG"; : >"$PW_LOG"; : >"$HOLD_LOG"; printf 0 >"$OOM_N"; rm -f "$LOCAL_MARK"
   rm -rf "$TMP/run/devbox"
   local args=()
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do args+=("$1"); shift; done
@@ -195,12 +201,13 @@ assert_fail "and the gate did not run here either" local_ran
 # Rule 5 of the target choice, with nothing that refuses the fallback: no
 # DEVBOX_REQUIRES and no DEVBOX_NEEDS_POSTGRES. Without strict the gate runs here.
 write_env "${TARGET_B[@]}" 'DEVBOX_MAX_QUEUE_WAIT=60' 'DEVBOX_QUEUE_FULL_ACTION=local'
-run_verify DEVBOX_STRICT=1 FAKE_EST='wait 900 3 4/4 1/2 2'
-assert_eq 64 "$rc" "strict, every target over the ceiling with DEVBOX_QUEUE_FULL_ACTION=local: exit 64"
+# FAKE_ACQ=75 is the pool giving up on the ceiling, so no target grants in time.
+run_verify DEVBOX_STRICT=1 FAKE_EST='wait 900 3 4/4 1/2 2' FAKE_ACQ=75
+assert_eq 64 "$rc" "strict, no grant within the ceiling with DEVBOX_QUEUE_FULL_ACTION=local: exit 64"
 assert_ok "the refusal names the queue action" contains "DEVBOX_QUEUE_FULL_ACTION=local" "$out"
 assert_fail "the gate did not run on this machine" local_ran
-assert_fail "and no grant was asked for on the target" contains "devbox-gate@hostb.invalid run " "$ssh_log"
-run_verify FAKE_EST='wait 900 3 4/4 1/2 2'
+assert_fail "and the gate never started on the target" grep -q " go " "$HOLD_LOG"
+run_verify FAKE_EST='wait 900 3 4/4 1/2 2' FAKE_ACQ=75
 assert_eq 0 "$rc" "without strict, the same queue runs the gate locally"
 assert_ok "the local gate ran" local_ran
 
@@ -243,7 +250,7 @@ assert_fail "and not to the environment's" contains "hosta.invalid" "$ssh_log"
 # address for a target the call does not use is not refused as unlisted.
 run_verify DEVBOX_STRICT=1 DEVBOX_TARGETS=hosta DEVBOX_TARGET_HOSTA=hosta.invalid "DEVBOX_TARGET_HOSTA_HOSTKEY=$GATE_STUB_PIN"
 assert_eq 0 "$rc" "strict, the environment's target list and address: exit 0"
-assert_ok "the run chose the environment's target" contains "==> devbox: running on hosta" "$out"
+assert_ok "the run chose the environment's target" contains "==> devbox: queuing on hosta" "$out"
 assert_fail "and never asked the file's target" contains "hostb.invalid" "$ssh_log"
 
 # A key that only the file sets still comes from the file.
@@ -324,7 +331,10 @@ assert_eq 1 "$rc" "without strict, the same failure exits 1"
 # devbox's failure, not the gate's, so strict mode reports it as 65.
 run_verify DEVBOX_STRICT=1 FAKE_RSYNC_RC=23
 assert_eq 65 "$rc" "strict, a sync that fails with 23 before the gate: exit 65"
-assert_fail "and no grant was asked for" contains "devbox-gate@hostb.invalid run " "$ssh_log"
+# Since protocol 3 the grant comes before the sync, so the run was asked for;
+# the gate never got `go`, and the held grant was released.
+assert_fail "and the gate never started" grep -q " go " "$HOLD_LOG"
+assert_ok "and the held grant was released" grep -q " abort abort" "$HOLD_LOG"
 run_verify FAKE_RSYNC_RC=23
 assert_eq 23 "$rc" "without strict, the sync's own 23 passes through"
 
@@ -337,7 +347,7 @@ for step in "FAKE_RSYNC_RC=5:the sync" "FAKE_RSYNC_RC=7:the sync" "FAKE_SETUP_RC
   run_verify DEVBOX_STRICT=1 "$setting"
   assert_eq 65 "$rc" "strict, $name exits $code before the gate: exit 65"
   assert_fail "and prints no infra line" contains "::devbox-infra::" "$out"
-  assert_fail "and asks for no grant" contains "devbox-gate@hostb.invalid run " "$ssh_log"
+  assert_fail "and the gate never started" grep -q " go " "$HOLD_LOG"
   run_verify "$setting"
   assert_eq "$code" "$rc" "without strict, $name's own $code passes through"
 done
@@ -345,10 +355,10 @@ done
 # Exit 8 is "no target can take this gate". The queue line comes with it only
 # when the queue is the cause.
 write_env "${TARGET_B[@]}" 'DEVBOX_MAX_QUEUE_WAIT=60'
-run_verify DEVBOX_STRICT=1 FAKE_EST='wait 900 3 4/4 1/2 2'
-assert_eq 72 "$rc" "strict, every target over the ceiling with action fail: exit 72"
+run_verify DEVBOX_STRICT=1 FAKE_EST='wait 900 3 4/4 1/2 2' FAKE_ACQ=75
+assert_eq 72 "$rc" "strict, no grant within the ceiling with action fail: exit 72"
 assert_ok "stderr names the queue event" contains "::devbox-infra::queue" "$out"
-run_verify FAKE_EST='wait 900 3 4/4 1/2 2'
+run_verify FAKE_EST='wait 900 3 4/4 1/2 2' FAKE_ACQ=75
 assert_eq 8 "$rc" "without strict, the same queue exits 8"
 
 write_env "${TARGET_B[@]}"
@@ -371,12 +381,17 @@ assert_ok "stderr names the queue event" contains "::devbox-infra::queue" "$out"
 run_verify FAKE_ACQ=75
 assert_eq 8 "$rc" "without strict, the same ceiling exits 8"
 
+# The pool's 75 comes before its grant, so since protocol 3 the client tells it
+# from a gate's own 75, which comes after `go`.
 write_env "${TARGET_B[@]}"
-run_verify DEVBOX_STRICT=1 FAKE_GATE_RC=75
-assert_eq 74 "$rc" "strict, the pool gives up with 75 and no ceiling: exit 74"
+run_verify DEVBOX_STRICT=1 FAKE_PRE_RC=75
+assert_eq 74 "$rc" "strict, the pool gives up with 75 before a grant and no ceiling: exit 74"
 assert_ok "stderr names the pool deadline" contains "::devbox-infra::pool-deadline" "$out"
-run_verify FAKE_GATE_RC=75
-assert_eq 75 "$rc" "without strict, the pool's 75 passes through"
+run_verify FAKE_PRE_RC=75
+assert_eq 75 "$rc" "without strict, the pool's 75 is 75"
+run_verify DEVBOX_STRICT=1 FAKE_GATE_RC=75
+assert_eq 75 "$rc" "strict, a gate's own 75 after go: exit 75, the gate's own"
+assert_fail "and it is never read as the pool's deadline" contains "::devbox-infra::" "$out"
 
 # The watchdog's stop is exit 10, and 76 in strict mode. The gate did not run to
 # its end, so the code is devbox's report, as an OOM kill's is.
@@ -395,12 +410,12 @@ assert_fail "and prints no infra line" contains "::devbox-infra::" "$out"
 # The pool lost the gate's queue ticket and could not restore it: exit 11, and
 # 77 in strict mode. The gate never ran.
 LOST='1000.4242 after 30s of waiting for 4 tokens (min 1) and cannot restore it in /run/devbox-pool/queue'
-run_verify DEVBOX_STRICT=1 FAKE_GATE_RC=78 FAKE_TICKET="$LOST"
+run_verify DEVBOX_STRICT=1 FAKE_PRE_RC=78 FAKE_PRE_ERR="devbox-pool: lost its queue ticket $LOST"
 assert_eq 77 "$rc" "strict, the pool lost the queue ticket: exit 77"
 assert_ok "stderr names the pool-ticket event" contains "::devbox-infra::pool-ticket" "$out"
 assert_ok "and the client names the event and says the gate did not run" \
   contains "lost this gate's queue ticket and could not restore it, so the gate did not run" "$out"
-run_verify FAKE_GATE_RC=78 FAKE_TICKET="$LOST"
+run_verify FAKE_PRE_RC=78 FAKE_PRE_ERR="devbox-pool: lost its queue ticket $LOST"
 assert_eq 11 "$rc" "without strict, the lost ticket exits 11"
 assert_fail "and prints no infra line" contains "::devbox-infra::" "$out"
 run_verify FAKE_GATE_RC=78

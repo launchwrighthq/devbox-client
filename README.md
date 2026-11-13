@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v2.0.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.0.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v2.0.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v2.0.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v2.0.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.0.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -120,11 +120,17 @@ DEVBOX_VERIFY="npm run verify:local"
 | `DEVBOX_FORWARD_ENV` | no | names of variables that the gate receives from the laptop |
 | `DEVBOX_NEEDS_POSTGRES`, `DEVBOX_DB_URL_VAR` | no | `1` for a per-worktree Postgres database, and the variable that receives its URL |
 | `DEVBOX_RUNPOD_IMAGE` | no | the RunPod image; a value in `.devbox.env` wins |
-| `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target; default `3600`, at most `14400` |
+| `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target, counted from the moment the gate starts; default `3600`, at most `14400` |
+| `DEVBOX_LANES` | no | how many workspaces this worktree may hold on each target, so that many of its runs can run there at once; default `2`, `1` to `4` |
 
 Each command key becomes the body of a shell function. The function text goes to the
 workspace on stdin, so no command becomes part of an ssh argument list. Put a command longer
 than one line in a committed script, for example `DEVBOX_SETUP="bash .devbox/setup.sh"`.
+
+`DEVBOX_LANES` sets how many runs of one worktree can run at once on one target. Each lane is a
+full workspace with its own container, volumes, Postgres role and lock, so each one costs the
+project disk and memory on every target. A run takes lane 1 when it is free, because lane 1 is
+the warm one. `devbox gc` keeps every lane up to this count. A value outside 1 to 4 exits 2.
 
 `DEVBOX_FORWARD_ENV` may not name a key of `.devbox.env`. A name such as
 `DEVBOX_GATE_PASSWORD` is refused with exit 2, so the password never reaches a gate.
@@ -158,6 +164,7 @@ from an earlier shell never stands in for a missing line.
 | `DEVBOX_RENT` | the rented targets, in order: `runpod`, `hetzner`, or both. Empty by default |
 | `DEVBOX_MAX_QUEUE_WAIT` | the longest queue wait in seconds; unset or `0` is no ceiling |
 | `DEVBOX_QUEUE_FULL_ACTION` | `fail`, the default, exits 8; `local` runs the gate here when this machine satisfies `DEVBOX_REQUIRES` |
+| `DEVBOX_AFFINITY_GRACE` | how long, in seconds, a run waits on the target that ran this worktree last before it joins the others; default `60`, `0` turns it off |
 | `RUNPOD_KEY` | the RunPod account API key; read from this file only |
 | `DEVBOX_RUNPOD_CPUS` | vCPUs for a new pod; default `16` |
 | `DEVBOX_RUNPOD_IDLE_SECONDS` | idle time before the pod terminates itself; default `7200`, at most `28800` |
@@ -196,6 +203,7 @@ DEVBOX_RENT=
 # Queue
 DEVBOX_MAX_QUEUE_WAIT=600
 DEVBOX_QUEUE_FULL_ACTION=fail
+DEVBOX_AFFINITY_GRACE=60
 ```
 
 The operator of the hosts gives each developer the addresses, the pins and the gate password.
@@ -205,13 +213,21 @@ The operator's deploy prints the address line and the pin line of each target, r
 
 `devbox verify` sends every deployed target one `probe`, in parallel, with a 3-second connect
 timeout. The answer carries the protocol and library fingerprint, the watchdog's health record
-and its age, and the pool's queue estimate. The client then takes the first rule that matches:
+and its age, and the pool's queue estimate.
 
-1. The target that ran this worktree last, when it is reachable, healthy, passes the handshake
-   and `DEVBOX_REQUIRES`, and its queue fits this gate now.
-2. The first target in `DEVBOX_TARGETS` order that meets the same conditions.
-3. Among targets that meet every condition except "fits now", the one with the smallest wait,
-   when that wait is at most `DEVBOX_MAX_QUEUE_WAIT`.
+A target is eligible when it is reachable, healthy, passes the handshake and
+`DEVBOX_REQUIRES`, and its queue estimate is not `never`. It need not fit now, and an estimate
+over `DEVBOX_MAX_QUEUE_WAIT` is joined too, because that queue may still grant first. **A run
+waits in the queue of every eligible target and runs on the first that grants.** On each one it
+first takes a free lane of this worktree, then a place in the queue. At the first grant every
+other place is given up at once, and the sync, the setup and the gate run on the granted
+target, under that grant. The client takes the first rule that matches:
+
+1. The target that ran this worktree last, when it is eligible and fits now, or estimates at
+   most `DEVBOX_AFFINITY_GRACE` seconds of queuing. Its workspace is warm, so the run waits on it
+   alone first, and joins every other eligible target after the grace.
+2. The first target in `DEVBOX_TARGETS` order that fits now. The run joins every eligible target.
+3. Any other eligible target. The run joins every eligible target.
 4. The first rented target in `DEVBOX_RENT`.
 5. This machine, when `DEVBOX_QUEUE_FULL_ACTION=local`.
 6. Otherwise exit 8, with one line per target that says why.
@@ -219,8 +235,14 @@ and its age, and the pool's queue estimate. The client then takes the first rule
 ```
 ==> devbox: lan1 unreachable (no answer in 3s)
 ==> devbox: cloud1 skipped: degraded (disk 93%)
-==> devbox: running on cloud2 (the first target in DEVBOX_TARGETS that can take it now)
+==> devbox: queuing on cloud2: 30/32 tokens, 3/3 jobs, 1 waiting: about 240s of queuing
+==> devbox: queuing on cloud3: 4/16 tokens, 1/3 jobs, 0 waiting: this ask fits now
+==> devbox: granted 12 tokens on cloud3 lane 1 after 2s (also queued on cloud2)
 ```
+
+`DEVBOX_MAX_QUEUE_WAIT` counts from the first place in a queue, the grace included. When it runs
+out with no grant, rules 4 to 6 apply. A run that gets no free lane on any eligible target
+within `DEVBOX_LOCK_WAIT` (3600 seconds, from the environment) exits 4.
 
 A target is healthy when its watchdog record says `ok` and is at most 90 seconds old. A
 handshake mismatch, or an image that does not satisfy `DEVBOX_REQUIRES`, skips one target. On
@@ -228,8 +250,16 @@ every target, it exits 5 or 6. A refused gate password on every target exits 3. 
 target is remembered for 60 seconds, so back-to-back runs off a LAN do not each wait for a
 LAN-only target.
 
+A host grants a job when its free memory, less a reserve, covers a fixed headroom
+(`DEVBOX_MEMORY_HEADROOM`, set by the host's operator). From the grant to the release the
+workspace may use at most its granted tokens in cores, so a gate that needs more cores asks for
+more tokens in `DEVBOX_WANT_TOKENS`. Above a soft memory limit, 90 % of the workspace's cap, the
+host slows the workspace and pages it to swap instead of killing a process. The cap itself still
+ends a gate that grows without end, which exits 7.
+
 `--target <name>` forces one target: a name from `DEVBOX_TARGETS`, `runpod` or `hetzner`. The
-probe and its checks still apply to a deployed target.
+probe and its checks still apply to a deployed target, and the run waits on that target alone,
+with no grace.
 
 ### The gate password
 
@@ -313,16 +343,16 @@ minutes, and 4 when another run of this worktree held the creation for 15 minute
 
 | Command | What it does |
 |---|---|
-| `devbox verify` | Chooses a target, locks the worktree, syncs it, runs `DEVBOX_SETUP` and `DEVBOX_VERIFY` there, and returns the gate's exit code. |
+| `devbox verify` | Waits in the queue of every eligible target, holding a free lane of this worktree on each, and on the first that grants syncs the worktree, runs `DEVBOX_SETUP` and `DEVBOX_VERIFY` there, and returns the gate's exit code. |
 | `devbox verify --target <name>` | The same, on one target: a name from `DEVBOX_TARGETS`, `runpod` or `hetzner`. |
 | `devbox verify --local` | Runs the local gate and opens no connection. |
 | `devbox run [--target <name>] -- <command>` | Runs one command in the remote workspace after setup. It never runs locally. |
 | `devbox runpod up\|status\|down` | Manages this checkout's RunPod pod. |
 | `devbox hetzner up\|status\|down` | Manages this checkout's Hetzner server. |
 | `devbox compare [--target <name>]` | Runs both gates and compares the passed, failed and skipped counts. |
-| `devbox gc [--dry-run] [--yes] <root>...` | Removes remote workspaces whose local worktree is gone, on every target in `DEVBOX_TARGETS`. Run `--dry-run` first. |
+| `devbox gc [--dry-run] [--yes] <root>...` | Removes remote workspaces whose local worktree is gone, on every target in `DEVBOX_TARGETS`, and every lane above a worktree's `DEVBOX_LANES`. Run `--dry-run` first. |
 | `devbox doctor` | Checks every prerequisite and every target, and names each one that fails. |
-| `devbox status [--target <name>]` | Shows the runs this laptop started and the phase each is in (probe, rent, sync, setup, queued, gate), then each target in `DEVBOX_TARGETS`: its health and pool, every gate it runs or queues, which are this laptop's, and how long each has run and has left, then each RunPod pod and Hetzner server and what it has cost so far. It changes nothing. |
+| `devbox status [--target <name>]` | Shows the runs this laptop started and the phase each is in (probe, rent, lock, queued, sync, setup, gate), then each target in `DEVBOX_TARGETS`: its health and pool, every gate it runs or queues, which are this laptop's, and how long each has run and has left, then each RunPod pod and Hetzner server and what it has cost so far. It changes nothing. |
 | `devbox requires-local <token>...` | Checks this machine against `DEVBOX_REQUIRES` tokens. |
 | `devbox ssh-install --host <host>` | Writes a `Host` block in `~/.ssh/config` for an operator's root access. A client does not need it. `--print` writes it to stdout, and `--remove` deletes it. |
 | `devbox version` | Prints the release version and the protocol version. |
@@ -345,7 +375,9 @@ It checks the checkout, `.devbox/config.env`, `.devbox/exclude`, `.devbox.env`, 
 this laptop and the OpenSSH version. Then it prints one block per target: reachable, gate
 password accepted, the host key pin and whether the recorded key matches it, the protocol
 handshake, the watchdog's
-health, the token pool, the memory budget per worker, and each `DEVBOX_REQUIRES` token. When
+health, the token pool, the CPU limit, the soft memory limit and the swap of the host, the
+memory budget per worker, and each `DEVBOX_REQUIRES` token. The three host limits are `ok`, or
+`skip` with the host's reason, and never `ok` for a limit the host cannot set. When
 ssh fails, it names the cause: DNS, the network, a refused gate password or a host key that is
 not its pin.
 
@@ -353,10 +385,12 @@ not its pin.
 
 `devbox status` asks every target one `status` verb, in parallel. It prints one line per
 target in `DEVBOX_TARGETS` order: health, then a bar each for reserved tokens, load against
-the core count and memory in use, then jobs. Then one table lists every gate that runs, then
-the queue in line order, then the runs this laptop started that no target holds yet (probe,
-rent, sync, setup), then the lost ones. A run is lost when its target answered without it
-for over a minute. A gate of this laptop shows as `<repository>/<worktree>`, and `▶` with a
+the core count and memory in use, then jobs, and swap while the host uses it. Then one table
+lists every gate that runs, then the queue in line order, then the runs this laptop started
+that no target holds yet (probe, rent, lock, sync, setup), then the lost ones. `lock` is the
+wait for a free lane. A run that waits in several queues is one row, and its target cell names
+each of those targets, joined by `+`. A run is lost when every target it names answered
+without it for over a minute. A gate of this laptop shows as `<repository>/<worktree>`, and `▶` with a
 bold name marks the gates of the repository you run the command in. A gate of another
 laptop shows dim as `other laptop`, with no name. Every duration of a gate uses the host's
 clock.
@@ -408,13 +442,15 @@ library or a gate verb changes.
 | 1 | an internal failure before the gate |
 | 2 | a configuration or usage error |
 | 3 | no target answered, or every target refused the gate password or showed a host key that is not its pin |
-| 4 | another run holds the worktree lock |
+| 4 | no lane of this worktree was free on any eligible target within `DEVBOX_LOCK_WAIT`: other runs of it hold every lane |
 | 5 | the protocol handshake refused, on every deployed target |
 | 6 | no target's workspace image satisfies `DEVBOX_REQUIRES` |
 | 7 | the workspace memory limit killed the gate |
-| 8 | no target can take this gate, or the queue wait ran out; the gate did not run |
+| 8 | no target can take this gate, or `DEVBOX_MAX_QUEUE_WAIT` ran out with no grant; the gate did not run |
 | 9 | a Git LFS file is a pointer; run `git lfs pull` |
 | 10 | the watchdog on the target stopped the gate: past `DEVBOX_GATE_MAX_SECONDS`, or no CPU used for too long. This is not a test result |
+| 11 | the pool on the target lost the gate's queue ticket and could not restore it; the gate did not run |
+| 12 | the pool released the grant because the sync and the setup took longer than the host's `DEVBOX_HOLD_PREP_SECONDS`; the gate did not run. This is not a test result. A cold lane is the usual cause, and the next run there is warm |
 | 75 | the pool on the host stopped waiting and ran nothing |
 
 A caller that must know whether the remote gate ran sets `DEVBOX_STRICT=1` in the environment.
@@ -436,9 +472,11 @@ devbox's own codes move to 64 to 79:
 | 74 | 75 | `pool-deadline` |
 | 75 | 3 | `auth`: every target refused the gate password, or showed a host key that is not its pin |
 | 76 | 10 | `watchdog` |
+| 77 | 11 | `pool-ticket` |
+| 78 | 12 | `prep-limit` |
 
-An OOM kill, a queue timeout, a watchdog stop or a pool deadline also prints one
-`::devbox-infra::<name>` line on stderr.
+An OOM kill, a queue timeout, a watchdog stop, a lost ticket, a prep limit or a pool deadline
+also prints one `::devbox-infra::<name>` line on stderr.
 
 ## Tests
 

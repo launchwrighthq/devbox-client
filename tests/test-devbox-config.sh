@@ -5,6 +5,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
 REPO="$(cd .. && pwd)"
+# The parser checks DEVBOX_LANES with the library's require_lanes, the rule the
+# host's `lock` verb applies too, so the library is loaded first, as every
+# client program loads it.
+# shellcheck source=lib/devbox-lib.sh
+source "$REPO/lib/devbox-lib.sh"
 # shellcheck source=client/libexec/devbox-config
 source "$REPO/client/libexec/devbox-config"
 
@@ -65,6 +70,35 @@ assert_eq "p|npm ci|npm run verify||fixture/image:1" \
 assert_eq "p|npm ci|npm run verify||mine" \
   "$(DEVBOX_RUNPOD_IMAGE=mine parse "$BASE"$'\nDEVBOX_RUNPOD_IMAGE=fixture/image:1')" \
   "a developer's RunPod image wins over the config's default"
+
+# ── DEVBOX_LANES: the workspaces one worktree may hold on each target ───────
+#
+# verify takes this many lane locks and gc keeps this many lanes, so both read
+# it here, and an exported value never stands in for the file.
+lanes() {  # $1 the file content; prints DEVBOX_LANES
+  printf '%s\n' "$1" >"$TMP/config.env"
+  ( unset DEVBOX_LANES; DEVBOX_LANES="${ENV_LANES-}"; devbox_config_parse "$TMP/config.env" || exit; printf '%s' "$DEVBOX_LANES" )
+}
+assert_eq "2" "$(lanes "$BASE")" "a config with no DEVBOX_LANES has two lanes"
+assert_eq "2" "$(ENV_LANES=4 lanes "$BASE")" "and an inherited value does not stand in for the file"
+for n in 1 2 3 4; do
+  assert_eq "$n" "$(lanes "$BASE"$'\n'"DEVBOX_LANES=$n")" "DEVBOX_LANES=$n is read"
+done
+for bad in 0 5 two 2x "" -1; do
+  rc=0
+  err="$(lanes "$BASE"$'\n'"DEVBOX_LANES=$bad" 2>&1)" || rc=$?
+  assert_eq "2" "$rc" "DEVBOX_LANES='$bad' is refused"
+  assert_ok "by the library's rule, naming the key and the file" \
+    contains "refusing DEVBOX_LANES '$bad' from $TMP/config.env: write a whole number of lanes from 1 to 4" "$err"
+done
+
+# ── DEVBOX_AFFINITY_GRACE is a .devbox.env key ───────────────────────────────
+printf 'DEVBOX_AFFINITY_GRACE=30\n' >"$TMP/dev.env"
+assert_eq "30" "$(devbox_env_load "$TMP/dev.env" && printf '%s' "$DEVBOX_AFFINITY_GRACE")" \
+  "DEVBOX_AFFINITY_GRACE is read from .devbox.env"
+rc=0
+(printf 'DEVBOX_AFFINITY_GRACE=30\n' >"$TMP/c.env"; devbox_config_parse "$TMP/c.env") >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "and is no key of the project's config"
 
 # The hooks run in a fresh bash, the way the workspace runs them.
 mkdir -p "$TMP/co/.devbox"

@@ -205,7 +205,7 @@ GIB=1073741824
 E=1700000000
 {
   printf '%s %s %s\n' "$PROTO" "$FP" "$E"
-  printf 'host ok 5 0 20 0 3 0 0.31 8 %s %s\n' "$((30 * GIB))" "$((32 * GIB))"
+  printf 'host ok 5 0 20 0 3 0 0.31 8 %s %s 0 %s\n' "$((30 * GIB))" "$((32 * GIB))" "$((16 * GIB))"
   printf 'end\n'
 } >"$TMP/replies/203.0.113.1.status"
 

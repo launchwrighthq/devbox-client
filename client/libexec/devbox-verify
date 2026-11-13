@@ -88,6 +88,11 @@ devbox_exit_code() {
     # The pool lost this gate's queue ticket and could not put it back. The
     # gate never ran, so this is devbox's report too.
     11) code=77; echo '::devbox-infra::pool-ticket' >&2 ;;
+    # The pool released the grant because the gate did not start within
+    # DEVBOX_HOLD_PREP_SECONDS: the sync and the setup run under the grant, and
+    # a stuck client must not keep tokens that other runs wait for. The gate
+    # did not run, so the code must never read as a test result.
+    12) code=78; echo '::devbox-infra::prep-limit' >&2 ;;
     75) code=74; echo '::devbox-infra::pool-deadline' >&2 ;;
     *) echo "devbox verify: a step before the gate stopped with status $code" >&2; code=65 ;;
   esac
@@ -96,10 +101,11 @@ devbox_exit_code() {
 # The map is applied in the EXIT trap, so it covers every devbox_die below and
 # every set -e death with one call site. Without strict it returns, and bash keeps the
 # original status. $1 is the cleanup armed further down, once there is one.
-# The map runs BEFORE that cleanup: release_worktree_lock runs `exec 8>&-
+# The map runs BEFORE that cleanup. The lock's release once ran `exec 8>&-
 # 2>/dev/null`, which sends this shell's stderr to /dev/null for good. MEASURED:
 # with the map after the cleanup, the ::devbox-infra:: line of every
-# run that reached the lock never reached the caller.
+# run that reached the lock never reached the caller. No close below carries a
+# redirection for that reason.
 # shellcheck disable=SC2317
 devbox_on_exit() {
   local rc=$? code
@@ -389,6 +395,19 @@ esac
 # A run waits for its tokens with no ceiling: the ceiling's only purpose is the
 # local fallback, and a run has none.
 [ "$RUN_MODE" = "1" ] && QUEUE_WAIT=0
+# The head start of the target that ran this worktree last (spec section 3.2):
+# its workspace is warm, so its run syncs the changed files and skips most of
+# the setup, where another target uploads the whole checkout and runs the full
+# setup. 0 turns it off. It lands in bash arithmetic below, so it is checked
+# like the ceiling.
+AFFINITY_GRACE="${DEVBOX_AFFINITY_GRACE:-60}"
+require_uint "DEVBOX_AFFINITY_GRACE" "$AFFINITY_GRACE" "$DEVBOX_ENV"
+# The lane wait on each target. It lands in the `lock` verb, a word the host
+# checks again, and in bash arithmetic below, a context that evaluates
+# whatever text it is given. An operator exporting it by hand is one typo away
+# from either.
+LOCK_WAIT="${DEVBOX_LOCK_WAIT:-3600}"
+require_uint "DEVBOX_LOCK_WAIT" "$LOCK_WAIT" "the environment"
 
 # ── what this project needs from the workspace image ─────────────────────────
 #
@@ -514,7 +533,26 @@ fi
 
 MACHINE_ID="$(devbox_machine_id)"
 MACHINE="$(devbox_machine_label)"
-SLUG="$(devbox_slug "$MACHINE" "$MACHINE_ID" "$DEVBOX_PROJECT" "$ROOT")"
+# Every lane of this worktree, lane 1 first (spec section 5). The `lock` verb
+# takes them in this order on each target, so lane 2 is used only while lane 1
+# is busy. Lane 1 keeps the slug of protocol 2, so every warm workspace stays
+# warm, and it labels this worktree's history on every target: the pool records
+# the duration of every lane under it.
+LANE_TEXT="$(devbox_lane_slugs "$MACHINE" "$MACHINE_ID" "$DEVBOX_PROJECT" "$ROOT" "$DEVBOX_LANES")"
+mapfile -t LANE_SLUGS <<<"$LANE_TEXT"
+SLUG="${LANE_SLUGS[0]}"
+HISTORY_SLUG="$SLUG"
+# The run id, `<hash of the machine id>.<pid>`, in every ticket this run holds
+# and in its run file, so `devbox status` shows one run that waits on three
+# targets once. devbox_run_id_prefix says why it is a hash. require_run_id is
+# the host's rule, applied before anything crosses.
+RUN_ID="$(devbox_run_id_prefix "$MACHINE_ID")" || {
+  echo "devbox verify: cannot hash this machine's id into a run id: sha256sum failed" >&2
+  devbox_die 2
+}
+RUN_ID="$RUN_ID.$$"
+require_run_id "$RUN_ID" "this machine's id"
+DEVBOX_RUNFILE_RUN="$RUN_ID"
 
 # Every call below goes to the gate account through devbox-transport, sourced
 # at the top: one verb and its words, never a command string for a remote
@@ -560,6 +598,283 @@ if ! declare -F devbox_handshake_verdict >/dev/null 2>&1; then
   devbox_die 5
 fi
 
+# ── the joins: a lane and a place in the queue of every eligible target ──────
+#
+# A run waits in the queue of every eligible target at once and runs on the
+# first whose pool grants (spec section 3). MEASURED: tickets waited up to tens
+# of minutes in the queue of a full target while a second target ran at about a
+# third of its CPU, because the target was chosen once from a probe and the
+# choice was final.
+#
+# One join per target, each a background job with its own target selected:
+#   1. `lock <wait> <lane slugs>`: the host takes the first free lane of this
+#      worktree and answers `LOCKED <slug>`, then holds that lane's flock until
+#      the session's stdin ends. A dropped laptop drops the session, and the
+#      lock with it, with no stale state to reap.
+#   2. `run` in hold mode: the pool queues as it always did, and at its grant
+#      prints `devbox-pool: held <granted> <want>` on stderr and waits for one
+#      line on stdin. `go` starts the gate in the process that holds the grant;
+#      `abort`, or the end of stdin, releases the grant at once.
+# The first `held` line read wins. Every other join is aborted on the spot, so
+# a duplicate grant costs one poll of tokens on the other host.
+#
+# This shell holds both stdins: one fifo each, opened read-write, so neither
+# open blocks on the other end and a fifo keeps what is written to it until the
+# job's ssh reads it. Every job closes every fd this shell opened for another
+# join first, or that join's stdin would never reach its end.
+JOIN_DIR=""
+JOINED=()
+JOIN_FDS=()
+JOIN_T0=""
+WINNER=""
+declare -A JOIN_LOCK_FD=() JOIN_RUN_FD=() JOIN_PID=() JOIN_STATE=()
+
+# The job of one join. $1 the target, $2 the max wait the pool is sent. It
+# writes what happened into its directory: `lane` once it holds one, `end`
+# when it stopped before a run, and `run.rc` when its run ended. `run.err` is
+# a copy of the run's stderr, which also reaches the developer as it streams.
+#
+# Every `kill` here names a process that may have ended already, and that end
+# is the one asked for, so its "no such process" is dropped with 2>/dev/null.
+# `set +e`: each status here is read as data, and a job that died on one would
+# leave its join neither ended nor running.
+#
+# Braces, not a subshell body, and only ever started with `&`, which forks the
+# one process that runs it. A `( ... )` body forked twice, and the first
+# process held every fd this shell had opened while it waited for the second:
+# MEASURED, the gate's stdin never reached its end, and the run hung after
+# `go`.
+# shellcheck disable=SC2317  # started in the background by join_start
+join_job() {
+  set +e
+  local name="$1" maxwait="$2" d="$JOIN_DIR/$1" f answer slug lpid rpid efd tpid n
+  for f in "${JOIN_FDS[@]}"; do exec {f}>&-; done
+  # The address was checked by devbox_targets_check, and its message went out
+  # then; this second use only selects the target in this job.
+  devbox_target_use "$name" >/dev/null 2>&1 || { echo "its address is not an address" >"$d/end"; exit 0; }
+  join_fifo_reader "$d/lock.in"
+  devbox_gate_spawn lock "$LOCK_WAIT" "${LANE_SLUGS[@]}" <&"$JOIN_READER" >"$d/lock.out" 2>"$d/lock.err" \
+    || { echo "the lock could not be sent" >"$d/end"; exit 0; }
+  exec {JOIN_READER}<&-
+  lpid="$GATE_SPAWN_PID"
+  answer=""
+  while :; do
+    answer="$(sed -n '/^LOCKED/{p;q;}' "$d/lock.out")"
+    [ -z "$answer" ] || break
+    if [ -e "$d/abort" ]; then kill -KILL "$lpid" 2>/dev/null; exit 0; fi
+    if ! kill -0 "$lpid" 2>/dev/null; then
+      # A LOCKED line written just before the exit is read once more.
+      answer="$(sed -n '/^LOCKED/{p;q;}' "$d/lock.out")"
+      [ -n "$answer" ] || { echo lock >"$d/end"; exit 0; }
+      break
+    fi
+    sleep 0.2
+  done
+  slug="${answer#LOCKED}"
+  slug="${slug# }"
+  # The host answers with one of the slugs it was sent. Anything else is not a
+  # lane of this worktree, and a run in it would take another workspace's tree.
+  # A bare LOCKED is the answer of a lock with no lanes: it ends the join here,
+  # where waiting for a lane name would hold the lane and this run forever.
+  case " ${LANE_SLUGS[*]} " in *" ${slug:-?} "*) ;; *)
+    echo "the lock answered '$answer', which names no lane of this worktree" >"$d/end"
+    exit 0 ;;
+  esac
+  printf '%s\n' "$slug" >"$d/lane.tmp" && mv -f "$d/lane.tmp" "$d/lane"
+  [ ! -e "$d/abort" ] || exit 0
+  exec {efd}> >(tee "$d/run.err" >&2)
+  tpid=$!
+  join_fifo_reader "$d/run.in"
+  devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$maxwait" \
+    "$GATE_MAX_SECONDS" "$GATE_MODE" "$HISTORY_SLUG" "$RUN_ID" <&"$JOIN_READER" 2>&"$efd" \
+    || { exec {efd}>&-; echo "the run could not be sent" >"$d/end"; exit 0; }
+  exec {JOIN_READER}<&-
+  rpid="$GATE_SPAWN_PID"
+  printf '%s\n' "$rpid" >"$d/run.pid"
+  exec {efd}>&-
+  while kill -0 "$rpid" 2>/dev/null; do
+    if [ -e "$d/abort" ]; then
+      # A held grant ends on the abort line at once. A pool still in its queue
+      # reads no stdin, so the session is dropped: SIGKILL, because ssh prints
+      # a line on any signal it catches, and this run's terminal is not the
+      # place for it.
+      n=0
+      while kill -0 "$rpid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 0.2; n=$((n + 1)); done
+      kill -KILL "$rpid" 2>/dev/null
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$rpid"
+  printf '%s\n' "$?" >"$d/run.rc.tmp"
+  # The tee must have written its last line before run.rc says the run ended.
+  # Bounded, because a killed ssh's child may still hold the pipe, and a job
+  # that never ends holds this run's exit.
+  n=0
+  while kill -0 "$tpid" 2>/dev/null && [ "$n" -lt 25 ]; do sleep 0.2; n=$((n + 1)); done
+  kill "$tpid" 2>/dev/null
+  mv -f "$d/run.rc.tmp" "$d/run.rc"
+}
+
+# Open fifo $1 read-only in JOIN_READER, for a job's ssh, without blocking. A
+# plain `<fifo` blocks until some process holds the write end, and this shell
+# closes its end when it aborts the join: a join aborted before its job reached
+# that open would hang the job, and with it this run's exit. The job's own
+# read-write open is the writer for that one moment, and it closes it at once,
+# so the reader still sees the end of the stream when this shell closes its end.
+JOIN_READER=""
+join_fifo_reader() {
+  local rw
+  exec {rw}<>"$1"
+  exec {JOIN_READER}<"$1"
+  exec {rw}>&-
+}
+
+# Join one target: its two fifos, its fds, its job. $1 the target, $2 the max
+# wait for its pool, $3 the line that says why it is joined.
+join_start() {
+  local name="$1" d="$JOIN_DIR/$1" lfd rfd
+  rm -rf "$d"
+  mkdir -m 700 "$d"
+  mkfifo -m 600 "$d/lock.in" "$d/run.in"
+  exec {lfd}<>"$d/lock.in"
+  exec {rfd}<>"$d/run.in"
+  JOIN_FDS+=("$lfd" "$rfd")
+  JOIN_LOCK_FD[$name]="$lfd"
+  JOIN_RUN_FD[$name]="$rfd"
+  join_job "$name" "$2" &
+  JOIN_PID[$name]=$!
+  JOIN_STATE[$name]=lock
+  JOINED+=("$name")
+  [ -n "$JOIN_T0" ] || JOIN_T0="$SECONDS"
+  echo "==> devbox: queuing on $name$3"
+}
+
+# Close one fd of a join, once. No redirection on the close: see devbox_on_exit.
+join_close_fd() {
+  local fd="$1"
+  [ -n "$fd" ] || return 0
+  exec {fd}>&-
+}
+
+# Leave one join: its lane, its place in the queue, or its held grant. The
+# abort mark comes first, so a job that holds a lane and has not yet sent `run`
+# never sends it.
+join_abort() {
+  local name="$1" d="$JOIN_DIR/$1" rfd
+  [ "${JOIN_STATE[$name]-}" != gone ] || return 0
+  : >"$d/abort"
+  rfd="${JOIN_RUN_FD[$name]-}"
+  if [ -n "$rfd" ]; then
+    printf 'abort\n' >&"$rfd"
+    join_close_fd "$rfd"
+  fi
+  join_close_fd "${JOIN_LOCK_FD[$name]-}"
+  JOIN_RUN_FD[$name]=""
+  JOIN_LOCK_FD[$name]=""
+  JOIN_STATE[$name]=gone
+}
+
+# Every join ends, and its job with it: the EXIT trap and a ceiling that ran
+# out. The winner's lane is released here too, so it is called at exit only
+# once the gate is over.
+# shellcheck disable=SC2317  # reached through cleanup_probe, from the EXIT trap
+join_release_all() {
+  local name
+  for name in ${JOINED[@]+"${JOINED[@]}"}; do
+    join_abort "$name"
+  done
+  for name in ${JOINED[@]+"${JOINED[@]}"}; do
+    wait "${JOIN_PID[$name]}" 2>/dev/null || true  # the job's own status is in its directory
+  done
+  JOINED=()
+  JOIN_FDS=()
+  JOIN_T0=""
+}
+
+# Why one join ended without a grant, as one phrase. The host's first line
+# says why, when it printed one; grep finds none in an empty file, and the
+# phrase then goes without it, so its status 1 is no failure.
+join_end_reason() {
+  local d="$JOIN_DIR/$1" rc line
+  if [ -e "$d/end" ]; then
+    IFS= read -r line <"$d/end" || true
+    if [ "$line" = lock ]; then
+      line="$(grep -m1 . "$d/lock.err" || true)"
+      printf 'no lane of %s was free%s' "$SLUG" "${line:+ ($line)}"
+    else
+      printf '%s' "$line"
+    fi
+    return 0
+  fi
+  read -r rc <"$d/run.rc" || rc="?"
+  line="$(grep -m1 . "$d/run.err" || true)"
+  printf 'its run ended with status %s before a grant%s' "$rc" "${line:+ ($line)}"
+}
+
+# The joined targets that still wait, joined by $1.
+join_live() {
+  local sep="$1" name out=""
+  for name in ${JOINED[@]+"${JOINED[@]}"}; do
+    case "${JOIN_STATE[$name]}" in lock|queued) out="$out${out:+$sep}$name" ;; esac
+  done
+  printf '%s' "$out"
+}
+
+# Wait for the first grant. $1 the ceiling in seconds, 0 for none, counted from
+# the first join. GRACE_REST holds the targets that join once GRACE_UNTIL (a
+# SECONDS value) has passed, or once the grace target left the run.
+#   0  WINNER is set
+#   1  the ceiling ran out
+#   2  every join ended without a grant
+GRACE_REST=()
+GRACE_UNTIL=0
+GRACE_TARGET=""
+join_wait() {
+  local ceiling="$1" name d phase targets last="" now
+  while :; do
+    for name in ${JOINED[@]+"${JOINED[@]}"}; do
+      case "${JOIN_STATE[$name]}" in lock|queued) ;; *) continue ;; esac
+      d="$JOIN_DIR/$name"
+      # No run.err until the join holds a lane and sent its run: grep's
+      # "no such file" then means "not held yet", which the test already says.
+      if grep -q '^devbox-pool: held ' "$d/run.err" 2>/dev/null; then
+        WINNER="$name"
+        return 0
+      fi
+      if [ -e "$d/end" ] || [ -e "$d/run.rc" ]; then
+        JOIN_STATE[$name]=ended
+        echo "==> devbox: $name left this run: $(join_end_reason "$name")"
+        continue
+      fi
+      [ ! -e "$d/lane" ] || JOIN_STATE[$name]=queued
+    done
+    if [ "${#GRACE_REST[@]}" -gt 0 ]; then
+      if [ "$SECONDS" -ge "$GRACE_UNTIL" ] || [ "${JOIN_STATE[$GRACE_TARGET]-}" = ended ]; then
+        echo "==> devbox: no grant on $GRACE_TARGET within the grace, so this run joins the other targets"
+        for name in "${GRACE_REST[@]}"; do join_start_target "$name"; done
+        GRACE_REST=()
+        continue
+      fi
+    fi
+    targets="$(join_live +)"
+    [ -n "$targets" ] || return 2
+    phase=lock
+    for name in ${JOINED[@]+"${JOINED[@]}"}; do
+      [ "${JOIN_STATE[$name]}" != queued ] || phase=queued
+    done
+    if [ "$phase $targets" != "$last" ]; then
+      devbox_runfile_phase "$phase" "$targets" "$SLUG"
+      last="$phase $targets"
+    fi
+    now="$SECONDS"
+    if [ "$ceiling" -gt 0 ] && [ $((now - JOIN_T0)) -ge "$ceiling" ]; then
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
 # ── choose the target ────────────────────────────────────────────────────────
 #
 # Every deployed target is probed at once, with a 3-second connect timeout and
@@ -571,14 +886,16 @@ fi
 # The question is asked while nothing has been spent. A developer who met a long
 # queue only at the acquire had already paid for a container, a Postgres role, a
 # full rsync and an `npm ci`, and abandoning to a local gate threw all of it
-# away. The answer is an ESTIMATE and never a reservation. Minutes pass between
-# this probe and the acquire while the sync and the setup run, and the queue
-# moves in them, which is why --max-wait goes into the acquire as well. Neither
-# mechanism replaces the other.
+# away. The answer is an ESTIMATE and never a reservation, and the queue moves
+# while a run waits. So the probe only says which targets are eligible, and
+# the run then waits in the queue of every one of them and takes the first
+# grant (the joins further down). The ceiling counts from the first join.
 PROBE_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed; refusing to probe without a directory for the answers" >&2; devbox_die 1; }
 # A Hetzner server this run created and never saw ready is deleted here too.
+# Every join ends first: its lane lock, its place in a queue, or its held grant.
 # shellcheck disable=SC2317  # reached through the EXIT trap below, never by name
 cleanup_probe() {
+  join_release_all
   devbox_targets_close_all
   rm -rf "$PROBE_DIR"
   if declare -F hetzner_cleanup >/dev/null; then hetzner_cleanup || true; fi
@@ -593,7 +910,7 @@ use_cache=1
 if [ -n "$FORCE_TARGET" ]; then
   SELECT_TARGETS=("$FORCE_TARGET"); SELECT_RENT=(); SELECT_AFFINITY=""; use_cache=0
 fi
-SELECT_MAX_WAIT="$QUEUE_WAIT"
+SELECT_GRACE="$AFFINITY_GRACE"
 SELECT_ACTION="$QUEUE_ACTION"
 # A run has no local fallback, so rule 5 never applies to it.
 [ "$RUN_MODE" = "0" ] || SELECT_ACTION=fail
@@ -620,7 +937,7 @@ choose_target() {
   done <<<"$FACTS"
   SELECTION="$(printf '%s\n' "$FACTS" | sed '/^$/d' | devbox_select)"
   DECISION="${SELECTION##*$'\n'}"
-  read -r d_kind d_name d_rule d_verdict d_secs d_tokens d_jobs d_queued <<<"$DECISION"
+  read -r d_kind d_name d_rule _ <<<"$DECISION"
 }
 # The rented Hetzner server becomes a target once it answers, and the choice then
 # runs on it alone: rules 1, 2, 3, 5 and 6, as for any forced target. The probe
@@ -676,7 +993,7 @@ refuse_handshake() {
       3|5) echo "devbox verify: $name: $verdict. $name's devbox-runner is missing, or it predates the handshake or the probe. $(repair_hint "$name")" ;;
       # A server on another protocol. The library's line names both integers.
       0) echo "devbox verify: $name: its probe answer is not a line this client reads. $(repair_hint "$name")" ;;
-      *) echo "devbox verify: $name: $verdict. $(repair_hint "$name")" ;;
+      *) echo "devbox verify: $name: $verdict. $(devbox_protocol_repair "$(repair_hint "$name")")" ;;
     esac
   done <<<"$FACTS"
 }
@@ -702,13 +1019,13 @@ refuse_requires() {
   echo "devbox verify: the fix is in the DEPLOYMENT and not in this project. Add the missing feature to the deployment config of each target and redeploy it with the server's deploy.sh."
 }
 # The strict kind of an 8 (see EXIT_KIND): `queue` when every skipped target
-# was skipped for its pool alone, over the ceiling or never able to grant, and
+# was skipped for its pool alone, never able to grant, and
 # nothing when one was down, degraded or unreachable.
 queue_kind() {
   local kind _name class _text n=0
   while read -r kind _name class _text; do
     [ "$kind" = skip ] || continue
-    case "$class" in over|never) n=$((n + 1)) ;; *) return 0 ;; esac
+    case "$class" in never) n=$((n + 1)) ;; *) return 0 ;; esac
   done <<<"$SELECTION"
   [ "$n" -eq 0 ] || printf queue
 }
@@ -718,305 +1035,26 @@ refuse_none() {
   echo "  the gate did not run, here or there."
 }
 
-[ "$FORCE_TARGET" != hetzner ] || hetzner_target
-choose_target
-if [ "$d_kind" = rent ] && [ "$d_name" = hetzner ]; then
-  skip_lines "==> devbox: "
-  echo "==> devbox: renting hetzner: no deployed target can take this gate"
-  hetzner_target
-  choose_target
-fi
-
-case "$d_kind" in
-  pick|rent|local) skip_lines "==> devbox: " ;;
-esac
-case "$d_kind" in
-  pick)
-    devbox_target_use "$d_name"
-    case "$d_rule" in
-      1) why="the last run of this worktree was here" ;;
-      2) why="the first target in DEVBOX_TARGETS that can take it now" ;;
-      *) why="the shortest queue" ;;
-    esac
-    [ -z "$FORCE_TARGET" ] || why="--target $FORCE_TARGET"
-    [ "$d_name" != hetzner ] || why="the rented Hetzner server of this checkout"
-    echo "==> devbox: running on $TARGET ($why)"
-    # The pool's state is printed as it was answered, so the reader sees the
-    # numbers the decision rested on.
-    case "$d_verdict" in
-      now) echo "==> devbox: $d_tokens tokens, $d_jobs jobs, $d_queued waiting: this ask fits now" ;;
-      wait) echo "==> devbox: $d_tokens tokens, $d_jobs jobs, $d_queued waiting: about ${d_secs}s of queuing" ;;
-      # unknown: the pool would not put a number on the wait. --max-wait still
-      # goes into the acquire, so the ceiling the developer asked for still
-      # holds, and the only thing lost is the chance to skip the setup.
-      *) if [ "$QUEUE_WAIT" -gt 0 ]; then
-           echo "==> devbox: no usable queue estimate, so this run continues on $TARGET under a ${QUEUE_WAIT}s ceiling"
-         else
-           echo "==> devbox: no usable queue estimate, so this run waits on $TARGET's queue"
-         fi ;;
-    esac ;;
-  rent)
-    # The rented target owns its own transport and its own EXIT trap, so the
-    # deployed targets' masters are closed first.
-    # The strict map stays armed until devbox-runpod arms its own trap, which
-    # applies the same map.
-    cleanup_probe
-    trap devbox_on_exit EXIT
-    devbox_runfile_phase rent "$d_name"
-    echo "==> devbox: renting $d_name: no deployed target can take this gate"
-    # shellcheck source=/dev/null
-    source "$_here/devbox-runpod"
-    devbox_die "$?" ;;
-  local)
-    if [ -n "$d_name" ]; then
-      FALLBACK_FROM="$d_name"
-      FALLBACK_STAY="so this run keeps waiting on $d_name instead."
-      fb_secs="$(sed -n "s/^skip $d_name over skipped: busy, about \([0-9]*\)s.*/\1/p" <<<"$SELECTION")"
-      fb_why="$d_name estimates ${fb_secs}s of queuing, over your DEVBOX_MAX_QUEUE_WAIT of ${QUEUE_WAIT}s"
-    else
-      fb_why="no target can take this gate now, and DEVBOX_QUEUE_FULL_ACTION is local"
-    fi
-    # Returns only when this machine cannot run the gate. A target over the
-    # ceiling is then still the honest answer, under that same ceiling: the
-    # acquire gives up on it, and the 75 below asks again without one.
-    queue_fallback "$fb_why" || true
-    if [ -z "$d_name" ]; then
-      refuse_none >&2
-      devbox_die 8 "$(queue_kind)"
-    fi
-    devbox_target_use "$d_name"
-    echo "==> devbox: running on $TARGET, the shortest queue, because this machine cannot run the gate" ;;
-  fail)
-    case "$d_rule" in
-      auth)
-        while read -r f_name f_kind f_rest; do
-          case "$f_kind" in
-            refused) echo "devbox verify: the gate password was refused by $f_name ($(target_addr "$f_name")). Set the current DEVBOX_GATE_PASSWORD in $DEVBOX_ENV." >&2 ;;
-            hostkey) echo "devbox verify: $f_name: $f_rest" >&2 ;;
-          esac
-        done <<<"$FACTS" ;;
-      handshake) refuse_handshake >&2 ;;
-      requires) refuse_requires >&2 ;;
-      never)
-        # A permanent misconfiguration and not a busy afternoon, so it is refused
-        # whatever the action says. Routing around it would send every future run
-        # to a laptop and leave the targets unused with nobody told why.
-        {
-          echo "devbox verify: every target can NEVER grant this gate's tokens:"
-          skip_lines "  "
-          echo "  DEVBOX_MIN_TOKENS is $DEVBOX_MIN_TOKENS in $DEVBOX_CONFIG."
-          echo "  lower DEVBOX_MIN_TOKENS there, or raise DEVBOX_TOTAL_TOKENS in the deployment config of each target and redeploy it with the server's deploy.sh."
-          echo "  without this check the acquire would have waited out DEVBOX_POOL_DEADLINE, an hour, and then failed."
-        } >&2 ;;
-      unreachable)
-        {
-          echo "devbox verify: no target answered:"
-          skip_lines "  "
-          echo "  use 'devbox verify --local' to run here, or set DEVBOX_RENT to rent a target."
-        } >&2 ;;
-      *)
-        {
-          refuse_none
-          echo "  raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV, set DEVBOX_QUEUE_FULL_ACTION=local to run it here when this machine can, or DEVBOX_RENT=runpod to rent a target."
-        } >&2 ;;
-    esac
-    # A fail decision reads `fail <code> <class>`, so the code is the second word.
-    case "$d_rule" in
-      auth) devbox_die "$d_name" auth ;;
-      never) devbox_die "$d_name" queue ;;
-      none) devbox_die "$d_name" "$(queue_kind)" ;;
-      *) devbox_die "$d_name" ;;
-    esac ;;
-  *)
-    echo "devbox verify: the target choice ended without a decision: $DECISION" >&2
-    devbox_die 1 ;;
-esac
-
-# From here on a fallback is a fallback from this one target.
-FALLBACK_FROM="$TARGET"
-FALLBACK_STAY="so this run keeps waiting on $TARGET instead."
-
-# The sync phase of the run file starts here: the workspace,
-# the worktree lock and the rsync all prepare the tree before the setup.
-devbox_runfile_phase sync "$TARGET"
-echo "==> workspace $SLUG on $TARGET"
-# ensure-workspace's contract is that stdout carries only the DSN; it enforces
-# that on its own side by routing every diagnostic line (container id, ALTER/
-# CREATE ROLE, CREATE DATABASE) to stderr. `tail -n1` is defense in depth on
-# top of that, not a substitute for it. The shape check below is what actually
-# refuses to trust a violation of that contract instead of writing garbage
-# into --env-file.
-DSN="$(devbox_gate ensure-workspace "$SLUG" "$MACHINE_ID" | tail -n1)"
-case "$DSN" in
-  postgresql*) ;;
-  *) echo "devbox verify: ensure-workspace on $TARGET did not return a DSN as its last output line; refusing to trust it" >&2; devbox_die 1 ;;
-esac
-# Affinity: this worktree now has a workspace on this target, so the
-# next run prefers it, and pays an incremental sync there instead of a full one
-# somewhere else. Written once the workspace exists, so a run that fails in the
-# gate still records where its warm workspace is.
-# A rented target is never recorded: it is gone after its idle time.
-if [ "$TARGET" != hetzner ]; then
-  devbox_affinity_write "$TARGET" || echo "devbox verify: could not record $TARGET as this worktree's last target; the next run may choose another" >&2
-fi
-
-# ── the workspace's OOM counter, before the gate ─────────────────────────────
+# ── what crosses with the gate ───────────────────────────────────────────────
 #
-# The workspace runs under a memory cap, and the kernel enforces that cap by
-# KILLING a process. pytest dies mid-run, prints no summary, and this script
-# returns a bare non-zero status with no cause, and a developer chased wrong
-# theories until dmesg named it. The
-# container's own cgroup counts every such kill, so the number is asked for
-# rather than inferred, and the tail of this file turns it into a sentence.
+# Fixed before any target is joined, so a value this run refuses is refused
+# before a lane or a grant is held for it.
 #
-# ── the per-worktree lock ────────────────────────────────────────────────────
-#
-# One workspace serves one (machine, project, worktree), deliberately, because
-# that is what keeps node_modules and the mypy cache warm between runs. The
-# consequence is that two runs from the SAME checkout share one tree, and until
-# this lock existed they mutated it concurrently: the token pool serialises the
-# GATE, but the sync and `devbox_setup` ran before any token was held.
-#
-# That is not theoretical. A second run from one checkout reached
-# `devbox_setup` while the first was mid-gate, reinstalled the dependencies
-# under it, and the first run died, MEASURED.
-#
-# The lock is held by a backgrounded ssh whose gate verb `lock` takes a
-# `flock` on the host and then reads this fifo with `cat`. Closing the fd ends that `cat`, which ends `flock`, which
-# releases. Crash safety is free: if this laptop or the network dies the
-# connection drops, the remote `cat` sees EOF, and the lock releases with no
-# stale state to reap. Different worktrees take different locks, so the
-# concurrency the pool is there to allow is untouched.
-#
-# The fifo and its answer file live in a private `mktemp -d` directory. In the
-# shared /tmp the answer file was the fifo's public name plus `.out`, opened
-# with `>`, so another local user could plant a symlink there and have this
-# client truncate the file it named. macOS /tmp has no fs.protected_symlinks.
-LOCK_DIR=""
-LOCK_PID=""
-release_worktree_lock() {
-  if [ -n "$LOCK_PID" ]; then
-    exec 8>&- 2>/dev/null || true
-    wait "$LOCK_PID" 2>/dev/null || true
-  fi
-  [ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"
-  return 0
-}
-
-LOCK_WAIT="${DEVBOX_LOCK_WAIT:-3600}"
-# The same rule as the profile values, applied where this one is read. It lands
-# in two places that both take more than a number: `flock -w $LOCK_WAIT` on
-# the host, through the gate verb below, and `$(( SECONDS + LOCK_WAIT + 30 ))`
-# further down, a bash arithmetic context that evaluates whatever text it is
-# given. An operator exporting it by hand is one typo away from either.
-require_uint "DEVBOX_LOCK_WAIT" "$LOCK_WAIT" "the environment"
-LOCK_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed; refusing to take the lock without a private directory for the fifo" >&2; devbox_die 1; }
-mkfifo -m 600 "$LOCK_DIR/fifo"
-devbox_gate lock "$SLUG" "$LOCK_WAIT" < "$LOCK_DIR/fifo" > "$LOCK_DIR/out" &
-LOCK_PID=$!
-exec 8> "$LOCK_DIR/fifo"
-
-# Arm the cleanup here, where the fifo starts existing. It used to be armed 117
-# lines below, after the DSN file was written, so every abort in between -- a
-# refused rsync, a docker exec that fails, a Ctrl-C -- left one more fifo
-# directory in the temp directory.
-#
-# The DSN file and the forwarded-env file are no longer this client's to remove.
-# The client named them, created them over ssh and removed them on exit with one
-# more ssh, and a Ctrl-C at the wrong moment left a Postgres password in /run
-# on the host. gate-root now writes both values into one file of its own for the
-# length of the `run` verb and removes it when that verb ends, on the host,
-# whatever the laptop does.
-#
-# cleanup_all is reached only through the trap on the line below and is never
-# called by name, so the linter reads its body as unreachable. Without this
-# directive `shellcheck -x` fails on SC2317 here.
-# shellcheck disable=SC2317
-cleanup_all() { release_worktree_lock; cleanup_probe; }
-trap 'devbox_on_exit cleanup_all' EXIT
-
-# Wait for the remote to report it actually holds the lock. Bounded, because a
-# wait that never ends is the failure mode this whole runner keeps rediscovering.
-lock_deadline=$(( SECONDS + LOCK_WAIT + 30 ))
-until [ -s "$LOCK_DIR/out" ]; do
-  if ! kill -0 "$LOCK_PID" 2>/dev/null; then
-    echo "devbox verify: could not take the lock for $SLUG on $TARGET" >&2
-    rm -rf "$LOCK_DIR"; devbox_die 4
-  fi
-  if [ "$SECONDS" -ge "$lock_deadline" ]; then
-    echo "devbox verify: gave up after ${LOCK_WAIT}s waiting for another run of $SLUG to finish" >&2
-    release_worktree_lock; devbox_die 4
-  fi
-  sleep 1
-done
-rm -f "$LOCK_DIR/out"
-echo "==> holding the $SLUG lock"
-
-echo "==> sync"
-# rsync straight into the workspace volume, NOT into a temp dir followed by
-# `docker cp`. docker cp MERGES, so with that shape a file deleted locally
-# survives in the workspace and can keep a stale test green. That is the same
-# class of fault as the silently-skipped Postgres tests this whole runner
-# exists to prevent, so --delete has to act on the real target.
-#
-# The client only names sync/<slug>/<project>/. gate-root maps that to
-# /home/dev/<project>/ in ws-<slug>, where the volume is mounted, and runs the
-# rsync receiver there with docker exec. A symlink that workspace code plants
-# then resolves inside the container and never on the host.
-#
-# The two remote steps devbox-sync asks its caller for. `sync-finish` also does
-# the `chown -R dev:dev` that followed the sync, before the finish script runs
-# as dev in the workspace.
-devbox_sync_push() {
-  local sub="$1"; shift
-  devbox_gate_rsync "$@" "sync/$SLUG/$DEVBOX_PROJECT/${sub:+$sub/}"
-}
-devbox_sync_finish() {
-  devbox_gate sync-finish "$SLUG" "$DEVBOX_PROJECT" ${1:+"$1"}
-}
-# shellcheck source=client/libexec/devbox-sync
-source "$_here/devbox-sync"
-devbox_sync
-
 # The hooks cross on stdin; the workspace bash expands each entry after reading
 # them. gate-root holds the entry, `eval "$(cat)" && devbox_environment &&
 # devbox_setup`, as a fixed string, so nothing on this line reaches a shell as
 # code except through the workspace bash that reads stdin.
 HOOKS="$(devbox_hooks_script)"
-devbox_runfile_phase setup
-echo "==> setup"
-devbox_gate setup "$SLUG" "$DEVBOX_PROJECT" <<< "$HOOKS"
-
-echo "==> waiting for $GRANT_WANT tokens (min $DEVBOX_MIN_TOKENS)"
-
-# ONE ssh invocation holds the grant and runs the gate. devbox-pool run is what
-# keeps the two together: the grant is keyed to a PID, so the process that holds
-# it must be the process doing the work. Splitting this into an acquire call and
-# a separate exec would key the grant to a shell that exits at once, and the
-# reaper would give the tokens away mid-run.
-#
-# DEVBOX_TOKENS and PYTEST_WORKERS are exported by devbox-pool run itself, so
-# only the DSN has to cross from here. It must not cross as `docker exec -e
-# VAR=value`: that string sits verbatim in the argv of the ssh-spawned shell,
-# of devbox-pool's own process, AND of the final docker exec, for the whole
-# multi-minute run of the gate, readable by anyone on the devbox via `ps`.
-# Route it through `docker exec --env-file` instead: that flag takes only a
-# PATH (never secret), and Docker resolves the file itself rather than handing
-# its contents to any process as an argument. Same reasoning devbox-runner
-# already applies to the admin and workspace Postgres passwords, just for a
-# value that has to cross a host boundary instead of staying local to one exec.
-#
-# The value travels as the first lines of the `run` verb's stdin: a count, then
-# that many NAME=value lines, then the gate's own stdin. gate-root reads the
-# header, writes the lines to a 0600 file of its own under /run, passes that
-# path with --env-file, and removes the file when the verb ends. The lines are
-# built with `printf`, a shell builtin with no process and no argv of its own,
-# and cross ssh's data channel, never its command line, so the DSN (a password
-# included) never becomes an argument anywhere on either host.
-GATE_ENV=()
-if [ "${DEVBOX_NEEDS_POSTGRES:-0}" = "1" ]; then
-  GATE_ENV+=("$DEVBOX_DB_URL_VAR=$DSN")
+# A run swaps devbox_verify for its own command after the hooks on stdin. The
+# mode word says which, and gate-root holds both entries as fixed strings: the
+# command itself never enters this argv.
+GATE_MODE=verify
+GATE_STDIN="$HOOKS"
+if [ "$RUN_MODE" = "1" ]; then
+  GATE_MODE="command"
+  GATE_STDIN="$HOOKS"$'\n'"devbox_environment && $RUN_SCRIPT"
 fi
+GATE_ENV=()
 
 # ── the switches a project asks to carry over ────────────────────────────────
 #
@@ -1032,7 +1070,7 @@ fi
 #
 # NAMES are checked and values are not, and that asymmetry is the point. A name
 # becomes the left side of a line in an env file on the host, so it is refused
-# unless it is an environment variable name and nothing else; gate-root checks
+# unless it is an environment variable name and nothing else; the host checks
 # it again. A value never becomes an argument anywhere: it travels the way the
 # DSN does, on stdin into a file the gate reads with --env-file, so no shell on
 # either host ever parses it.
@@ -1067,6 +1105,484 @@ if [ -n "${DEVBOX_FORWARD_ENV:-}" ]; then
   fi
 fi
 
+# ── did a run's own connection fail? ─────────────────────────────────────────
+#
+# The run verb opens a NEW connection with a fresh password login (devbox_gate
+# gives it no master), after the probe and the lock. When that login is
+# refused (the gate password was rotated during the run) or the connect fails
+# (sshd MaxStartups, a network drop), ssh exits 255 before anything runs on the
+# host. That 255 fell through as the gate's own status: exit 255 with a line
+# about the OOM counter, and under strict mode 255 unmapped, where a refused
+# password must give 3 (75). ssh's own line in the run's stderr tells it apart
+# from a gate that exits 255 itself.
+#
+# $1 the status, $2 the file that holds the run's stderr, $3 the target. It
+# returns when the status is not ssh's own failure.
+refuse_ssh_failure() {
+  local status="$1" err="$2" target="$3" ssh_line
+  [ "$status" -eq 255 ] || return 0
+  ssh_line="$(grep -m1 -E "^devbox-gate@.*: Permission denied|Too many authentication failures|REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed" "$err" 2>/dev/null || true)"
+  if [ -n "$ssh_line" ]; then
+    case "$ssh_line" in
+      *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
+        echo "devbox verify: the host key of $target is not its pin at the run step; the gate did not run, and no password was sent ($ssh_line)" >&2 ;;
+      *) echo "devbox verify: the gate password was refused by $target at the run step; the gate did not run ($ssh_line)" >&2 ;;
+    esac
+    devbox_die 3 auth
+  fi
+  ssh_line="$(grep -m1 -E "^ssh: connect to host |^ssh: Could not resolve hostname |^kex_exchange_identification: |Connection closed by |Connection reset by " "$err" 2>/dev/null || true)"
+  if [ -n "$ssh_line" ]; then
+    echo "devbox verify: the run step could not reach $target, so the gate's result is unknown ($ssh_line)" >&2
+    devbox_die 3
+  fi
+}
+
+# ── did the pool lose this gate's place in line? ─────────────────────────────
+#
+# 78 from devbox-pool means its queue ticket was gone and could not be written
+# again, so the gate never ran. MEASURED on a live host: runs showed "queued"
+# for over an hour while the host's queue was empty. A waiter is granted only
+# at the head of the queue, so one without a ticket never is. The pool now
+# restores a lost ticket, and when it cannot, it stops with 78 rather than wait
+# for a turn that cannot come. A gate that exits 78 of its own prints no such
+# line, and its status passes through as any other gate status does.
+TICKET_LINE="devbox-pool: lost its queue ticket "
+refuse_lost_ticket() {
+  local status="$1" err="$2" target="$3" ticket_line
+  [ "$status" -eq 78 ] || return 0
+  ticket_line="$(grep -m1 -F "$TICKET_LINE" "$err" 2>/dev/null)" || return 0
+  {
+    echo "devbox verify: the pool on $target lost this gate's queue ticket and could not restore it, so the gate did not run (${ticket_line#devbox-pool: })"
+    echo "  this is not a test result. The pool's state directory on $target is not writable or not there: run devbox doctor, and redeploy the host when it names the pool."
+  } >&2
+  devbox_die 11
+}
+
+# ── did the grant run out before the gate started? ──────────────────────────
+#
+# The sync and the setup run under the grant (D2), so a host releases a grant
+# whose gate has not started within DEVBOX_HOLD_PREP_SECONDS: a stuck client
+# must not keep tokens other runs wait for. The pool then exits 80 with its
+# line. 80 alone is not enough, because a gate may exit 80 of its own, and that
+# one keeps its code.
+PREP_LINE="devbox-pool: released the grant: no go within "
+refuse_prep_limit() {
+  local status="$1" err="$2" target="$3" prep_line
+  [ "$status" -eq 80 ] || return 0
+  prep_line="$(grep -m1 -F "$PREP_LINE" "$err" 2>/dev/null)" || return 0
+  {
+    echo "devbox verify: the pool on $target released this run's grant before the gate started (${prep_line#devbox-pool: }), so the gate did not run"
+    echo "  this is not a test result. The sync and the setup took longer than DEVBOX_HOLD_PREP_SECONDS on $target allows: a cold lane is the usual cause, and the next run there is warm."
+  } >&2
+  devbox_die 12
+}
+
+# ── joining the targets ──────────────────────────────────────────────────────
+#
+# Each join takes a free lane of this worktree, then a place in that target's
+# queue (D3). A run whose lanes are all busy on one target still waits in the
+# queue of every other target.
+#
+# A lane is one workspace of one worktree on one target, and its lock is the
+# per-worktree lock this client always took. One workspace serves one (machine,
+# project, worktree, lane), deliberately, because that is what keeps
+# node_modules and the mypy cache warm between runs. Two runs from the SAME lane
+# share one tree, and until the lock existed they mutated it concurrently: the
+# token pool serialises the GATE, but the sync and `devbox_setup` ran before any
+# token was held. A second run from one checkout reached `devbox_setup` while
+# the first was mid-gate, reinstalled the dependencies under it, and the first
+# run died, MEASURED. Lanes keep that rule, and give the second run a second
+# tree instead of a wait: several runs of one worktree started at once, and all
+# but one waited tens of minutes on one host's lock while that host ran at about
+# a third of its CPU.
+#
+# The fifos and the answer files live in the private `mktemp -d` directory of
+# the probe. In the shared /tmp the answer file was the fifo's public name plus
+# `.out`, opened with `>`, so another local user could plant a symlink there
+# and have this client truncate the file it named. macOS /tmp has no
+# fs.protected_symlinks. That directory's cleanup is armed the moment it
+# exists: a cleanup armed 117 lines after the fifo once left one more fifo
+# directory in the temp directory on every abort in between, a refused rsync,
+# a docker exec that failed, a Ctrl-C.
+declare -A JOIN_FACT=()
+JOIN_MAXWAIT=0
+# Join one target, with the line that says why and what its probe answered.
+join_start_target() {
+  local name="$1" why="" verdict secs tokens jobs queued state
+  [ -z "$FORCE_TARGET" ] || why=" (--target $FORCE_TARGET)"
+  [ "$name" != hetzner ] || why=" (the rented Hetzner server of this checkout)"
+  [ -n "$why" ] || [ "$name" != "$SELECT_AFFINITY" ] || why=" (the last run of this worktree was here)"
+  read -r verdict secs tokens jobs queued <<<"${JOIN_FACT[$name]-}"
+  # The pool's state is printed as it was answered, so the reader sees the
+  # numbers the join rested on.
+  case "$verdict" in
+    now) state="$tokens tokens, $jobs jobs, $queued waiting: this ask fits now" ;;
+    wait) state="$tokens tokens, $jobs jobs, $queued waiting: about ${secs}s of queuing" ;;
+    # unknown: the pool would not put a number on the wait. The ceiling still
+    # holds, and the only thing lost is the chance to skip a target.
+    *) if [ "$JOIN_MAXWAIT" -gt 0 ]; then
+         state="no usable queue estimate, so this run waits on it under a ${JOIN_MAXWAIT}s ceiling"
+       else
+         state="no usable queue estimate, so this run waits in its queue"
+       fi ;;
+  esac
+  join_start "$name" "$JOIN_MAXWAIT" "$why: $state"
+}
+
+# Join every target named, after the affinity grace when GRACE_TARGET is set.
+join_targets() {
+  local name
+  if [ -z "$JOIN_DIR" ]; then
+    JOIN_DIR="$PROBE_DIR/join"
+    mkdir -m 700 "$JOIN_DIR"
+  fi
+  GRACE_REST=()
+  if [ -n "$GRACE_TARGET" ]; then
+    for name in "$@"; do
+      [ "$name" = "$GRACE_TARGET" ] || GRACE_REST+=("$name")
+    done
+    join_start_target "$GRACE_TARGET"
+    # SECONDS counts whole seconds, so one more makes the grace at least its
+    # length: a deadline of SECONDS + 2 read at x.9 seconds ended 1.1 seconds on.
+    GRACE_UNTIL=$((SECONDS + AFFINITY_GRACE + 1))
+    echo "==> devbox: waiting up to ${AFFINITY_GRACE}s on $GRACE_TARGET alone, where this worktree's workspace is warm, before joining ${GRACE_REST[*]}"
+    return 0
+  fi
+  for name in "$@"; do join_start_target "$name"; done
+}
+
+# Every join ended with no grant. All of them at the lane lock exits 4, as one
+# lock that could not be taken did. Otherwise the first run that ended says
+# why, by the rules its status had when this client knew one target.
+joins_failed() {
+  local name d rc first="" reasons=""
+  for name in "${JOINED[@]}"; do
+    d="$JOIN_DIR/$name"
+    reasons="$reasons"$'\n'"  $name: $(join_end_reason "$name")"
+    [ -n "$first" ] || [ ! -e "$d/run.rc" ] || first="$name"
+  done
+  if [ -z "$first" ]; then
+    echo "devbox verify: could not take the lock of a lane of $SLUG on any target within DEVBOX_LOCK_WAIT of ${LOCK_WAIT}s, so the gate did not run:$reasons" >&2
+    devbox_die 4
+  fi
+  d="$JOIN_DIR/$first"
+  read -r rc <"$d/run.rc" || rc=1
+  refuse_ssh_failure "$rc" "$d/run.err" "$first"
+  refuse_lost_ticket "$rc" "$d/run.err" "$first"
+  # 75 from devbox-pool means it gave up queuing and ran NOTHING, on the
+  # ceiling this client sent or on its own DEVBOX_POOL_DEADLINE. Before the
+  # hold mode this client could not tell that 75 from a gate that exits 75
+  # itself. Now the gate starts only after `go`, so a 75 before a grant is the
+  # pool's: under a ceiling it is the ceiling, and without one the deadline.
+  if [ "$rc" -eq 75 ] && [ "$JOIN_CEILING" -gt 0 ]; then
+    return 1
+  fi
+  if [ "$rc" -eq 75 ]; then
+    echo "devbox verify: the pool on $first gave up waiting for tokens and ran nothing (devbox-pool exit 75).$reasons" >&2
+    devbox_die 75
+  fi
+  echo "devbox verify: no target granted this gate, so it did not run:$reasons" >&2
+  devbox_die 1
+}
+
+# Wait on the joins under one ceiling. Returns 0 with WINNER set, or 1 when the
+# ceiling ran out; every other end exits.
+JOIN_CEILING=0
+run_joins() {
+  local rc=0
+  JOIN_CEILING="$1"
+  join_wait "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  joins_failed
+}
+
+# The ceiling ran out with no grant: every join ends, and rules 4 to 6 apply,
+# as they did when the probe found no target under the ceiling.
+RENT_RUNPOD=0
+queued_past_ceiling=0
+queue_ceiling() {
+  local -a waited=()
+  local name
+  for name in "${JOINED[@]}"; do
+    case "${JOIN_STATE[$name]}" in lock|queued) waited+=("$name") ;; esac
+  done
+  [ "${#waited[@]}" -gt 0 ] || waited=("${JOINED[@]}")
+  join_release_all
+  if [ "${#SELECT_RENT[@]}" -gt 0 ]; then
+    echo "==> devbox: renting ${SELECT_RENT[0]}: no target granted this gate within your DEVBOX_MAX_QUEUE_WAIT of ${QUEUE_WAIT}s"
+    if [ "${SELECT_RENT[0]}" = hetzner ]; then
+      hetzner_target
+      choose_target
+      decide
+    else
+      RENT_RUNPOD=1
+    fi
+    return 0
+  fi
+  if [ "$QUEUE_ACTION" = local ]; then
+    FALLBACK_FROM="${waited[*]}"
+    FALLBACK_STAY="so this run keeps waiting on ${waited[*]} instead."
+    # Returns only when this machine cannot run the gate. The ceiling is then
+    # dropped, so this second wait is bounded by DEVBOX_POOL_DEADLINE like every
+    # run before this feature.
+    queue_fallback "the queue on ${waited[*]} did not free up within your DEVBOX_MAX_QUEUE_WAIT of ${QUEUE_WAIT}s" || true
+    echo "devbox verify: waiting on ${waited[*]} without a ceiling, because this machine cannot run this gate." >&2
+    queued_past_ceiling=1
+    JOIN_MAXWAIT=0
+    GRACE_TARGET=""
+    join_targets "${waited[@]}"
+    run_joins 0
+    return 0
+  fi
+  {
+    echo "devbox verify: gave up waiting for tokens on ${waited[*]} after ${QUEUE_WAIT}s. The gate did not run, here or there."
+    echo "  raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV, or set DEVBOX_QUEUE_FULL_ACTION=local to run it here when this machine can."
+  } >&2
+  devbox_die 8 queue
+}
+
+# Act on the decision of devbox_select. It returns with WINNER set, or with
+# RENT_RUNPOD=1, which the top level acts on, because devbox-runpod is sourced
+# there and nowhere else. Every other end exits.
+decide() {
+  local kind name rest
+  local -a names=()
+  case "$d_kind" in
+    pick|rent|local) skip_lines "==> devbox: " ;;
+  esac
+  case "$d_kind" in
+    pick)
+      JOIN_FACT=()
+      while read -r kind name rest; do
+        [ "$kind" = join ] || continue
+        names+=("$name")
+        JOIN_FACT[$name]="$rest"
+      done <<<"$SELECTION"
+      # Rule 1 is the affinity target within the grace. It gets a head start
+      # only when there is another target to join after it.
+      GRACE_TARGET=""
+      if [ "$d_rule" = 1 ] && [ "$AFFINITY_GRACE" -gt 0 ] && [ "${#names[@]}" -gt 1 ]; then
+        GRACE_TARGET="$d_name"
+      fi
+      JOIN_MAXWAIT="$QUEUE_WAIT"
+      join_targets "${names[@]}"
+      run_joins "$QUEUE_WAIT" || queue_ceiling ;;
+    rent)
+      RENT_RUNPOD=1 ;;
+    local)
+      # No target is eligible, so a target over the ceiling is never the
+      # reason: devbox_select joins those. Returns only when this machine
+      # cannot run the gate, and nothing is left to wait on.
+      queue_fallback "no target can take this gate now, and DEVBOX_QUEUE_FULL_ACTION is local" || true
+      refuse_none >&2
+      devbox_die 8 "$(queue_kind)" ;;
+    fail)
+      case "$d_rule" in
+        auth)
+          while read -r f_name f_kind f_rest; do
+            case "$f_kind" in
+              refused) echo "devbox verify: the gate password was refused by $f_name ($(target_addr "$f_name")). Set the current DEVBOX_GATE_PASSWORD in $DEVBOX_ENV." >&2 ;;
+              hostkey) echo "devbox verify: $f_name: $f_rest" >&2 ;;
+            esac
+          done <<<"$FACTS" ;;
+        handshake) refuse_handshake >&2 ;;
+        requires) refuse_requires >&2 ;;
+        never)
+          # A permanent misconfiguration and not a busy afternoon, so it is refused
+          # whatever the action says. Routing around it would send every future run
+          # to a laptop and leave the targets unused with nobody told why.
+          {
+            echo "devbox verify: every target can NEVER grant this gate's tokens:"
+            skip_lines "  "
+            echo "  DEVBOX_MIN_TOKENS is $DEVBOX_MIN_TOKENS in $DEVBOX_CONFIG."
+            echo "  lower DEVBOX_MIN_TOKENS there, or raise DEVBOX_TOTAL_TOKENS in the deployment config of each target and redeploy it with the server's deploy.sh."
+            echo "  without this check the acquire would have waited out DEVBOX_POOL_DEADLINE, an hour, and then failed."
+          } >&2 ;;
+        unreachable)
+          {
+            echo "devbox verify: no target answered:"
+            skip_lines "  "
+            echo "  use 'devbox verify --local' to run here, or set DEVBOX_RENT to rent a target."
+          } >&2 ;;
+        *)
+          {
+            refuse_none
+            echo "  raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV, set DEVBOX_QUEUE_FULL_ACTION=local to run it here when this machine can, or DEVBOX_RENT=runpod to rent a target."
+          } >&2 ;;
+      esac
+      # A fail decision reads `fail <code> <class>`, so the code is the second word.
+      case "$d_rule" in
+        auth) devbox_die "$d_name" auth ;;
+        never) devbox_die "$d_name" queue ;;
+        none) devbox_die "$d_name" "$(queue_kind)" ;;
+        *) devbox_die "$d_name" ;;
+      esac ;;
+    *)
+      echo "devbox verify: the target choice ended without a decision: $DECISION" >&2
+      devbox_die 1 ;;
+  esac
+}
+
+[ "$FORCE_TARGET" != hetzner ] || hetzner_target
+choose_target
+if [ "$d_kind" = rent ] && [ "$d_name" = hetzner ]; then
+  skip_lines "==> devbox: "
+  echo "==> devbox: renting hetzner: no deployed target can take this gate"
+  hetzner_target
+  choose_target
+fi
+decide
+
+if [ "$RENT_RUNPOD" = 1 ]; then
+  # The rented target owns its own transport and its own EXIT trap, so every
+  # join and the deployed targets' masters are closed first.
+  # The strict map stays armed until devbox-runpod arms its own trap, which
+  # applies the same map.
+  cleanup_probe
+  trap devbox_on_exit EXIT
+  devbox_runfile_phase rent runpod
+  [ "$d_kind" != rent ] || echo "==> devbox: renting runpod: no deployed target can take this gate"
+  # shellcheck source=/dev/null
+  source "$_here/devbox-runpod"
+  devbox_die "$?"
+fi
+
+# ── the grant ────────────────────────────────────────────────────────────────
+#
+# The target is fixed here, at the first grant, and every other join ends on
+# the spot. The workspace, the sync and the setup run on the granted target
+# while this run holds its tokens (D2): they run under the grant's CPU limit,
+# and the gate then starts in the same pool process that holds the grant.
+for name in "${JOINED[@]}"; do
+  [ "$name" = "$WINNER" ] || join_abort "$name"
+done
+also=""
+for name in "${JOINED[@]}"; do
+  [ "$name" != "$WINNER" ] || continue
+  case "${JOIN_STATE[$name]}" in ended) ;; *) also="$also${also:+, }$name" ;; esac
+done
+devbox_target_use "$WINNER"
+WIN_DIR="$JOIN_DIR/$WINNER"
+GATE_ERR="$WIN_DIR/run.err"
+read -r SLUG <"$WIN_DIR/lane"
+lane=1
+while [ "$lane" -lt "${#LANE_SLUGS[@]}" ] && [ "${LANE_SLUGS[lane - 1]}" != "$SLUG" ]; do lane=$((lane + 1)); done
+granted="$(sed -n 's/^devbox-pool: held \([0-9][0-9]*\) .*/\1/p' "$GATE_ERR" | sed -n 1p)"
+echo "==> devbox: granted ${granted:-?} tokens on $TARGET lane $lane after $((SECONDS - JOIN_T0))s${also:+ (also queued on $also)}"
+
+# The held run must still hold its grant before each step that spends time on
+# it. A grant the host released, or a session that dropped, ends this run with
+# the reason, rather than a sync into a workspace no gate will run in.
+held_or_die() {
+  local rc
+  [ -e "$WIN_DIR/run.rc" ] || return 0
+  read -r rc <"$WIN_DIR/run.rc" || rc=1
+  refuse_prep_limit "$rc" "$GATE_ERR" "$TARGET"
+  refuse_ssh_failure "$rc" "$GATE_ERR" "$TARGET"
+  echo "devbox verify: the held run on $TARGET ended with status $rc before the gate started, so the gate did not run" >&2
+  devbox_die 1
+}
+
+# The sync phase of the run file starts here: the workspace and the rsync both
+# prepare the tree before the setup.
+devbox_runfile_phase sync "$TARGET" "$SLUG"
+echo "==> workspace $SLUG on $TARGET"
+# ensure-workspace's contract is that stdout carries only the DSN; it enforces
+# that on its own side by routing every diagnostic line (container id, ALTER/
+# CREATE ROLE, CREATE DATABASE) to stderr. `tail -n1` is defense in depth on
+# top of that, not a substitute for it. The shape check below is what actually
+# refuses to trust a violation of that contract instead of writing garbage
+# into --env-file.
+DSN="$(devbox_gate ensure-workspace "$SLUG" "$MACHINE_ID" | tail -n1)"
+case "$DSN" in
+  postgresql*) ;;
+  *) echo "devbox verify: ensure-workspace on $TARGET did not return a DSN as its last output line; refusing to trust it" >&2; devbox_die 1 ;;
+esac
+# Affinity: this worktree now has a workspace on this target, so the
+# next run prefers it, and pays an incremental sync there instead of a full one
+# somewhere else. Written once the workspace exists, so a run that fails in the
+# gate still records where its warm workspace is. The record names the target,
+# not the lane: every lane of a worktree there shares its history.
+# A rented target is never recorded: it is gone after its idle time.
+if [ "$TARGET" != hetzner ]; then
+  devbox_affinity_write "$TARGET" || echo "devbox verify: could not record $TARGET as this worktree's last target; the next run may choose another" >&2
+fi
+held_or_die
+
+# ── the workspace's OOM counter, before the gate ─────────────────────────────
+#
+# The workspace runs under a memory cap, and the kernel enforces that cap by
+# KILLING a process. pytest dies mid-run, prints no summary, and this script
+# returns a bare non-zero status with no cause, and a developer chased wrong
+# theories until dmesg named it. The
+# container's own cgroup counts every such kill, so the number is asked for
+# rather than inferred, and the tail of this file turns it into a sentence.
+
+echo "==> holding the $SLUG lock"
+echo "==> sync"
+# rsync straight into the workspace volume, NOT into a temp dir followed by
+# `docker cp`. docker cp MERGES, so with that shape a file deleted locally
+# survives in the workspace and can keep a stale test green. That is the same
+# class of fault as the silently-skipped Postgres tests this whole runner
+# exists to prevent, so --delete has to act on the real target.
+#
+# The client only names sync/<slug>/<project>/. gate-root maps that to
+# /home/dev/<project>/ in ws-<slug>, where the volume is mounted, and runs the
+# rsync receiver there with docker exec. A symlink that workspace code plants
+# then resolves inside the container and never on the host.
+#
+# The two remote steps devbox-sync asks its caller for. `sync-finish` also does
+# the `chown -R dev:dev` that followed the sync, before the finish script runs
+# as dev in the workspace.
+devbox_sync_push() {
+  local sub="$1"; shift
+  devbox_gate_rsync "$@" "sync/$SLUG/$DEVBOX_PROJECT/${sub:+$sub/}"
+}
+devbox_sync_finish() {
+  devbox_gate sync-finish "$SLUG" "$DEVBOX_PROJECT" ${1:+"$1"}
+}
+# shellcheck source=client/libexec/devbox-sync
+source "$_here/devbox-sync"
+devbox_sync
+held_or_die
+
+devbox_runfile_phase setup
+echo "==> setup"
+devbox_gate setup "$SLUG" "$DEVBOX_PROJECT" <<< "$HOOKS"
+held_or_die
+
+# DEVBOX_TOKENS and PYTEST_WORKERS are exported by devbox-pool run itself, so
+# only the DSN has to cross from here. It must not cross as `docker exec -e
+# VAR=value`: that string sits verbatim in the argv of the ssh-spawned shell,
+# of devbox-pool's own process, AND of the final docker exec, for the whole
+# multi-minute run of the gate, readable by anyone on the devbox via `ps`.
+# Route it through `docker exec --env-file` instead: that flag takes only a
+# PATH (never secret), and Docker resolves the file itself rather than handing
+# its contents to any process as an argument. Same reasoning devbox-runner
+# already applies to the admin and workspace Postgres passwords, just for a
+# value that has to cross a host boundary instead of staying local to one exec.
+#
+# The value travels after `go` on the held run's stdin: a count, then that
+# many NAME=value lines, then the gate's own stdin. The pool reads the header,
+# writes the lines to a 0600 file of its own under /run, passes that path with
+# --env-file, and removes the file when the gate ends. The lines are built with
+# `printf`, a shell builtin with no process and no argv of its own, and cross
+# ssh's data channel, never its command line, so the DSN (a password included)
+# never becomes an argument anywhere on either host. The file is the host's to
+# remove: the client once named it, created it over ssh and removed it on exit
+# with one more ssh, and a Ctrl-C at the wrong moment left a Postgres password
+# in /run on the host.
+if [ "${DEVBOX_NEEDS_POSTGRES:-0}" = "1" ]; then
+  GATE_ENV=("$DEVBOX_DB_URL_VAR=$DSN" ${GATE_ENV[@]+"${GATE_ENV[@]}"})
+fi
+GATE_HEADER="${#GATE_ENV[@]}"
+if [ "${#GATE_ENV[@]}" -gt 0 ]; then
+  GATE_HEADER="$GATE_HEADER"$'\n'"$(printf '%s\n' "${GATE_ENV[@]}")"
+fi
+
 # ── the workspace's OOM counter, read as late as possible ───────────────────
 #
 # The counter is CUMULATIVE for the life of the container, so the two reads
@@ -1075,7 +1591,7 @@ fi
 # ensure-workspace where it is cheaper.
 #
 # Two long stretches would otherwise fall inside it, and both are real. The
-# worktree lock above waits up to DEVBOX_LOCK_WAIT, one hour by default, and
+# lane lock above waits up to DEVBOX_LOCK_WAIT, one hour by default, and
 # ANOTHER run of this same slug holds that lock and uses this same container: its
 # kill would be charged here, and a genuinely failing test in this run would be
 # reported as a memory kill. That is not hypothetical, and the lock's own comment
@@ -1089,122 +1605,37 @@ fi
 # failure as a memory kill, which is the opposite of this file's job.
 OOM_BEFORE="$(devbox_gate oom-count "$SLUG" 2>/dev/null || true)"
 is_uint "$OOM_BEFORE" || OOM_BEFORE=""
+held_or_die
 
-# ONE ssh invocation holds the grant and runs the gate, and this is a function
-# only so the max-wait path below can ask for the same thing again without a
-# ceiling. The verb and its words are identical on both calls, deliberately: two
-# copies of it is the drift this repository keeps finding in its own history.
+# ── go ───────────────────────────────────────────────────────────────────────
 #
-# A run swaps devbox_verify for its own command after the hooks on stdin. The
-# mode word says which, and gate-root holds both entries as fixed strings: the
-# command itself never enters this argv.
-GATE_MODE=verify
-GATE_STDIN="$HOOKS"
-if [ "$RUN_MODE" = "1" ]; then
-  GATE_MODE="command"
-  GATE_STDIN="$HOOKS"$'\n'"devbox_environment && $RUN_SCRIPT"
-fi
-GATE_HEADER="${#GATE_ENV[@]}"
-if [ "${#GATE_ENV[@]}" -gt 0 ]; then
-  GATE_HEADER="$GATE_HEADER"$'\n'"$(printf '%s\n' "${GATE_ENV[@]}")"
-fi
+# ONE ssh session holds the grant and runs the gate. devbox-pool run is what
+# keeps the two together: the grant is keyed to a PID, so the process that holds
+# it must be the process doing the work. Splitting this into an acquire call and
+# a separate exec would key the grant to a shell that exits at once, and the
+# reaper would give the tokens away mid-run. `go` starts the gate's clock on the
+# host (D10): DEVBOX_GATE_MAX_SECONDS and the watchdog's stall rule measure the
+# gate, and the preparation has its own limit.
+#
 # The gate's stderr is copied to GATE_ERR as it streams, because the watchdog's
 # reason reaches this laptop as one line of it, and exit 10 names that reason.
 # tee passes every byte on at once, so a gate's progress output streams as
 # before.
-GATE_ERR="$PROBE_DIR/gate.err"
-run_remote_gate() {
-  local s=0
-  set +e
-  devbox_runfile_phase queued
-  # A mock SSH that exits immediately raced printf and returned 141 for a successful gate.
-  # A here-string has no producer process whose SIGPIPE can replace the remote exit code.
-  # The third copy of the stderr moves the run file to its gate phase at the
-  # pool's grant line.
-  devbox_gate run "$SLUG" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "${1:-0}" "$GATE_MAX_SECONDS" "$GATE_MODE" \
-    <<< "$GATE_HEADER"$'\n'"$GATE_STDIN" 2> >(tee "$GATE_ERR" >(devbox_runfile_watch_grant) >&2)
-  s=$?
-  # The tee must have written its last line before the file is read below.
-  # Since bash 4.4, $! names the last process substitution. On a shell where it
-  # still named the lock's ssh, this wait would block until that lock was
-  # released at exit, so that one pid is never waited for here.
-  [ "$!" = "$LOCK_PID" ] || wait "$!" 2>/dev/null
-  set -e
-  return "$s"
-}
-
-status=0
-queued_past_ceiling=0
-run_remote_gate "$QUEUE_WAIT" || status=$?
-
-# 75 from devbox-pool means it gave up queuing and ran NOTHING, on the ceiling
-# this client sent or on its own DEVBOX_POOL_DEADLINE. That is not a gate
-# result, so where this run asked for a ceiling it is intercepted here: it must
-# never reach the OOM comparison below, and it must never be passed through as
-# a gate's own status.
 #
-# The QUEUE_WAIT guard is therefore not "did OUR ceiling cause this". A 75 can
-# arrive with the feature off too, because DEADLINE fires whether or not
-# --max-wait was ever sent, and this client cannot tell that 75 from a gate
-# that happens to exit 75 itself. The guard is "is there a ceiling and a
-# fallback to talk about at all". With the feature off there is neither, so
-# every 75 falls straight through to this script's own exit at the bottom,
-# exactly as any other status does and exactly as it did before this feature
-# existed. Intercepting one there, with no ceiling to name, would invent a
-# local fallback the developer never asked for, or report a gate that ran and
-# failed as one that never ran.
-#
-# The residual is a known collision: under a ceiling, a gate of its own that
-# exits exactly 75 is read here as a queue that gave up.
-if [ "$status" -eq 75 ] && [ "$QUEUE_WAIT" -gt 0 ]; then
-  if [ "$QUEUE_ACTION" = "local" ]; then
-    # Returns only when this machine cannot satisfy DEVBOX_REQUIRES.
-    queue_fallback "the queue on $TARGET did not free up within your DEVBOX_MAX_QUEUE_WAIT of ${QUEUE_WAIT}s" || {
-      # The fallback is refused, so the only honest thing left is the wait this
-      # run was trying to avoid. Nothing is thrown away by asking again: the
-      # workspace is warm, the lock is still held, and the sync and the setup
-      # are already done. The ceiling is dropped, so this second attempt is
-      # bounded by DEVBOX_POOL_DEADLINE like every run before this feature.
-      echo "devbox verify: waiting on $TARGET without a ceiling, because this machine cannot run this gate." >&2
-      queued_past_ceiling=1
-      status=0
-      run_remote_gate 0 || status=$?
-    }
-  else
-    {
-      echo "devbox verify: gave up waiting for tokens on $TARGET after ${QUEUE_WAIT}s. The gate did not run, here or there."
-      echo "  raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV, or set DEVBOX_QUEUE_FULL_ACTION=local to run it here when this machine can."
-    } >&2
-    devbox_die 8 queue
-  fi
-fi
+# The stdin is written into the fifo this shell holds read-write, so a host
+# that ends early can never answer the write with SIGPIPE. A mock ssh that
+# exited at once raced a printf into a pipe and returned 141 for a successful
+# gate.
+devbox_runfile_phase gate
+printf 'go\n%s\n%s\n' "$GATE_HEADER" "$GATE_STDIN" >&"${JOIN_RUN_FD[$WINNER]}"
+join_close_fd "${JOIN_RUN_FD[$WINNER]}"
+JOIN_RUN_FD[$WINNER]=""
+wait "${JOIN_PID[$WINNER]}" || true  # the job's own status is the run's, in run.rc
+status=1
+read -r status <"$WIN_DIR/run.rc" || status=1
 
-# ── did the run's own connection fail? ───────────────────────────────────────
-#
-# The run verb opens a NEW connection with a fresh password login (devbox_gate
-# gives it no master), after the probe, the lock, the sync and the setup. When
-# that login is refused (the gate password was rotated during the run) or the
-# connect fails (sshd MaxStartups, a network drop), ssh exits 255 before
-# anything runs on the host. That 255 fell through as the gate's own status:
-# exit 255 with a line about the OOM counter, and under strict mode 255
-# unmapped, where a refused password must give 3 (75). ssh's
-# own line in GATE_ERR tells it apart from a gate that exits 255 itself.
-if [ "$status" -eq 255 ]; then
-  ssh_line="$(grep -m1 -E "^devbox-gate@.*: Permission denied|Too many authentication failures|REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed" "$GATE_ERR" 2>/dev/null || true)"
-  if [ -n "$ssh_line" ]; then
-    case "$ssh_line" in
-      *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
-        echo "devbox verify: the host key of $TARGET is not its pin at the run step; the gate did not run, and no password was sent ($ssh_line)" >&2 ;;
-      *) echo "devbox verify: the gate password was refused by $TARGET at the run step; the gate did not run ($ssh_line)" >&2 ;;
-    esac
-    devbox_die 3 auth
-  fi
-  ssh_line="$(grep -m1 -E "^ssh: connect to host |^ssh: Could not resolve hostname |^kex_exchange_identification: |Connection closed by |Connection reset by " "$GATE_ERR" 2>/dev/null || true)"
-  if [ -n "$ssh_line" ]; then
-    echo "devbox verify: the run step could not reach $TARGET, so the gate's result is unknown ($ssh_line)" >&2
-    devbox_die 3
-  fi
-fi
+refuse_ssh_failure "$status" "$GATE_ERR" "$TARGET"
+refuse_prep_limit "$status" "$GATE_ERR" "$TARGET"
 
 # ── did the watchdog stop it? ────────────────────────────────────────────────
 #
@@ -1222,36 +1653,13 @@ if [ "$status" -eq 79 ] && stop_reason="$(grep -m1 -F "$WATCHDOG_LINE" "$GATE_ER
   } >&2
   devbox_die 10
 fi
+refuse_lost_ticket "$status" "$GATE_ERR" "$TARGET"
+# A 75 is the gate's own here. The pool exits 75 only while it queues, before
+# its `held` line, and joins_failed reads that one. Before the hold mode a gate
+# of its own that exited exactly 75 was read as a pool that gave up, a known
+# collision that the `go` line removed.
 
-# ── did the pool lose this gate's place in line? ─────────────────────────────
-#
-# 78 from devbox-pool means its queue ticket was gone and could not be written
-# again, so the gate never ran. MEASURED on a live host: runs showed "queued"
-# for over an hour while the host's queue was empty. A waiter is granted only
-# at the head of the queue, so one without a ticket never is. The pool now
-# restores a lost ticket, and when it cannot, it stops with 78 rather than wait
-# for a turn that cannot come. A gate that exits 78 of its own prints no such
-# line, and its status passes through below as any other gate status does.
-TICKET_LINE="devbox-pool: lost its queue ticket "
-if [ "$status" -eq 78 ] && ticket_line="$(grep -m1 -F "$TICKET_LINE" "$GATE_ERR" 2>/dev/null)"; then
-  {
-    echo "devbox verify: the pool on $TARGET lost this gate's queue ticket and could not restore it, so the gate did not run (${ticket_line#devbox-pool: })"
-    echo "  this is not a test result. The pool's state directory on $TARGET is not writable or not there: run devbox doctor, and redeploy the host when it names the pool."
-  } >&2
-  devbox_die 11
-fi
-
-# Strict mode reads every 75 that is left as the pool's: DEVBOX_POOL_DEADLINE,
-# with no ceiling asked for, or on the ceiling-free second wait above. It exits
-# 74 through the map at the top. A gate of its own that exits exactly 75 is read
-# the same way, the same known collision, and a strict caller still
-# takes that gate's result from its own output rather than from this code.
-if [ "$STRICT" = 1 ] && [ "$status" -eq 75 ]; then
-  echo "devbox verify: the pool on $TARGET gave up waiting for tokens and ran nothing (devbox-pool exit 75)." >&2
-  devbox_die 75
-fi
-
-# ── did the gate fail, or was it killed? ─────────────────────────────────────
+# ── did the gate fail, or was it killed?─────────────────────────────────────
 #
 # A non-zero status is not proof of a failing test. When memory runs out the
 # kernel kills the process, and the partial test summary, or the missing one, is

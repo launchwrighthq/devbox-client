@@ -15,11 +15,14 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# shellcheck source=tests/gate-stub-hold.sh
+source ./gate-stub-hold.sh
 
 T="$(cd .. && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/proj/.devbox" "$TMP/home" "$TMP/run"
+mkdir -p "$TMP/bin" "$TMP/proj/.devbox" "$TMP/home" "$TMP/run" "$TMP/lanes"
+export FAKE_LANES="$TMP/lanes"
 
 # A real checkout. devbox-verify starts with `git rev-parse --show-toplevel`,
 # and no commit is needed: nothing under test reads history, and `.git` stays
@@ -93,7 +96,7 @@ export TMP SSH_LOG FAKE_PROTO FAKE_FP
 # inspected the last word would see a token, match nothing, and silently fall
 # through to the catch-all for calls this file means to answer specifically.
 # The log keeps the WHOLE argv, so a case can still read every word that left.
-{ gate_stub_head; cat <<'STUB'
+{ gate_stub_head; gate_stub_hold; cat <<'STUB'
 case "$GATE_CMD" in
   version) printf '%s %s\n' "$FAKE_PROTO" "$FAKE_FP"; exit 0 ;;
   "queue-estimate "*)
@@ -131,15 +134,17 @@ case "$GATE_CMD" in
     if [ -n "${FAKE_EST_PAD-}" ]; then head -c 200000 /dev/zero; exit "$?"; fi
     exit 0 ;;
   # The `run` verb's fifth word is the max wait: 0 is the unbounded retry,
-  # anything else is the ceiling the developer asked for.
+  # anything else is the ceiling the developer asked for. FAKE_ACQ is the pool's
+  # exit under that ceiling BEFORE any grant (75: it gave up queuing), and
+  # FAKE_ACQ2 is the gate's own exit after `go`.
   "run "*)
     read -r _ _ _ _ _ _mw _ <<<"$GATE_CMD"
-    case "$_mw" in
-      0) exit "${FAKE_ACQ2:-0}" ;;
-      *) exit "${FAKE_ACQ:-0}" ;;
-    esac ;;
+    if [ "$_mw" != 0 ] && [ "${FAKE_ACQ:-0}" != 0 ]; then exit "$FAKE_ACQ"; fi
+    _hold_run
+    cat >/dev/null
+    exit "${FAKE_ACQ2:-0}" ;;
   "ensure-workspace "*) printf 'postgresql://fixture:fixture@fixture/fixture\n'; exit 0 ;;
-  # The per-worktree lock. LOCKED first, then stdin held open exactly as the
+  # The lane lock. LOCKED <slug> first, then stdin held open exactly as the
   # gate verb `lock` holds it on the host: the client waits for that word and
   # releases by closing its end of the fifo.
   #
@@ -150,7 +155,7 @@ case "$GATE_CMD" in
   # FAKE_LOCK_FAIL makes the verb end without LOCKED, as a refused lock does.
   "lock "*)
     if [ -n "${FAKE_LOCK_VIEW-}" ]; then
-      for _p in "${TMPDIR:-/tmp}"/*/* /tmp/devbox-lock-fifo.*; do
+      for _p in $(find "${TMPDIR:-/tmp}" -mindepth 1 2>/dev/null) /tmp/devbox-lock-fifo.*; do
         [ -e "$_p" ] || continue
         if [ /dev/stdin -ef "$_p" ]; then
           printf 'fifo %s\n' "$_p" >>"$FAKE_LOCK_VIEW"
@@ -160,8 +165,7 @@ case "$GATE_CMD" in
       done
       ls -A "${TMPDIR:-/tmp}" | sed 's/^/entry /' >>"$FAKE_LOCK_VIEW"
     fi
-    [ -z "${FAKE_LOCK_FAIL-}" ] || exit 1
-    printf 'LOCKED\n'; cat >/dev/null; exit 0 ;;
+    _hold_lock ;;
   *) exit 0 ;;
 esac
 STUB
@@ -230,7 +234,7 @@ assert_eq "1" "$(count " probe " "$ssh_log")" \
   "and the target was asked exactly one probe"
 assert_eq "0" "$(count "queue-estimate" "$ssh_log")" \
   "and no separate queue-estimate"
-assert_ok "the run names the target it chose" contains "==> devbox: running on fakehost" "$out"
+assert_ok "the run names the target it joins" contains "==> devbox: queuing on fakehost: " "$out"
 
 # ── a gate's OWN 75 is not reinterpreted when the feature is off ────────────
 #
@@ -292,26 +296,37 @@ FAKE_EST="wait x 5 10/32 3/3 2"
 run_verify
 assert_eq "0" "$rc" "an unparseable seconds field still runs remotely and completes"
 assert_ok "it degrades to the same message an unusable answer gets" \
-  contains "no usable queue estimate, so this run continues on fakehost under a 60s ceiling" "$out"
+  contains "no usable queue estimate, so this run waits on it under a 60s ceiling" "$out"
 assert_fail "and no raw shell error reaches the developer's terminal" \
   contains "integer expression expected" "$out"
 assert_ok "the run really reached the acquire" contains "devbox-gate@fakehost run " "$ssh_log"
 
-# wait, over the max, action fail: exit 8, gate runs nowhere.
+# wait, over the max: the target is still joined. The estimate is an upper
+# bound, so its queue may grant first, and only the ceiling ends the wait. A
+# client that skipped it exited 8 at once while the queue could still free up.
 FAKE_EST="wait 120 5 10/32 3/3 2"
 run_verify
-assert_eq "8" "$rc" "a wait over the ceiling with the default action exits 8"
-assert_ok "the message says no target can take the gate" \
-  contains "no target can take this gate:" "$out"
-assert_ok "and names the target, both numbers and the key" \
-  contains "  fakehost skipped: busy, about 120s of queuing, over the DEVBOX_MAX_QUEUE_WAIT of 60s" "$out"
-assert_ok "and the file to fix" contains "raise DEVBOX_MAX_QUEUE_WAIT in $TMP/proj/.devbox.env" "$out"
-assert_ok "and says the gate ran nowhere" contains "the gate did not run, here or there." "$out"
-assert_eq "0" "$(count "devbox-gate@fakehost run " "$ssh_log")" \
-  "and the acquire was never even asked for"
+assert_eq "0" "$rc" "a wait over the ceiling is joined, and a grant within the ceiling runs the gate"
+assert_ok "the join names the estimate" \
+  contains "10/32 tokens, 3/3 jobs, 2 waiting: about 120s of queuing" "$out"
+assert_fail "and the target is not skipped" contains "fakehost skipped" "$out"
+assert_ok "the run really reached the acquire" contains "devbox-gate@fakehost run " "$ssh_log"
 
-# wait, over the max, action local, DEVBOX_REQUIRES unset: falls back, and
-# BEFORE anything was created on the host.
+# wait, over the max, no grant within the ceiling, action fail: exit 8, gate
+# runs nowhere. FAKE_ACQ=75 is the pool giving up on the ceiling it was sent.
+FAKE_ACQ=75
+run_verify
+assert_eq "8" "$rc" "a wait over the ceiling that is not granted within it exits 8 with the default action"
+assert_ok "the message names the queue and the ceiling" \
+  contains "gave up waiting for tokens on fakehost after 60s. The gate did not run, here or there." "$out"
+assert_ok "and the file to fix" contains "raise DEVBOX_MAX_QUEUE_WAIT in $TMP/proj/.devbox.env" "$out"
+assert_eq "1" "$(count "devbox-gate@fakehost run " "$ssh_log")" \
+  "and the acquire was asked for once"
+assert_fail "no workspace was ever asked for on the host" \
+  contains "devbox-gate@fakehost ensure-workspace" "$ssh_log"
+
+# wait, over the max, no grant within the ceiling, action local,
+# DEVBOX_REQUIRES unset: falls back, and nothing was created on the host.
 write_env 'DEVBOX_MAX_QUEUE_WAIT=60' 'DEVBOX_QUEUE_FULL_ACTION=local'
 write_profile
 run_verify
@@ -319,11 +334,10 @@ assert_eq "0" "$rc" "the same wait with the local action and no requirements com
 assert_ok "the local gate really ran" contains "LOCAL GATE RAN" "$out"
 assert_ok "the banner names this machine and the reason" \
   contains "running demo's gate on THIS machine instead of fakehost." "$out"
-assert_ok "and the reason is the queue estimate, not the acquire" \
-  contains "fakehost estimates 120s of queuing, over your DEVBOX_MAX_QUEUE_WAIT of 60s" "$out"
+assert_ok "and the reason is the ceiling" \
+  contains "the queue on fakehost did not free up within your DEVBOX_MAX_QUEUE_WAIT of 60s" "$out"
 assert_fail "no workspace was ever asked for on the host" \
   contains "devbox-gate@fakehost ensure-workspace" "$ssh_log"
-assert_fail "and the acquire never ran either" contains "devbox-gate@fakehost run " "$ssh_log"
 
 # The same fallback with a DEVBOX_REQUIRES that is set and genuinely SATISFIED
 # here, not merely absent from the profile. `bash` is on PATH on any machine
@@ -470,7 +484,7 @@ FAKE_EST="unknown - 0 4/32 1/3 1"
 run_verify
 assert_eq "0" "$rc" "an unknown verdict runs remotely and completes"
 assert_ok "the client says so and names the ceiling that still applies" \
-  contains "no usable queue estimate, so this run continues on fakehost under a 60s ceiling" "$out"
+  contains "no usable queue estimate, so this run waits on it under a 60s ceiling" "$out"
 assert_ok "the run really reached the acquire" contains "devbox-gate@fakehost run " "$ssh_log"
 
 # ── the acquire's own ceiling expiry (exit 75) ───────────────────────────────
@@ -522,6 +536,10 @@ write_profile
 
 # ── the lock's fifo lives in a private directory ─────────────────────────────
 #
+# Since protocol 3 the fifos of every join live under the probe's own private
+# directory, one directory per target, so the fifo sits some levels under
+# TMPDIR rather than directly in it.
+#
 # The client used to make the fifo at a random name in the shared /tmp and open
 # that name plus a fixed `.out` with `>`. The name was public from the moment
 # mkfifo made it, so another local user could plant a symlink at the `.out`
@@ -547,8 +565,8 @@ run_verify_tmpdir held
 assert_eq "0" "$rc" "a run that takes the lock with TMPDIR set completes"
 lock_fifo="$(sed -n 's/^fifo //p' <<<"$view")"
 lock_dir="$(dirname "${lock_fifo:-/nonexistent/x}")"
-assert_ok "the lock's stdin was a fifo inside a directory directly under TMPDIR" \
-  test "$(dirname "$lock_dir")" = "$LOCK_TMP"
+under() { case "$1" in "$2"/*) return 0 ;; esac; return 1; }
+assert_ok "the lock's stdin was a fifo inside a directory under TMPDIR" under "$lock_dir" "$LOCK_TMP"
 assert_ok "and its stdout was a file in that same directory" \
   contains "out $lock_dir/" "$view"
 assert_ok "that directory was private to this user while the lock waited" \
@@ -563,8 +581,7 @@ run_verify_tmpdir refused 1
 assert_eq "4" "$rc" "a lock the host refuses exits 4"
 assert_ok "and says it could not take the lock" contains "could not take the lock" "$out"
 lock_fifo="$(sed -n 's/^fifo //p' <<<"$view")"
-assert_ok "the refused lock also waited on a fifo under TMPDIR" \
-  test "$(dirname "$(dirname "${lock_fifo:-/nonexistent/x/y}")")" = "$LOCK_TMP"
+assert_ok "the refused lock also waited on a fifo under TMPDIR" under "${lock_fifo:-/nonexistent/x}" "$LOCK_TMP"
 assert_ok "the refused lock's private directory is gone after exit" \
   gone "$(dirname "${lock_fifo:-/nonexistent/x}")"
 assert_eq "0" "$left" "and the temp directory is empty after a refused lock"

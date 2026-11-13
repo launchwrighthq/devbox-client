@@ -524,6 +524,20 @@ render_host() {
   paint_to "$col" "$STATUS_JOBS/$STATUS_MAX_JOBS"
   jobs="jobs $PAINTED"
   line+="$tok  $load  $mem  $jobs"
+  # Swap in use, after the bars. A host with no swap paid a memory peak with a
+  # killed process: the kernel killed test workers in several workspaces and the
+  # shared broker. Every host now has swap, and a host that keeps paging is one
+  # whose headroom is too low for its gates (docs/specs/2026-11-13-late-binding-queue-design.md
+  # section 7.4). No bar and no colour: the host owns the threshold, and its
+  # health word turns `degraded swap <pct>%` past it. Shown only while swap is
+  # in use, after the jobs, so a line stays as wide as before on a host that
+  # does not page and a watch keeps it inside the terminal. `no swap` is a host
+  # with none at all, which the operator chose with DEVBOX_SWAP_SIZE=0.
+  if isnum "$STATUS_SWAP_TOTAL" && [ "$STATUS_SWAP_TOTAL" -eq 0 ]; then
+    line+="  no swap"
+  elif isnum "$STATUS_SWAP_TOTAL" && isnum "$STATUS_SWAP_USED" && [ "$STATUS_SWAP_USED" -gt 0 ]; then
+    line+="  swap $(human_bytes "$STATUS_SWAP_USED")/$(human_bytes "$STATUS_SWAP_TOTAL")"
+  fi
   if [ -n "$reason" ]; then paint_to "$hcol" "$reason"; line+="  $PAINTED"; fi
   SRV_TEXT+="$line"$'\n'
 }
@@ -543,6 +557,11 @@ render_host() {
 #   name   the name, when the row knows it; else the slug's name at render
 #   state, its colour, target, tokens, time, left, its colour, cores, memory,
 #   note, its colour
+#   run    a ticket's run id, `<machine id hash>.<client pid>`, or empty
+#
+# A ticket's key2 is its start estimate in seconds, so merge_runs can keep the
+# soonest of one run's tickets. It orders nothing else: two tickets of one
+# target never share a place in its queue.
 US=$'\037'
 ROW_ACC=""
 add_row() { local IFS="$US"; ROW_ACC+="$*"$'\n'; }
@@ -610,8 +629,9 @@ run_row() {  # $1 the run's index, $2 the target, $3 its place
 }
 
 ticket_row() {  # $1 the ticket's index, $2 the target, $3 its place
-  local i="$1" state=queued pos=999999 time="-" tok left
+  local i="$1" state=queued pos=999999 time="-" tok left start=999999
   if isnum "${STATUS_TICKET_POS[i]}"; then pos="${STATUS_TICKET_POS[i]}"; state="queued #$pos"; fi
+  ! isnum "${STATUS_TICKET_START[i]}" || start="${STATUS_TICKET_START[i]}"
   if isnum "${STATUS_TICKET_QUEUED[i]}" && isnum "$STATUS_EPOCH"; then
     time="$(dur_clock $((STATUS_EPOCH - STATUS_TICKET_QUEUED[i])))"
   fi
@@ -624,8 +644,79 @@ ticket_row() {  # $1 the ticket's index, $2 the target, $3 its place
   else
     left="starts ~$(dur_about "${STATUS_TICKET_START[i]}")"
   fi
-  add_row 2 "$3" "$pos" "$i" "${STATUS_TICKET_OWNER[i]}" "${STATUS_TICKET_SLUG[i]:--}" "" "$state" yellow "$2" \
-    "$tok" "$time" "$left" "" "" "" "" ""
+  add_row 2 "$3" "$pos" "$start" "$(ticket_owner "$i")" "${STATUS_TICKET_SLUG[i]:--}" "" "$state" yellow "$2" \
+    "$tok" "$time" "$left" "" "" "" "" "" "${STATUS_TICKET_RUN[i]:--}"
+}
+
+# The first word of a run id this laptop writes (devbox_run_id_prefix). Empty
+# when it cannot be computed, and then no ticket is read as this laptop's by
+# its run id: the host's own word still stands.
+RUN_PREFIX="$(devbox_run_id_prefix "$MACHINE_ID")" || RUN_PREFIX=""
+# Is $1 a run id this laptop wrote? A run id is `<hash of the machine id>.<client
+# pid>`.
+my_run() {
+  local run="${1-}"
+  [ -n "$RUN_PREFIX" ] || return 1
+  [[ "$run" =~ ^[0-9a-f]{8,32}\.[0-9]+$ ]] || return 1
+  [ "${run%%.*}" = "$RUN_PREFIX" ]
+}
+# The owner of ticket $1: the host's word, or me when the ticket's run id is
+# this laptop's. A run now joins a target's queue before its workspace there
+# exists, and the host proves an owner only from the workspace container's
+# label, so it called this laptop's first ticket on a new target `other`. The
+# run id is the client's own word, so it makes a row this laptop's and never a
+# slug: a host that cannot prove the slug still sends `-`, and the row takes
+# its name from this laptop's run file.
+ticket_owner() {
+  if [ "${STATUS_TICKET_OWNER[$1]}" != me ] && my_run "${STATUS_TICKET_RUN[$1]-}"; then
+    printf 'me'
+  else
+    printf '%s' "${STATUS_TICKET_OWNER[$1]}"
+  fi
+}
+
+# One run waits in the queue of every eligible target, so its tickets on three
+# targets were three rows, three positions and three estimates for one gate.
+# The tickets that carry one run id become the one row of that run: the ticket
+# with the soonest start estimate, then the best place in line, then the first
+# target in DEVBOX_TARGETS order, with every target the run waits on in its
+# TARGET cell, joined by `+` as the run file joins them. $1 the row records;
+# the result is in MERGED.
+merge_runs() {
+  local line run i n=0
+  local -a f g rows=() keep=()
+  local -A best=() tl=()
+  MERGED=""
+  # In target order, so each run's target list reads in DEVBOX_TARGETS order.
+  mapfile -t rows < <(printf '%s' "$1" | LC_ALL=C sort -s -t "$US" -k2,2n)
+  for line in ${rows[@]+"${rows[@]}"}; do
+    keep[n]=1
+    IFS="$US" read -r -a f <<<"$line"
+    run="${f[18]-}"
+    if [ "${f[0]}" = 2 ] && [ -n "$run" ] && [ "$run" != - ]; then
+      tl[$run]="${tl[$run]:+${tl[$run]}+}${f[9]}"
+      if [ -z "${best[$run]+x}" ]; then
+        best[$run]="$n"
+      else
+        i="${best[$run]}"
+        IFS="$US" read -r -a g <<<"${rows[i]}"
+        if [ "${f[3]}" -lt "${g[3]}" ] || { [ "${f[3]}" -eq "${g[3]}" ] && [ "${f[2]}" -lt "${g[2]}" ]; }; then
+          keep[i]=0
+          best[$run]="$n"
+        else
+          keep[n]=0
+        fi
+      fi
+    fi
+    n=$((n + 1))
+  done
+  for ((i = 0; i < n; i++)); do
+    [ "${keep[i]}" = 1 ] || continue
+    IFS="$US" read -r -a f <<<"${rows[i]}"
+    run="${f[18]-}"
+    if [ "${f[0]}" = 2 ] && [ -n "$run" ] && [ "$run" != - ]; then f[9]="${tl[$run]}"; fi
+    MERGED+="$(IFS="$US"; printf '%s' "${f[*]}")"$'\n'
+  done
 }
 
 # The slugs of this laptop's gates in each target's answer, as " <slug> <slug> ",
@@ -693,7 +784,11 @@ render_target() {  # $1 the target, $2 the file its status job wrote, $3 its pla
   done
   for ((i = 0; i < STATUS_TICKET_COUNT; i++)); do
     ticket_row "$i" "$name" "$3"
-    [ "${STATUS_TICKET_OWNER[i]}" != me ] || mine+="${STATUS_TICKET_SLUG[i]} "
+    # A ticket of this laptop joins its run file by slug, or by the run id the
+    # run file records: a ticket on a target where the worktree has no
+    # workspace yet carries no slug the host could prove.
+    ! my_run "${STATUS_TICKET_RUN[i]-}" || mine+="run:${STATUS_TICKET_RUN[i]} "
+    [ "${STATUS_TICKET_OWNER[i]}" != me ] || [ "${STATUS_TICKET_SLUG[i]}" = - ] || mine+="${STATUS_TICKET_SLUG[i]} "
   done
   ROW_TEXT="$ROW_ACC"
   JOIN[$name]="$mine"
@@ -707,16 +802,21 @@ render_target() {  # $1 the target, $2 the file its status job wrote, $3 its pla
 # that show too.
 #
 # A run in phase queued or gate is the same gate as a mine ticket or run in its
-# target's answer, joined on target and slug. It gets no row of its own, so one
-# gate never shows two clocks: the host's and this laptop's.
+# target's answer, joined on target and slug, or on target and the pid of a
+# ticket's run id. It gets no row of its own, so one gate never shows two
+# clocks: the host's and this laptop's.
 #
-# A run in phase queued or gate that its target answered without is lost.
+# A run in phase queued or gate that every target it names answered without is
+# lost.
 # Verify runs once waited over an hour on connections whose far end was gone,
 # and the view showed them as gates that ran. A run gets a minute in its phase
 # first: between the queued phase and the ticket, and between the grant and
 # the end of the run, the host may hold no record of it for a moment.
 LOST_SECONDS=60
 LOCAL_ROWS=""
+# The name of each live run file's worktree, by the run id the file records,
+# for a ticket that carries that run id and whose slug the host sent as -.
+declare -A RUN_NAME=() RUN_PROJ=()
 
 # The rows of this laptop's runs, in LOCAL_ROWS. It also names each slug from
 # its worktree path, for the target rows. A file whose pid is gone, or whose pid
@@ -725,8 +825,9 @@ LOCAL_ROWS=""
 # that a recycled pid cannot carry (devbox_pid_identity). With --target, only
 # the runs on that target show.
 collect_local() {
-  local dir="$PRIV/runs" f pid l1 l2 ident cur now started at phase target slug path name
-  local g state scol note ncol age
+  local dir="$PRIV/runs" f pid l1 l2 ident rid cur now started at phase target slug path name
+  local g state scol note ncol age t joined answered silent
+  local -a tl=()
   ROW_ACC=""
   LOCAL_ROWS=""
   [ -d "$dir" ] || return 0
@@ -736,8 +837,11 @@ collect_local() {
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     l1=""; l2=""
     { IFS= read -r l1 || true; IFS= read -r l2 || true; } <"$f" 2>/dev/null || continue
-    ident=""
-    read -r ident _ <<<"$l2" || true
+    ident=""; rid=""
+    # The run id is the third word, `-` until the run has one. A file from a
+    # client before protocol 3 has no third word, and joins by slug alone.
+    read -r ident _ rid _ <<<"$l2" || true
+    my_run "$rid" || rid=""
     cur="$(devbox_pid_identity "$pid")" || cur=""
     if [ -z "$cur" ] || { [ -n "$ident" ] && [ "$ident" != - ] && [ "$cur" != "$ident" ]; }; then
       rm -f "$f" 2>/dev/null || true
@@ -745,7 +849,12 @@ collect_local() {
     fi
     started=""; at=""; phase=""; target=""; slug=""; path=""
     read -r started at phase target slug path <<<"$l1" || true
-    if [ "$ONLY_GIVEN" = 1 ] && [ "$target" != "$ONLY" ]; then continue; fi
+    # The target field names one target, or every target a run waits on joined
+    # by `+` (devbox_runfile_phase), from the lane lock to the first grant.
+    IFS=+ read -r -a tl <<<"$target" || true
+    if [ "$ONLY_GIVEN" = 1 ]; then
+      case "+$target+" in *"+$ONLY+"*) ;; *) continue ;; esac
+    fi
     if ! isnum "$started" || ! isnum "$at" || [ -z "$phase" ]; then
       add_row 3 0 0 "$pid" me - "pid $pid" "?" yellow - "" "" "" "" "" "" "unreadable run file $f" yellow
       continue
@@ -757,20 +866,37 @@ collect_local() {
       path_task "$path"
       name="$PT_NAME"
       if [ "$slug" != - ]; then SLUG_NAME[$slug]="$PT_NAME"; SLUG_PROJ[$slug]="$PT_PROJ"; fi
+      if [ -n "$rid" ]; then RUN_NAME[$rid]="$PT_NAME"; RUN_PROJ[$rid]="$PT_PROJ"; fi
     fi
     age=$((now - at))
     [ "$age" -ge 0 ] || age=0
     g=3; state="$phase"; scol=""; note=""; ncol=""
     case "$phase" in
+      # A lane wait read as `sync`, because the sync phase covered the lock wait
+      # too: runs of one worktree showed as syncing for tens of minutes while
+      # they waited on one host's lock. No host reports a lane lock, so the row
+      # is this laptop's alone.
+      lock) scol=yellow ;;
       queued|gate)
         if [ "$phase" = gate ]; then state=running; scol=green; else scol=yellow; fi
-        if [ -n "${JOIN[$target]-}" ]; then
-          case "${JOIN[$target]}" in *" $slug "*) continue ;; esac
-          if [ "$age" -gt "$LOST_SECONDS" ]; then
-            g=4; state=lost; scol=red; note="$target has no such gate"; ncol=red
+        # Joined when any target the run waits on holds it, by slug or by run
+        # id. Lost when every one of them answered without it.
+        joined=0; answered=0; silent=""
+        for t in ${tl[@]+"${tl[@]}"}; do
+          if [ -n "${JOIN[$t]-}" ]; then
+            answered=$((answered + 1))
+            case "${JOIN[$t]}" in *" $slug "*) joined=1 ;; esac
+            if [ -n "$rid" ]; then case "${JOIN[$t]}" in *" run:$rid "*) joined=1 ;; esac; fi
+          elif [ -n "${JOIN[$t]+x}" ]; then
+            silent="${silent:+$silent, }$t"
           fi
-        elif [ -n "${JOIN[$target]+x}" ]; then
-          note="no answer from $target"
+        done
+        [ "$joined" = 0 ] || continue
+        if [ -n "$silent" ]; then
+          note="no answer from $silent"
+        elif [ "$answered" -gt 0 ] && [ "$answered" -eq "${#tl[@]}" ] && [ "$age" -gt "$LOST_SECONDS" ]; then
+          g=4; state=lost; scol=red; ncol=red
+          if [ "${#tl[@]}" -eq 1 ]; then note="$target has no such gate"; else note="${target//+/, } hold no such gate"; fi
         fi ;;
     esac
     add_row "$g" 0 "$started" "$pid" me "$slug" "$name" "$state" "$scol" "$target" "" \
@@ -802,20 +928,25 @@ tb_cell() {
   fi
 }
 format_table() {
-  local g owner slug name state scol target tok time left lcol cpu mem note ncol who
+  local g owner slug name state scol target tok time left lcol cpu mem note ncol run who
   local n=0 i c dim bold
   local -a W=() A=(l l l r r l r l) H=(STATE TASK TARGET TOKENS TIME LEFT CORES MEM)
   local -a WHO=() C0=() C1=() C2=() C3=() C4=() C5=() C6=() C7=() SC=() LC=() NOTE=() NC=()
   TABLE=""
   [ -n "${1//$'\n'/}" ] || return 0
-  while IFS="$US" read -r g _ _ _ owner slug name state scol target tok time left lcol cpu mem note ncol; do
+  merge_runs "$1"
+  while IFS="$US" read -r g _ _ _ owner slug name state scol target tok time left lcol cpu mem note ncol run; do
     [ -n "$g" ] || continue
     who=other
     if [ "$owner" = me ]; then
       who=laptop
       if [ -z "$name" ] && [ -n "$slug" ] && [ -n "${SLUG_NAME[$slug]+x}" ]; then name="${SLUG_NAME[$slug]}"; fi
+      # A ticket whose slug the host could not prove takes the name of the run
+      # file that records its run id.
+      if [ -z "$name" ] && [ -n "$run" ] && [ -n "${RUN_NAME[$run]+x}" ]; then name="${RUN_NAME[$run]}"; fi
       [ -n "$name" ] || name="$slug"
       if [ -n "$slug" ] && [ "${SLUG_PROJ[$slug]-0}" = 1 ]; then who=project; fi
+      if [ -n "$run" ] && [ "${RUN_PROJ[$run]-0}" = 1 ]; then who=project; fi
     else
       name="other laptop"
     fi
@@ -823,7 +954,7 @@ format_table() {
     WHO[n]="$who"; C0[n]="$state"; C1[n]="$name"; C2[n]="$target"; C3[n]="$tok"; C4[n]="$time"
     C5[n]="$left"; C6[n]="$cpu"; C7[n]="$mem"; SC[n]="$scol"; LC[n]="$lcol"; NOTE[n]="$note"; NC[n]="$ncol"
     n=$((n + 1))
-  done < <(printf '%s' "$1" | LC_ALL=C sort -t "$US" -k1,1n -k2,2n -k3,3n -k4,4n)
+  done < <(printf '%s' "$MERGED" | LC_ALL=C sort -t "$US" -k1,1n -k2,2n -k3,3n -k4,4n)
   for ((c = 0; c < 8; c++)); do W[c]="${#H[c]}"; done
   for ((i = 0; i < n; i++)); do
     [ "${#C0[i]}" -le "${W[0]}" ] || W[0]="${#C0[i]}"
