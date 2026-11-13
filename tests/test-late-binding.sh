@@ -186,7 +186,7 @@ assert_ok "D1: lan1's queue was left when its session ended" contains "left sess
 assert_eq "vps1" "$(cat "$CO/.git/devbox/last-target" 2>/dev/null)" "D1: the affinity record names the granted target"
 # The run carries the lane slug, the history slug and the run id as its last words.
 assert_ok "D1: run carries nine words: lane, project, want, min, max wait, limit, mode, history slug, run id" \
-  grep -qE "devbox-gate@$A_VPS1 run ${LANES[0]} app 4 2 0 3600 verify ${LANES[0]} [0-9a-f]{8,32}\.[0-9]+$" "$SSH_LOG"
+  grep -qE "devbox-gate@$A_VPS1 run ${LANES[0]} app 4 2 0 7200 verify ${LANES[0]} [0-9a-f]{8,32}\.[0-9]+$" "$SSH_LOG"
 assert_ok "D1: lock carries the wait, then every lane slug, lane 1 first" \
   grep -qF "devbox-gate@$A_VPS1 lock 30 ${LANES[0]} ${LANES[1]}" "$SSH_LOG"
 
@@ -223,7 +223,7 @@ assert_ok "D6: in lane 2" contains "GATE RAN ON $A_LAN1 IN ${LANES[1]}" "$out"
 assert_ok "D6: the grant line names lane 2" contains "==> devbox: granted 4 tokens on lan1 lane 2 after" "$out"
 assert_ok "D6: the workspace asked for is lane 2's" contains "ensure-workspace ${LANES[1]}" "$(grep " $A_LAN1 " "$HOLD_LOG")"
 assert_ok "D6: and lane 2's run carries lane 1's slug as its history" \
-  grep -qE "devbox-gate@$A_LAN1 run ${LANES[1]} app 4 2 0 3600 verify ${LANES[0]} " "$SSH_LOG"
+  grep -qE "devbox-gate@$A_LAN1 run ${LANES[1]} app 4 2 0 7200 verify ${LANES[0]} " "$SSH_LOG"
 
 # ═══ R7 and R8: no lane anywhere within DEVBOX_LOCK_WAIT ═════════════════════
 #

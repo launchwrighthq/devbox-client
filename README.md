@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.0.2"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.1.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.2"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.1.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.0.2"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.1.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.0.2 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.1.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -120,7 +120,7 @@ DEVBOX_VERIFY="npm run verify:local"
 | `DEVBOX_FORWARD_ENV` | no | names of variables that the gate receives from the laptop |
 | `DEVBOX_NEEDS_POSTGRES`, `DEVBOX_DB_URL_VAR` | no | `1` for a per-worktree Postgres database, and the variable that receives its URL |
 | `DEVBOX_RUNPOD_IMAGE` | no | the RunPod image; a value in `.devbox.env` wins |
-| `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target, counted from the moment the gate starts; default `3600`, at most `14400` |
+| `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target, counted from the moment the gate starts; default `7200`, at most `14400` |
 | `DEVBOX_LANES` | no | how many workspaces this worktree may hold on each target, so that many of its runs can run there at once; default `2`, `1` to `4` |
 
 Each command key becomes the body of a shell function. The function text goes to the

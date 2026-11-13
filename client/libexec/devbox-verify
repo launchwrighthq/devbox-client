@@ -331,7 +331,11 @@ require_uint "DEVBOX_MIN_TOKENS" "${DEVBOX_MIN_TOKENS:-}" "$DEVBOX_CONFIG"
 # an endless loop until a person noticed, and no rule bounded a gate's wall
 # clock. Checked here, by the rule devbox-gate and gate-root apply again, so a
 # refusal names the file to fix before anything has crossed.
-GATE_MAX_SECONDS="${DEVBOX_GATE_MAX_SECONDS:-3600}"
+# The default is 7200. At 3600, large gates on a busy host ran at their CPU
+# limit for most of the hour, so a slow gate that still did work came close to
+# the stop. The stall rule still stops a gate that does no work, whatever this
+# limit says.
+GATE_MAX_SECONDS="${DEVBOX_GATE_MAX_SECONDS:-7200}"
 require_gate_max_seconds "$GATE_MAX_SECONDS" "$DEVBOX_CONFIG"
 # A run is one test file or one scenario, so it asks for the floor and leaves
 # the rest of the shared pool to the gates queued behind it.

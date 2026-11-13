@@ -529,9 +529,9 @@ assert_eq "2" "$(count "devbox-gate@fakehost run " "$ssh_log")" \
 first_try="$(grep -m1 "devbox-gate@fakehost run " <<<"$ssh_log")"
 second_try="$(grep "devbox-gate@fakehost run " <<<"$ssh_log" | tail -n1)"
 assert_ok "the first attempt carried the developer's ceiling" \
-  contains " 10 6 60 3600 verify" "$first_try"
+  contains " 10 6 60 7200 verify" "$first_try"
 assert_ok "and the retry carried none: it is bounded only by the pool's own deadline" \
-  contains " 10 6 0 3600 verify" "$second_try"
+  contains " 10 6 0 7200 verify" "$second_try"
 write_profile
 
 # ── the lock's fifo lives in a private directory ─────────────────────────────
