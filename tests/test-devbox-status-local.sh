@@ -236,7 +236,7 @@ rm -f "$RUNS"
 # tests/test-runpod.sh does for the dispatch.
 CLIENT="$TMP/client"
 mkdir -p "$CLIENT/client/libexec" "$CLIENT/lib"
-for f in devbox-verify devbox-run devbox-config devbox-transport devbox-targets devbox-askpass; do
+for f in devbox-verify devbox-run devbox-config devbox-transport devbox-targets devbox-askpass devbox-sync; do
   cp "$REPO/client/libexec/$f" "$CLIENT/client/libexec/"
 done
 cp "$REPO/lib/devbox-lib.sh" "$CLIENT/lib/"

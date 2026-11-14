@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.1.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.2.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.1.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.2.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.1.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.2.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.1.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.2.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -122,6 +122,7 @@ DEVBOX_VERIFY="npm run verify:local"
 | `DEVBOX_RUNPOD_IMAGE` | no | the RunPod image; a value in `.devbox.env` wins |
 | `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target, counted from the moment the gate starts; default `7200`, at most `14400` |
 | `DEVBOX_LANES` | no | how many workspaces this worktree may hold on each target, so that many of its runs can run there at once; default `2`, `1` to `4` |
+| `DEVBOX_MAX_RESUMES` | no | how many times a stopped gate may resume from its ledger; default `1`, `0` to `9`, `0` turns resuming off |
 
 Each command key becomes the body of a shell function. The function text goes to the
 workspace on stdin, so no command becomes part of an ssh argument list. Put a command longer
@@ -148,6 +149,32 @@ one is skipped, and the run exits 6 when no target satisfies it. This check stop
 gate that is weaker than the local gate. A project's first remote run reported green after a
 set of its tests errored on an image that lacked a required system tool, and the skip count
 changed with no warning.
+
+### Resumable gates
+
+A gate keeps a ledger of the steps and test files that finished. When the watchdog stops it
+(exit 10), the memory cap kills it (exit 7) or the client dies before it returns, `devbox verify`
+resumes it with only the units that had not passed, up to `DEVBOX_MAX_RESUMES` times. A gate that
+returned a failure is not resumed. A ledger is valid only for the exact files the sync sends,
+`.devbox/config.env`, the forwarded variables and the client version. `devbox verify --fresh`
+ignores it.
+
+A verify gate runs with `DEVBOX_LEDGER`, `DEVBOX_RESUME` (`0` or `1`) and `DEVBOX_LEDGER_TOOLS`,
+the directory of three tools the client writes into the workspace:
+
+- `"$DEVBOX_LEDGER_TOOLS/devbox-ledger" step <name> -- <command...>` records one step, and skips
+  it on a resume when it passed;
+- `vitest-ledger.mjs`, a vitest reporter with `passedFiles()` for `test.exclude`, both wired in the
+  vitest config (vitest 3 refuses a `--reporter` file outside the project folder):
+
+```js
+const ledger = process.env.DEVBOX_LEDGER_TOOLS ? await import(`${process.env.DEVBOX_LEDGER_TOOLS}/vitest-ledger.mjs`) : null;
+test: { exclude: [...configDefaults.exclude, ...(ledger ? ledger.passedFiles() : [])], reporters: ['default', ...(ledger ? [new ledger.default()] : [])] }
+```
+
+- `devbox_ledger.py`, a pytest plugin: `PYTHONPATH="$DEVBOX_LEDGER_TOOLS" pytest -p devbox_ledger`.
+
+A verify gate that recorded nothing gets one warning line, and its exit code is unchanged.
 
 ### `.devbox.env`
 

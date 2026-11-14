@@ -90,7 +90,9 @@ assert_ok "and carries no filename beside the digest" \
 # asserted below is that a round trip did NOT happen. rsync is stubbed into the
 # same log, because the remote sync is the first thing that would write to
 # another machine, and a handshake that ran after it would already have done
-# the damage the handshake exists to prevent.
+# the damage the handshake exists to prevent. Only an rsync to a host is
+# logged: the ledger key lists the checkout with a local rsync dry run before
+# any target is asked, and that one writes to no machine.
 mkdir -p "$TMP/bin" "$TMP/home" "$TMP/run" "$TMP/lanes"
 export FAKE_LANES="$TMP/lanes"
 # A run that passed the handshake takes a lane and a grant first (protocol 3),
@@ -107,7 +109,7 @@ FAKE
 } >"$TMP/bin/ssh"
 cat >"$TMP/bin/rsync" <<'FAKE'
 #!/bin/bash
-printf 'rsync %s\n' "$*" >>"$SSH_LOG"
+case "${*: -1}" in devbox-gate@*) printf 'rsync %s\n' "$*" >>"$SSH_LOG" ;; esac
 exit 0
 FAKE
 chmod +x "$TMP/bin/ssh" "$TMP/bin/rsync"

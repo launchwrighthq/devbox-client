@@ -14,14 +14,11 @@
 #
 # This file builds no command for a remote shell. Before the gate account it
 # built five, each run as root on the shared devbox.
-devbox_sync() {
-local -a rsync_args=()
-if declare -p SYNC_RSYNC_ARGS >/dev/null 2>&1; then rsync_args=("${SYNC_RSYNC_ARGS[@]}"); fi
-local f
-for f in devbox_sync_push devbox_sync_finish; do
-  declare -F "$f" >/dev/null || { echo "devbox sync: the caller defines no $f, so nothing was synced" >&2; return 1; }
-done
-local WORKTREE=""
+# The rules of the project tree's rsync, set in DEVBOX_SYNC_FILTERS. devbox_sync
+# sends the tree with them, and devbox_sync_manifest lists what they send for the
+# ledger key of devbox-verify. A second copy of this list would let the key miss
+# a file the gate receives, and a resume would then skip a unit whose input changed.
+#
 # devbox-runpod/ and devbox-hetzner/ in the git dir are the rental records. The
 # first holds the pod's private ssh key and the second its server's gate password,
 # and a workspace runs any code a gate brings.
@@ -39,19 +36,32 @@ local WORKTREE=""
 # that itself rather than depend on every consumer spelling it correctly.
 # The editor, agent and browser scratch after /.build/ is excluded for every project, which
 # had each listed it in its own exclude file.
-devbox_sync_push "" -a --delete "${rsync_args[@]}" \
-  --filter='P node_modules/' --filter='P .venv/' \
-  --filter='- .venv' --filter='- node_modules' \
-  --filter='P .mypy_cache/' --filter='P .pytest_cache/' --filter='P .ruff_cache/' \
-  --filter='P /.git-common/' \
-  --filter='- devbox-runpod/' --filter='- devbox-hetzner/' \
-  --filter='+ .env*.example' --filter='- .env*' --filter='- .devbox.env' \
-  --filter='- *.pem' --filter='- *.key' --filter='- /vendor/' --filter='- /.build/' \
-  --filter='- .idea/' --filter='- .aider*' --filter='- .playwright-mcp/' \
-  --filter='- playwright-report/' --filter='- test-results/' \
-  --filter='- /.claude/settings.local.json' --filter='- /.claude/logs/' --filter='- /.claude/worktrees/' \
-  --exclude-from="$DEVBOX_EXCLUDE" \
-  "$ROOT/"
+devbox_sync_filters() {
+  DEVBOX_SYNC_FILTERS=(
+    --filter='P node_modules/' --filter='P .venv/'
+    --filter='- .venv' --filter='- node_modules'
+    --filter='P .mypy_cache/' --filter='P .pytest_cache/' --filter='P .ruff_cache/'
+    --filter='P /.git-common/'
+    --filter='- devbox-runpod/' --filter='- devbox-hetzner/'
+    --filter='+ .env*.example' --filter='- .env*' --filter='- .devbox.env'
+    --filter='- *.pem' --filter='- *.key' --filter='- /vendor/' --filter='- /.build/'
+    --filter='- .idea/' --filter='- .aider*' --filter='- .playwright-mcp/'
+    --filter='- playwright-report/' --filter='- test-results/'
+    --filter='- /.claude/settings.local.json' --filter='- /.claude/logs/' --filter='- /.claude/worktrees/'
+    --exclude-from="$DEVBOX_EXCLUDE"
+  )
+}
+
+devbox_sync() {
+local -a rsync_args=()
+if declare -p SYNC_RSYNC_ARGS >/dev/null 2>&1; then rsync_args=("${SYNC_RSYNC_ARGS[@]}"); fi
+local f
+for f in devbox_sync_push devbox_sync_finish; do
+  declare -F "$f" >/dev/null || { echo "devbox sync: the caller defines no $f, so nothing was synced" >&2; return 1; }
+done
+local WORKTREE=""
+devbox_sync_filters
+devbox_sync_push "" -a --delete "${rsync_args[@]}" "${DEVBOX_SYNC_FILTERS[@]}" "$ROOT/"
 
 # A linked worktree's `.git` is a one-line `gitdir:` pointer at a path on THIS
 # laptop, so the copy the sync just made dangles. So send the common dir too,
@@ -89,4 +99,34 @@ fi
 # exclude rule above stops a new bad symlink arriving and cannot remove one
 # already there; the script removes it.
 devbox_sync_finish "$WORKTREE"
+}
+
+# One line per file and symlink the project tree's rsync sends: `<sha256>
+# <path>` for a file, as sha256sum prints it, and `link <path> -> <target>` for
+# a symlink. The ledger key of devbox-verify hashes these lines (resumable gates
+# spec, section 3.2). $1 is a directory that does not exist: the dry run names
+# it as its destination and writes nothing there.
+#
+# rsync's own dry run with the sync's own rules lists exactly what a gate
+# receives. /.git is left out: a main checkout's .git is part of the tree, and
+# `git status` rewrites its index on every call, so with it no two runs would
+# ever share a key. The tracked files are in the listing through the working
+# tree. A name rsync escapes (one that holds a newline) is not a file
+# sha256sum finds, so it fails the listing rather than leave that file out of
+# the key.
+devbox_sync_manifest() {
+  local dest="$1" listing line
+  local -a files=()
+  devbox_sync_filters
+  listing="$(rsync -a --dry-run --out-format='%i %n%L' --filter='- /.git' "${DEVBOX_SYNC_FILTERS[@]}" "$ROOT/" "$dest/")" || return 1
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[\>c.]([fL])[^\ ]{9}\ (.*)$ ]] || continue
+    case "${BASH_REMATCH[1]}" in
+      f) files+=("${BASH_REMATCH[2]}") ;;
+      L) printf 'link %s\n' "${BASH_REMATCH[2]}" ;;
+    esac
+  done <<<"$listing"
+  if [ "${#files[@]}" -gt 0 ]; then
+    (cd "$ROOT" && printf '%s\0' "${files[@]}" | xargs -0 sha256sum --) || return 1
+  fi
 }

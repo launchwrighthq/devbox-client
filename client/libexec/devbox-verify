@@ -139,6 +139,10 @@ source "$_here/devbox-config"
 # its `rent` phase before this script reaches the targets.
 # shellcheck source=client/libexec/devbox-transport
 source "$_here/devbox-transport"
+# Here and not beside the sync below: the ledger key reads the sync's own file
+# list before any target is joined, and the local fallback reads it too.
+# shellcheck source=client/libexec/devbox-sync
+source "$_here/devbox-sync"
 
 # ── the arguments ────────────────────────────────────────────────────────────
 #
@@ -153,12 +157,16 @@ source "$_here/devbox-transport"
 # <action>` in the same way. `--runpod` was an older
 # spelling of that target, and it is refused by name rather than read as an
 # unknown word, so a script that still passes it is told what replaced it.
+#
+# `--fresh` ignores and discards the ledger of an unfinished gate of this
+# worktree, and runs the gate in full (resumable gates spec, section 5).
 RUNPOD_ACTION=""
 HETZNER_ACTION=""
 RUN_MODE=0
 RUN_SCRIPT=""
 LOCAL_ONLY=0
 FORCE_TARGET=""
+FRESH=0
 refuse_args() { echo "devbox verify: $*" >&2; devbox_die 2; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -175,6 +183,7 @@ while [ "$#" -gt 0 ]; do
     --runpod)
       refuse_args "--runpod is no longer read. Run 'devbox verify --target runpod', or 'devbox runpod up|status|down' to manage the rental." ;;
     --local) LOCAL_ONLY=1; shift ;;
+    --fresh) FRESH=1; shift ;;
     --target)
       [ -n "${2:-}" ] || refuse_args "--target needs a name: a target in DEVBOX_TARGETS, runpod or hetzner"
       FORCE_TARGET="$2"; shift 2 ;;
@@ -185,12 +194,13 @@ while [ "$#" -gt 0 ]; do
     --) shift; break ;;
     *)
       [ "$RUN_MODE" = "1" ] && break
-      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>]" ;;
+      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>] [--fresh]" ;;
   esac
 done
 if [ "$RUN_MODE" = "1" ]; then
   [ "$#" -gt 0 ] || { echo "devbox run: name a command: devbox run [--target <name>] -- <command> [args]" >&2; devbox_die 2; }
   [ "$LOCAL_ONLY" = "0" ] || { echo "devbox run: a run never runs on this machine, so it takes no --local" >&2; devbox_die 2; }
+  [ "$FRESH" = "0" ] || { echo "devbox run: a run keeps no ledger, so it takes no --fresh" >&2; devbox_die 2; }
   RUN_SCRIPT="$(printf '%q ' "$@")"
 fi
 [ "$LOCAL_ONLY" = "0" ] || [ -z "$FORCE_TARGET" ] || refuse_args "--local and --target name two places; pass one"
@@ -213,8 +223,45 @@ run_local() {
   OWN_EXIT=1
   devbox_config_load
   OWN_EXIT=0
+  ledger_local
   GATE_OWNS_EXIT=1
-  bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_verify'
+  DEVBOX_LEDGER="$LOCAL_LEDGER" DEVBOX_RESUME=0 DEVBOX_LEDGER_TOOLS="$DEVBOX_LEDGER_TOOLS_DIR" \
+    bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_verify'
+}
+# A gate on this laptop gets the contract of a remote one (resumable gates
+# spec, section 4.1): the tools from this client's own client/share/ledger/,
+# and a fresh ledger in the private dir. A gate script that calls the tools
+# would otherwise fail here on an unset DEVBOX_LEDGER_TOOLS, and only here.
+# Nothing resumes on this laptop: no watchdog stops a local gate. The file is
+# named after a hash of the checkout path, so two worktrees keep two ledgers.
+LOCAL_LEDGER=""
+ledger_local() {
+  local dir root_sum key
+  dir="$(devbox_ledger_dir)" || {
+    echo "devbox verify: the private dir holds no ledgers directory this user owns, so the gate has no ledger to write and did not run" >&2
+    devbox_die 1
+  }
+  root_sum="$(printf '%s' "$ROOT" | sha256sum)" || { echo "devbox verify: sha256sum failed, so the gate has no ledger name and did not run" >&2; devbox_die 1; }
+  LOCAL_LEDGER="$dir/local-${root_sum:0:16}.ledger"
+  ledger_key_of key "$dir/none.$$" || key=-
+  ( umask 077; printf 'key\t%s\nresume\t0\n' "$key" >"$LOCAL_LEDGER" ) || {
+    echo "devbox verify: could not write $LOCAL_LEDGER, so the gate did not run" >&2
+    devbox_die 1
+  }
+}
+# Set the variable named $1 to the ledger key (spec section 3.2), from the
+# forwarded names after $2. $2 is a path that does not exist, the dry run's
+# destination. Returns 1 with a line on stderr when a step of the key fails: a
+# key that left out what it could not read would match a ledger written under
+# other inputs.
+ledger_key_of() {
+  local _var="$1" _dest="$2" _sum
+  shift 2
+  _sum="$(devbox_ledger_key_input "$_here/../../VERSION" "$_dest" "$@" | sha256sum)" || {
+    echo "devbox verify: could not compute the ledger key (the client version, the file list of the sync, .devbox/config.env or a forwarded value could not be read)" >&2
+    return 1
+  }
+  printf -v "$_var" '%s' "${_sum%% *}"
 }
 # The one guard every FALLBACK passes before it calls run_local. `--local` is a
 # person's choice and does not pass here. In strict mode a fallback exits 64 and
@@ -1109,6 +1156,318 @@ if [ -n "${DEVBOX_FORWARD_ENV:-}" ]; then
   fi
 fi
 
+# ── the ledger: resume a gate that did not return its own code ──────────────
+#
+# A gate the watchdog stopped at DEVBOX_GATE_MAX_SECONDS kept nothing. MEASURED:
+# one project's full gate was stopped at its limit several times in one day,
+# each time with its type check, lint and builds passed and only the test suite
+# unfinished, and each rerun repeated all of it. A landing that wrapped the gate
+# in its own time limit lost the same work when that limit killed the client.
+# docs/specs/2026-11-13-resumable-gates-design.md holds the design.
+#
+# The gate writes a ledger of its finished steps and test files into the
+# workspace. This client keeps a marker per worktree, <private dir>/ledgers/
+# <lane-1 slug>.open, from `go` until the gate returns its own exit code. A
+# marker that remains names a gate that never returned: a watchdog stop (10),
+# a memory kill (7), or a client that died or lost its session. Each line of
+# the marker is a name, a tab and a value:
+#
+#   target <name>      the target that ran the gate
+#   lane <slug>        the lane it ran in, the workspace that holds the ledger
+#   run <run id>       this run's id
+#   key <sha256>       the ledger key of section 3.2
+#   base <lines>       the lines of the ledger this client wrote at `go`
+#   open <unit>        one per unit that was open at the stop this run resumes
+#   fetched            once the ledger of that gate is in the local copy
+#
+# The local copy, <lane-1 slug>.ledger, is the ledger fetched with the `ledger`
+# verb, mode 0600. `base` splits a ledger into the records of the earlier runs
+# and those of the last one, so a unit open at the last stop is told from one
+# that was open at an earlier stop and never reached again.
+LEDGER_DIR=""
+LEDGER_MARK=""
+LEDGER_COPY=""
+LEDGER_KEY=""
+LEDGER_RESUME=0
+LEDGER_FILE="$PROBE_DIR/ledger"
+LEDGER_BASE=0
+LEDGER_OPEN=""
+# The line a resume prints at `go`, before its gate. Not before the joins: a
+# run that ends up on a rented RunPod pod, which keeps no ledger, runs in full.
+LEDGER_RESUME_LINE=""
+LEDGER_MARKED=0
+LEDGER_PREV_MARK=""
+# A FIFO swapped in for the ledger can stall the read on the host, and the
+# fetch stands between a stop and its resume, so it has a limit of its own.
+LEDGER_FETCH_SECONDS=30
+TAB=$'\t'
+
+# One value of the marker: the rest of the first line named $1.
+ledger_mark_get() {
+  awk -F'\t' -v k="$1" '$1 == k { sub(/^[^\t]*\t/, ""); print; exit }' "$LEDGER_MARK"
+}
+
+# Every unit of the ledger $1, after its first $2 lines, whose last record
+# there is the one named $3 (pass, start), one per line: `step<TAB><name>` or
+# `file<TAB><runner><TAB><path>`. A unit counts as passed only when its LAST
+# record is `pass`, and as open only when its last record is `start`: a later
+# `start` or `fail` makes a passed unit not passed again (spec section 3.3).
+ledger_units() {
+  awk -F'\t' -v base="$2" -v want="$3" '
+    NR <= base { next }
+    $1 == "step" { id = $1 FS $2; st = $3 }
+    $1 == "file" { id = $1 FS $2 FS $3; st = $4 }
+    $1 == "step" || $1 == "file" { if (!(id in last)) order[++n] = id; last[id] = st }
+    END { for (i = 1; i <= n; i++) if (want == "" || last[order[i]] == want) print order[i] }
+  ' "$1"
+}
+
+# Discard the marker and the local copy of this worktree.
+ledger_forget() {
+  [ -z "$LEDGER_MARK" ] || rm -f "$LEDGER_MARK" "$LEDGER_COPY"
+}
+
+# A gate that never started after `go` (the pool lost its ticket, or released
+# the grant before the gate began) wrote nothing. The marker of the gate this
+# run would have resumed goes back, so the next run still resumes that one.
+ledger_unmark() {
+  [ "$LEDGER_MARKED" = 1 ] || return 0
+  LEDGER_MARKED=0
+  if [ -n "$LEDGER_PREV_MARK" ]; then
+    printf '%s\n' "$LEDGER_PREV_MARK" >"$LEDGER_MARK"
+  else
+    rm -f "$LEDGER_MARK"
+  fi
+}
+
+# Fetch the ledger of lane $2 on target $1, which the caller selected with
+# devbox_target_use, into the local copy. $3 says what follows a failure, for
+# its one line; an empty $3 prints nothing. Returns 1 on any failure.
+#
+# The `ledger` verb exits 0 with the ledger, 1 when the workspace holds none,
+# and 2 for a ledger it refuses (too large, not a regular file, unreadable). A
+# host older than the verb refuses it as an unknown verb, also with 2, so that
+# case is read from its line, and the repair it names is the host's.
+ledger_fetch() {
+  local name="$1" lane="$2" then="$3" tmp="$LEDGER_DIR/fetch.$$" err="$LEDGER_DIR/fetch.$$.err" rc=0 line=""
+  # Its own refusal names the install; this line names the consequence instead.
+  if ! devbox_need_timeout 2>/dev/null; then
+    [ -z "$then" ] || echo "devbox verify: this laptop has no 'timeout' command to bound the ledger fetch from $name, so $then" >&2
+    return 1
+  fi
+  # Local, so devbox_gate_open and devbox_gate see the limit, and the caller's
+  # value is back when this function returns.
+  local GATE_TIME_LIMIT="$LEDGER_FETCH_SECONDS"
+  # Both streams are files, never a pipe: a master this verb starts keeps the
+  # streams it was started with, and a pipe would then stay open after the
+  # verb ended.
+  : >"$tmp"
+  chmod 0600 "$tmp"
+  devbox_gate ledger "$lane" "$DEVBOX_PROJECT" >"$tmp" 2>"$err" || rc=$?
+  if _gate_limit_hit "$rc"; then line="no answer within ${LEDGER_FETCH_SECONDS}s"; fi
+  # grep finds no line in an empty file, and the reason then goes without one.
+  [ -n "${line-}" ] || line="$(grep -m1 . "$err" || true)"
+  rm -f "$err"
+  if [ "$rc" -eq 0 ]; then
+    mv -f "$tmp" "$LEDGER_COPY"
+    return 0
+  fi
+  rm -f "$tmp"
+  [ -n "$then" ] || return 1
+  case "$line" in
+    *"unknown verb 'ledger'"*)
+      echo "devbox verify: $name predates the ledger verb, so $then. $(repair_hint "$name")" >&2 ;;
+    *)
+      if [ "$rc" -eq 1 ]; then
+        echo "devbox verify: $name holds no ledger of this worktree's gate (${line:-exit 1}), so $then" >&2
+      else
+        echo "devbox verify: could not fetch the ledger of this worktree's gate from $name (${line:-exit $rc}), so $then" >&2
+      fi ;;
+  esac
+  return 1
+}
+
+# Name each unit that was open at the stop this run resumed (the marker's
+# `open` lines) and is open at this stop too (spec section 5, step 7). $1 is
+# the marker's `base`.
+ledger_hang_check() {
+  local unit
+  [ -s "$LEDGER_COPY" ] || return 0
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    grep -qxF "open$TAB$unit" "$LEDGER_MARK" || continue
+    echo "devbox verify: ${unit##*"$TAB"} was running at both stops; it may hang" >&2
+  done <<<"$(ledger_units "$LEDGER_COPY" "$1" start)"
+}
+
+# The resume count of the local copy, or nothing when it holds no whole number.
+ledger_count() {
+  local count
+  count="$(awk -F'\t' '$1 == "resume" { print $2; exit }' "$LEDGER_COPY")"
+  is_uint "$count" || return 1
+  printf '%s' "$count"
+}
+
+# Before any target is joined: compute the key, and decide from the marker
+# whether this run resumes (spec section 5, steps 1 to 5). Sets LEDGER_FILE,
+# the ledger the hooks write into the workspace, LEDGER_RESUME, LEDGER_OPEN and
+# LEDGER_RESUME_LINE.
+ledger_prelude() {
+  local -a fwd=()
+  local target lane base count passed total
+  [ -z "${fwd_crossed:-}" ] || read -r -a fwd <<<"$fwd_crossed"
+  if LEDGER_DIR="$(devbox_ledger_dir)"; then
+    LEDGER_MARK="$LEDGER_DIR/$HISTORY_SLUG.open"
+    LEDGER_COPY="$LEDGER_DIR/$HISTORY_SLUG.ledger"
+    ledger_key_of LEDGER_KEY "$PROBE_DIR/none" ${fwd[@]+"${fwd[@]}"} || LEDGER_KEY=""
+  else
+    LEDGER_DIR=""
+  fi
+  if [ -z "$LEDGER_KEY" ]; then
+    echo "devbox verify: this gate keeps no ledger marker, so a stop cannot resume it" >&2
+    printf 'key\t-\nresume\t0\n' >"$LEDGER_FILE"
+    LEDGER_BASE=2
+    return 0
+  fi
+  GATE_ENV+=("DEVBOX_LEDGER_KEY=$LEDGER_KEY")
+  printf 'key\t%s\nresume\t0\n' "$LEDGER_KEY" >"$LEDGER_FILE"
+  LEDGER_BASE=2
+  [ -f "$LEDGER_MARK" ] || { rm -f "$LEDGER_COPY"; return 0; }
+  if [ "$FRESH" = 1 ]; then
+    echo "devbox verify: --fresh, so the unfinished gate of this worktree is discarded and the gate runs in full" >&2
+    ledger_forget
+    return 0
+  fi
+  if [ "$(ledger_mark_get key)" != "$LEDGER_KEY" ]; then
+    echo "devbox verify: the unfinished gate of this worktree ran on other inputs (its ledger key differs), so its ledger is discarded and the gate runs in full" >&2
+    ledger_forget
+    return 0
+  fi
+  target="$(ledger_mark_get target)"
+  lane="$(ledger_mark_get lane)"
+  base="$(ledger_mark_get base)"
+  is_uint "$base" || base=0
+  # Once fetched, the ledger of a gate that ended can no longer change, so the
+  # local copy is as new as the host's (step 3).
+  if ! grep -qx 'fetched' "$LEDGER_MARK" || [ ! -s "$LEDGER_COPY" ]; then
+    case " ${DEVBOX_DEPLOYED[*]} " in
+      *" ${target:-?} "*) ;;
+      *)
+        echo "devbox verify: the unfinished gate of this worktree ran on ${target:-no named target}, which $DEVBOX_ENV does not list as a deployed target, so its ledger cannot be fetched and the gate runs in full" >&2
+        ledger_forget
+        return 0 ;;
+    esac
+    if ! devbox_target_use "$target" >/dev/null 2>&1 || ! ledger_fetch "$target" "$lane" "the gate runs in full"; then
+      ledger_forget
+      return 0
+    fi
+    printf 'fetched\n' >>"$LEDGER_MARK"
+    ledger_hang_check "$base"
+  fi
+  if [ "$(awk -F'\t' 'NR == 1 && $1 == "key" { print $2 }' "$LEDGER_COPY")" != "$LEDGER_KEY" ]; then
+    echo "devbox verify: the ledger of the unfinished gate does not carry this run's key, so it is discarded and the gate runs in full" >&2
+    ledger_forget
+    return 0
+  fi
+  if ! count="$(ledger_count)"; then
+    echo "devbox verify: the ledger of the unfinished gate holds no resume count, so it is discarded and the gate runs in full" >&2
+    ledger_forget
+    return 0
+  fi
+  if [ "$count" -ge "$DEVBOX_MAX_RESUMES" ]; then
+    echo "devbox verify: the unfinished gate of this worktree resumed $count time(s), and DEVBOX_MAX_RESUMES in $DEVBOX_CONFIG is $DEVBOX_MAX_RESUMES, so its ledger is discarded and the gate runs in full" >&2
+    ledger_forget
+    return 0
+  fi
+  awk -F'\t' -v OFS='\t' '$1 == "resume" && !done { $2 = $2 + 1; done = 1 } { print }' "$LEDGER_COPY" >"$LEDGER_FILE"
+  LEDGER_BASE="$(wc -l <"$LEDGER_FILE" | tr -d ' ')"
+  LEDGER_OPEN="$(ledger_units "$LEDGER_COPY" "$base" start)"
+  LEDGER_RESUME=1
+  passed="$(ledger_units "$LEDGER_COPY" 0 pass | grep -c . || true)"  # grep -c exits 1 on a count of 0
+  total="$(ledger_units "$LEDGER_COPY" 0 "" | grep -c . || true)"  # the same
+  LEDGER_RESUME_LINE="devbox: resuming, $passed of $total units passed earlier, resume $((count + 1)) of $DEVBOX_MAX_RESUMES"
+}
+
+# At `go`: record this gate in the marker. The marker it replaces is kept in
+# memory for ledger_unmark.
+ledger_mark() {
+  local unit
+  [ -z "$LEDGER_RESUME_LINE" ] || echo "$LEDGER_RESUME_LINE"
+  [ -n "$LEDGER_KEY" ] || return 0
+  LEDGER_PREV_MARK=""
+  [ ! -f "$LEDGER_MARK" ] || LEDGER_PREV_MARK="$(cat "$LEDGER_MARK")"
+  if ! {
+    printf 'target\t%s\nlane\t%s\nrun\t%s\nkey\t%s\nbase\t%s\n' "$TARGET" "$SLUG" "$RUN_ID" "$LEDGER_KEY" "$LEDGER_BASE"
+    while IFS= read -r unit; do
+      [ -z "$unit" ] || printf 'open\t%s\n' "$unit"
+    done <<<"$LEDGER_OPEN"
+  } >"$LEDGER_MARK.tmp" || ! chmod 0600 "$LEDGER_MARK.tmp" || ! mv -f "$LEDGER_MARK.tmp" "$LEDGER_MARK"; then
+    echo "devbox verify: could not write $LEDGER_MARK, so a stop of this gate cannot resume it" >&2
+    return 0
+  fi
+  LEDGER_MARKED=1
+}
+
+# After a stop, exit 10 or 7: fetch the ledger at once, name a unit open
+# at two stops in a row, and when the count allows, start the resume in this
+# same `devbox verify`, so a landing needs no second call (spec section 5, step
+# 6). It returns when no resume follows, and the caller exits with its 10 or
+# 7; the marker stays, because the gate did not return its own code.
+#
+# The resume is this program run again, with the same --target: it joins the
+# targets as any run does, so it may land on another target or lane (D6), and
+# it reads the marker and the local copy this function leaves. Every join of
+# this run ends first, or its lane lock would hold lane 1 against the resume.
+ledger_after_stop() {
+  local base count rc=0
+  local -a again=()
+  [ "$LEDGER_MARKED" = 1 ] || return 0
+  if ! ledger_fetch "$TARGET" "$SLUG" "the stopped gate cannot resume"; then
+    ledger_forget
+    return 0
+  fi
+  printf 'fetched\n' >>"$LEDGER_MARK"
+  base="$(ledger_mark_get base)"
+  ledger_hang_check "${base:-0}"
+  count="$(ledger_count)" || count=""
+  if [ -z "$count" ] || [ "$count" -ge "$DEVBOX_MAX_RESUMES" ]; then
+    echo "devbox verify: this gate resumed ${count:-an unknown number of} time(s), and DEVBOX_MAX_RESUMES in $DEVBOX_CONFIG is $DEVBOX_MAX_RESUMES, so it does not resume again" >&2
+    return 0
+  fi
+  [ -z "$FORCE_TARGET" ] || again=(--target "$FORCE_TARGET")
+  cleanup_probe
+  trap devbox_on_exit EXIT
+  devbox_runfile_remove
+  bash "$_here/devbox-verify" ${again[@]+"${again[@]}"} || rc=$?
+  # The resume applied the strict map to its own code, so this run passes it on.
+  GATE_OWNS_EXIT=1
+  exit "$rc"
+}
+
+# After the gate returned its own code: fetch the ledger once and warn when it
+# holds no `step` and no `file` record (spec section 7, release 1). The code
+# stays the gate's. A fetch that fails says nothing here: the gate is over, and
+# the warning is advice about the next stop. Then the marker and the local copy
+# go, because a completed run is never resumed (section 2).
+ledger_finished() {
+  [ "$RUN_MODE" = 0 ] || return 0
+  if [ -n "$LEDGER_DIR" ] && ledger_fetch "$TARGET" "$SLUG" ""; then
+    if [ -z "$(ledger_units "$LEDGER_COPY" 0 "")" ]; then
+      echo "devbox verify: this gate wrote no ledger, so a stop cannot resume it" >&2
+    fi
+  fi
+  ledger_forget
+}
+
+if [ "$RUN_MODE" = 0 ]; then
+  ledger_prelude
+  ledger_hooks="$(devbox_ledger_hooks "$DEVBOX_PROJECT" "$LEDGER_RESUME" "$LEDGER_FILE")" || {
+    echo "devbox verify: could not encode the ledger tools for the workspace (base64 failed), so the gate did not run" >&2
+    devbox_die 1
+  }
+  GATE_STDIN="$HOOKS"$'\n'"$ledger_hooks"
+fi
+
 # ── did a run's own connection fail? ─────────────────────────────────────────
 #
 # The run verb opens a NEW connection with a fresh password login (devbox_gate
@@ -1159,6 +1518,7 @@ refuse_lost_ticket() {
     echo "devbox verify: the pool on $target lost this gate's queue ticket and could not restore it, so the gate did not run (${ticket_line#devbox-pool: })"
     echo "  this is not a test result. The pool's state directory on $target is not writable or not there: run devbox doctor, and redeploy the host when it names the pool."
   } >&2
+  ledger_unmark
   devbox_die 11
 }
 
@@ -1178,6 +1538,7 @@ refuse_prep_limit() {
     echo "devbox verify: the pool on $target released this run's grant before the gate started (${prep_line#devbox-pool: }), so the gate did not run"
     echo "  this is not a test result. The sync and the setup took longer than DEVBOX_HOLD_PREP_SECONDS on $target allows: a cold lane is the usual cause, and the next run there is warm."
   } >&2
+  ledger_unmark
   devbox_die 12
 }
 
@@ -1548,8 +1909,6 @@ devbox_sync_push() {
 devbox_sync_finish() {
   devbox_gate sync-finish "$SLUG" "$DEVBOX_PROJECT" ${1:+"$1"}
 }
-# shellcheck source=client/libexec/devbox-sync
-source "$_here/devbox-sync"
 devbox_sync
 held_or_die
 
@@ -1630,11 +1989,24 @@ held_or_die
 # that ends early can never answer the write with SIGPIPE. A mock ssh that
 # exited at once raced a printf into a pipe and returned 141 for a successful
 # gate.
+#
+# The write runs in a background job. The ledger tools, and on a resume the
+# ledger, made the stdin larger than a pipe's buffer: MEASURED, a gate that
+# ended before it read its stdin left this shell blocked in the write for
+# good, because its own read-write end keeps the fifo from ever failing the
+# write. The job holds that end until its write is done, then exits, and the
+# reader sees the end of the stream. A job still blocked once the run ended is
+# killed, since nothing will read the rest.
 devbox_runfile_phase gate
-printf 'go\n%s\n%s\n' "$GATE_HEADER" "$GATE_STDIN" >&"${JOIN_RUN_FD[$WINNER]}"
+[ "$RUN_MODE" = 1 ] || ledger_mark
+printf 'go\n%s\n%s\n' "$GATE_HEADER" "$GATE_STDIN" >&"${JOIN_RUN_FD[$WINNER]}" &
+go_writer=$!
 join_close_fd "${JOIN_RUN_FD[$WINNER]}"
 JOIN_RUN_FD[$WINNER]=""
 wait "${JOIN_PID[$WINNER]}" || true  # the job's own status is the run's, in run.rc
+# The writer may have ended already, and that end is the one asked for.
+kill "$go_writer" 2>/dev/null || true
+wait "$go_writer" 2>/dev/null || true  # its status is a write the gate did not need
 status=1
 read -r status <"$WIN_DIR/run.rc" || status=1
 
@@ -1655,6 +2027,7 @@ if [ "$status" -eq 79 ] && stop_reason="$(grep -m1 -F "$WATCHDOG_LINE" "$GATE_ER
     echo "devbox verify: the watchdog on $TARGET stopped this gate: ${stop_reason#*"$WATCHDOG_LINE"}"
     echo "  this is not a test result. Do not rerun the gate unchanged: find the test that hangs or spins, or raise DEVBOX_GATE_MAX_SECONDS in $DEVBOX_CONFIG when the gate is really that long."
   } >&2
+  ledger_after_stop
   devbox_die 10
 fi
 refuse_lost_ticket "$status" "$GATE_ERR" "$TARGET"
@@ -1725,12 +2098,16 @@ if [ "$status" -ne 0 ] || [ "$STRICT" = 1 ]; then
       echo "      check with: free -g on $TARGET, and devbox doctor reports the ratio"
     } >&2
     # 7 and not the gate's own status: this run says nothing about the tests.
-    [ "$oom_keeps_gate_status" = 1 ] || devbox_die 7
+    if [ "$oom_keeps_gate_status" != 1 ]; then
+      ledger_after_stop
+      devbox_die 7
+    fi
     echo '::devbox-infra::oom' >&2
   fi
 fi
 if [ "$STRICT" = 1 ] && [ "$queued_past_ceiling" = 1 ]; then
   echo '::devbox-infra::queue' >&2
 fi
+ledger_finished
 GATE_OWNS_EXIT=1
 exit "$status"

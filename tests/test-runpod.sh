@@ -116,7 +116,7 @@ assert_fail 'does not claim cleanup for an unreadable rental record' runpod_down
 mkdir -p "$TMP/client/client/libexec" "$TMP/client/client/bin" "$TMP/client/lib" "$TMP/checkout/.devbox"
 cp "$REPO/client/bin/devbox" "$TMP/client/client/bin/"
 cp "$REPO/client/libexec/devbox-verify" "$REPO/client/libexec/devbox-run" "$REPO/client/libexec/devbox-config" \
-  "$REPO/client/libexec/devbox-transport" "$REPO/client/libexec/devbox-targets" "$REPO/client/libexec/devbox-askpass" \
+  "$REPO/client/libexec/devbox-transport" "$REPO/client/libexec/devbox-targets" "$REPO/client/libexec/devbox-askpass" "$REPO/client/libexec/devbox-sync" \
   "$TMP/client/client/libexec/"
 cp "$REPO/lib/devbox-lib.sh" "$TMP/client/lib/"
 cat > "$TMP/client/client/libexec/devbox-runpod" <<'BACKEND'

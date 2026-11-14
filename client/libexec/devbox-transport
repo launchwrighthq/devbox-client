@@ -218,6 +218,20 @@ devbox_runs_dir() {
   printf '%s' "$priv/runs"
 }
 
+# The directory of the ledger markers and the fetched ledgers of devbox verify
+# (resumable gates spec, section 2), mode 0700. A ledger names every test file
+# of a project and a marker names its target, so both stay in the private dir,
+# never in /tmp. It prints nothing and returns 1 when the private dir is not
+# one this user owns; devbox_gate_private_dir says why.
+devbox_ledger_dir() {
+  local priv
+  priv="$(devbox_gate_private_dir)" || return 1
+  # A run in another worktree may create it between the test and the mkdir, so
+  # mkdir's "File exists" is dropped and the test after it decides.
+  [ -d "$priv/ledgers" ] || mkdir -m 0700 "$priv/ledgers" 2>/dev/null || [ -d "$priv/ledgers" ] || return 1
+  printf '%s' "$priv/ledgers"
+}
+
 _devbox_runfile_failed() {
   DEVBOX_RUNFILE_OFF=1
   echo "devbox: cannot write this run's file for devbox status ($1); the run goes on, and devbox status does not show it" >&2

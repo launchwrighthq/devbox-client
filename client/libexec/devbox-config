@@ -64,7 +64,8 @@ devbox_kv_parse() {
 # fails the run instead of silently running it with a default.
 DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
 DEVBOX_FORWARD_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR DEVBOX_RUNPOD_IMAGE \
-DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES "
+DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
+DEVBOX_MAX_RESUMES "
 
 devbox_config_parse() {
   local file="$1" image="${DEVBOX_RUNPOD_IMAGE:-}" key
@@ -88,6 +89,20 @@ devbox_config_parse() {
   case "$DEVBOX_KV_SEEN" in
     *" DEVBOX_LANES "*) (require_lanes "$DEVBOX_LANES" "$file") || return 2 ;;
     *) DEVBOX_LANES=2 ;;
+  esac
+  # DEVBOX_MAX_RESUMES, how many times devbox verify resumes one ledger of a
+  # stopped gate (resumable gates spec, D5). 0 turns resuming off. From the
+  # committed file alone, as DEVBOX_LANES is: a resume builds a green from two
+  # runs, so the project decides how many, and an exported value must not.
+  # Checked here, before anything reaches a host, because verify compares it
+  # in bash arithmetic, which evaluates whatever text it is given.
+  case "$DEVBOX_KV_SEEN" in
+    *" DEVBOX_MAX_RESUMES "*)
+      case "$DEVBOX_MAX_RESUMES" in
+        [0-9]) ;;
+        *) echo "devbox: $file: refusing DEVBOX_MAX_RESUMES '$DEVBOX_MAX_RESUMES': write a whole number from 0 to 9" >&2; return 2 ;;
+      esac ;;
+    *) DEVBOX_MAX_RESUMES=1 ;;
   esac
 }
 
@@ -339,4 +354,82 @@ devbox_hooks_script() {
   [ -z "${DEVBOX_PROVISION:-}" ] || printf 'devbox_provision() {\n%s\n}\n' "$DEVBOX_PROVISION"
   printf 'devbox_setup() {\n%s\n}\n' "$DEVBOX_SETUP"
   printf 'devbox_verify() {\n%s\n}\n' "$DEVBOX_VERIFY"
+}
+
+# ── the ledger of a resumable gate ───────────────────────────────────────────
+#
+# A gate the watchdog stopped ran every passed step and test file again on the
+# next attempt, so a suite that ran out of time ran out of time again
+# (docs/specs/2026-11-13-resumable-gates-design.md). The gate keeps a ledger
+# of what finished, and the client resumes it.
+
+# The tools of section 4.1, the files of client/share/ledger/ that the hooks
+# write into a workspace. With DEVBOX_QUEUE_FULL_ACTION=local, or --local, the
+# gate reads them from this directory itself.
+DEVBOX_LEDGER_TOOL_NAMES="devbox-ledger vitest-ledger.mjs ledger-core.mjs devbox_ledger.py"
+DEVBOX_LEDGER_TOOLS_DIR="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/..")/share/ledger"
+
+# Print the bytes the ledger key hashes, in the order of section 3.2: the
+# client version, the files the sync sends, .devbox/config.env, then each
+# forwarded name with the sha256 of its value, sorted by name. $1 the VERSION
+# file, $2 a directory that does not exist (devbox_sync_manifest's), the rest
+# the forwarded names. devbox-sync must be sourced, for the sync's own list.
+#
+# A forwarded value may be a token, so only its hash enters the key. It reaches
+# sha256sum on stdin from printf, a builtin, so no argv and no file ever holds
+# it.
+devbox_ledger_key_input() {
+  local version="$1" dest="$2" sorted="" name sum
+  shift 2
+  { printf 'version\n' && cat -- "$version"; } || return 1
+  printf 'files\n'
+  devbox_sync_manifest "$dest" || return 1
+  { printf 'config\n' && cat -- "$DEVBOX_CONFIG"; } || return 1
+  printf 'forward\n'
+  [ "$#" -eq 0 ] || sorted="$(printf '%s\n' "$@" | LC_ALL=C sort)" || return 1
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    sum="$(printf '%s' "${!name-}" | sha256sum)" || return 1
+    printf '%s %s\n' "$name" "${sum%% *}"
+  done <<<"$sorted"
+}
+
+# Print the shell text that writes the tools and the ledger into a workspace
+# and exports DEVBOX_LEDGER, DEVBOX_RESUME and DEVBOX_LEDGER_TOOLS (section
+# 4.1). It follows the hooks on the gate's stdin, which the workspace bash
+# evals as dev, so it runs before devbox_verify and never in a setup or a
+# `devbox run`. $1 the project, $2 0 or 1 for DEVBOX_RESUME, $3 a file that
+# holds the ledger's text.
+#
+# Every file crosses as base64 inside single quotes, decoded in the workspace.
+# Its own text never becomes part of the script, so no word of a tool, or of a
+# ledger a host sent back, can run. base64's alphabet holds no quote.
+#
+# A write that fails stops the gate before it starts, with a line that says
+# so: a resumed gate with no ledger reruns every unit, and a gate whose tool is
+# missing fails on "command not found", which reads like a test failure.
+devbox_ledger_hooks() {
+  local project="$1" resume="$2" ledger="$3" name mode b64 home=/home/dev/.devbox
+  printf '_devbox_ledger_home=%s\n' "$home"
+  printf '_devbox_ledger_prepare() {\n'
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf '  local d="$_devbox_ledger_home"\n  mkdir -p "$d/ledger" "$d/ledger-tools" || return\n'
+  for name in $DEVBOX_LEDGER_TOOL_NAMES; do
+    # Said, and the gate still runs: a gate that never calls this tool is
+    # whole without it, and one that does fails on it by name.
+    if [ ! -f "$DEVBOX_LEDGER_TOOLS_DIR/$name" ]; then
+      echo "devbox verify: this client carries no $DEVBOX_LEDGER_TOOLS_DIR/$name, so the workspace gets no $name; reinstall the devbox client" >&2
+      continue
+    fi
+    mode=0644
+    [ "$name" != devbox-ledger ] || mode=0755
+    b64="$(base64 <"$DEVBOX_LEDGER_TOOLS_DIR/$name" | tr -d '\n')" || return 1
+    printf "  printf '%%s' '%s' | base64 -d >\"\$d/ledger-tools/%s.tmp\" && chmod %s \"\$d/ledger-tools/%s.tmp\" && mv -f \"\$d/ledger-tools/%s.tmp\" \"\$d/ledger-tools/%s\" || return\n" \
+      "$b64" "$name" "$mode" "$name" "$name" "$name"
+  done
+  b64="$(base64 <"$ledger" | tr -d '\n')" || return 1
+  printf "  printf '%%s' '%s' | base64 -d >\"\$d/ledger/%s.ledger\" || return\n" "$b64" "$project"
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf '  export DEVBOX_LEDGER="$d/ledger/%s.ledger" DEVBOX_RESUME=%s DEVBOX_LEDGER_TOOLS="$d/ledger-tools"\n}\n' "$project" "$resume"
+  printf '_devbox_ledger_prepare || { echo "devbox: could not write the ledger or its tools under %s in the workspace, so the gate did not run" >&2; false; }\n' "$home"
 }

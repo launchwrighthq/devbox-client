@@ -27,7 +27,23 @@
 #                FAKE_GRANT is "<host>:<seconds> ...": the queue wait of that
 #                host, or `never`. A host it does not name grants at once.
 #                FAKE_GRANTED is the token count of the held line, the ask when
-#                unset.
+#                unset. FAKE_GRANT_FILE, when the file exists, holds a line that
+#                replaces FAKE_GRANT, so a gate can change who grants the next
+#                run of one `devbox verify`. The header's lines are kept in
+#                _HOLD_ENV for _hold_gate.
+#   _hold_gate   the gate of a resumable-gates run, after _hold_run: the gate's
+#                stdin (the hooks and the ledger script) runs as gate-root's
+#                verify entry runs it, with the workspace's /home/dev/.devbox
+#                at $FAKE_WS/<host>/<slug>, and the header's lines exported.
+#                While $FAKE_STOP_FILE holds a number above 0, the run takes one
+#                from it, tells the gate FAKE_STOPPING=1, and after the gate
+#                ends answers as the watchdog's stop does: the pool's line and
+#                exit 79. FAKE_SKIP_STDIN=<code> ends the gate with that code
+#                before it reads a byte of its stdin.
+#   _hold_ledger the `ledger <slug> <project>` verb: the workspace's ledger
+#                under $FAKE_WS, exit 1 with gate-root's line when there is
+#                none, and a host named in FAKE_LEDGER_OLD refuses the verb as
+#                a devbox-gate older than it does.
 #
 # Every step is a line in $HOLD_LOG when the stub's environment names one:
 # `<time> <host> <event> <word>`, the time from EPOCHREALTIME. A queued run
@@ -92,7 +108,9 @@ _hold_run() {
     [ -z "${FAKE_PRE_ERR-}" ] || printf '%s\n' "$FAKE_PRE_ERR" >&2
     exit "$FAKE_PRE_RC"
   fi
-  for _e in ${FAKE_GRANT-}; do
+  local _grants="${FAKE_GRANT-}"
+  [ -z "${FAKE_GRANT_FILE-}" ] || [ ! -f "$FAKE_GRANT_FILE" ] || read -r _grants <"$FAKE_GRANT_FILE"
+  for _e in $_grants; do
     [ "${_e%%:*}" != "$GATE_HOST" ] || _wait="${_e#*:}"
   done
   if [ -n "$_wait" ] && [ "$_wait" != 0 ]; then
@@ -131,7 +149,49 @@ _hold_run() {
   for ((_i = 0; _i < _n; _i++)); do
     IFS= read -r _l || exit 0
     [ -z "${FAKE_HEADER_FILE-}" ] || printf '%s\n' "$_l" >>"$FAKE_HEADER_FILE"
+    _HOLD_ENV+=("$_l")
   done
+}
+_HOLD_ENV=()
+_hold_gate() {
+  local _slug _mode _ws _n _stop=0 _rc=0 _e _entry
+  read -r _ _slug _ _ _ _ _ _mode _ <<<"$GATE_CMD"
+  # gate-root's two entries, word for word: the mode word picks one.
+  _entry='eval "$(cat)" && devbox_environment && devbox_verify'
+  [ "$_mode" != command ] || _entry='eval "$(cat)"'
+  _ws="${FAKE_WS:?}/$GATE_HOST/$_slug"
+  mkdir -p "$_ws"
+  if [ -n "${FAKE_STOP_FILE-}" ] && [ -f "$FAKE_STOP_FILE" ]; then
+    read -r _n <"$FAKE_STOP_FILE"
+    if [ "${_n:-0}" -gt 0 ]; then
+      printf '%s\n' "$((_n - 1))" >"$FAKE_STOP_FILE"
+      _stop=1
+    fi
+  fi
+  _hold_log gate "$_slug"
+  # A gate that ends before it reads its stdin, as a docker exec that fails does.
+  [ -z "${FAKE_SKIP_STDIN-}" ] || exit "$FAKE_SKIP_STDIN"
+  for _e in ${_HOLD_ENV[@]+"${_HOLD_ENV[@]}"}; do export "${_e?}"; done
+  sed "s#^_devbox_ledger_home=/home/dev/.devbox\$#_devbox_ledger_home=$_ws#" \
+    | GATE_HOST="$GATE_HOST" FAKE_STOPPING="$_stop" bash -c "$_entry" || _rc=$?
+  if [ "$_stop" = 1 ]; then
+    _hold_log stopped "$_slug"
+    echo "devbox-pool: the watchdog stopped this gate: it ran past DEVBOX_GATE_MAX_SECONDS" >&2
+    exit 79
+  fi
+  exit "$_rc"
+}
+_hold_ledger() {
+  local _slug _p _f
+  read -r _ _slug _p <<<"$GATE_CMD"
+  _hold_log ledger "$_slug"
+  case " ${FAKE_LEDGER_OLD-} " in *" $GATE_HOST "*)
+    echo "devbox-gate: unknown verb 'ledger'. This account runs devbox gate verbs only: a client older than protocol 3 sends raw commands, so update the devbox client" >&2
+    exit 2 ;;
+  esac
+  _f="${FAKE_WS:?}/$GATE_HOST/$_slug/ledger/$_p.ledger"
+  [ -f "$_f" ] || { echo "gate-root: no ledger for project $_p in workspace ws-$_slug" >&2; exit 1; }
+  cat "$_f"
 }
 HOLD
 }

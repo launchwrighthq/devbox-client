@@ -30,10 +30,11 @@ usage() {
   cat <<'EOF'
 usage: devbox <command> [args]
 
-  verify [--local | --target <name>]
+  verify [--local | --target <name>] [--fresh]
                          run this checkout's gate on the first target whose pool grants;
                          --local runs it here, --target joins one target from
-                         .devbox.env, runpod or hetzner
+                         .devbox.env, runpod or hetzner; --fresh discards the
+                         ledger of a stopped gate instead of resuming it
   run [--target <name>] -- <command>
                          run one command in this checkout's workspace on a target, never here
   runpod up|status|down   manage this checkout's temporary CPU rental

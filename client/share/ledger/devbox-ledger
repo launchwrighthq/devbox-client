@@ -1,0 +1,77 @@
+#!/bin/bash
+# devbox-ledger step <name> -- <command...>
+#
+# One step of a gate (a type check, a lint, a build) as one unit of the ledger
+# that lets a stopped gate resume. docs/specs/2026-11-13-resumable-gates-design.md
+# section 3.3 holds the record format and section 4.1 this program's contract.
+#
+# A project's verify script wraps each step in it. The host sets DEVBOX_LEDGER,
+# DEVBOX_RESUME and DEVBOX_LEDGER_TOOLS. With DEVBOX_LEDGER unset the program
+# only runs the command, so the same script also runs outside devbox.
+#
+# Exit status: the command's own code, or 2 when this program refuses its
+# arguments or cannot write the ledger, before the command runs.
+set -euo pipefail
+
+usage() { echo "usage: devbox-ledger step <name> -- <command...>" >&2; exit 2; }
+die() { echo "devbox-ledger: $*" >&2; exit 2; }
+
+[ "$#" -ge 4 ] || usage
+[ "$1" = "step" ] || usage
+name="$2"
+[ "$3" = "--" ] || usage
+shift 3
+
+# A record is one line of tab-separated fields, so a tab in a name splits it into
+# fields that the readers take for an outcome, and a newline forges a second
+# record. A forged `pass` would skip a step that never ran.
+[ -n "$name" ] || die "a step name is empty"
+case "$name" in
+  *$'\t'* | *$'\n'*) die "the step name $(printf '%q' "$name") holds a tab or a newline" ;;
+esac
+
+if [ -z "${DEVBOX_LEDGER-}" ]; then
+  exec "$@"
+fi
+ledger="$DEVBOX_LEDGER"
+
+# The LAST record of a step decides, as for a test file: a `start` written after a
+# `pass` means a later run began the step again and did not finish it. The name
+# reaches awk through ENVIRON, because `awk -v` expands backslash escapes, and a
+# name holding `\t` would then match a different step.
+step_passed() {
+  [ -f "$ledger" ] || return 1
+  LEDGER_STEP="$name" awk -F '\t' '
+    $1 == "step" && $2 == ENVIRON["LEDGER_STEP"] { last = $3 }
+    END { exit (last == "pass") ? 0 : 1 }
+  ' "$ledger"
+}
+
+# One printf of the whole line, in append mode, so that parallel steps of one
+# gate interleave whole lines and never fragments of two records.
+record() {
+  local line
+  printf -v line 'step\t%s\t%s' "$name" "$1"
+  [ "$#" -lt 2 ] || line="$line"$'\t'"$2"
+  printf '%s\n' "$line" >>"$ledger" || die "cannot append to the ledger $ledger"
+}
+
+if [ "${DEVBOX_RESUME-0}" = "1" ] && step_passed; then
+  echo "devbox-ledger: skipped step $name, it passed in an earlier run of this gate"
+  exit 0
+fi
+
+record start
+started="$SECONDS"
+rc=0
+"$@" || rc=$?
+elapsed=$((SECONDS - started))
+# Only the command's own exit 0 writes `pass`. A command the watchdog stops
+# either returns a non-zero code here or takes this program down with it, so its
+# step ends as `fail` or stays `start`, and both run again on a resume.
+if [ "$rc" -eq 0 ]; then
+  record pass "$elapsed"
+else
+  record fail "$elapsed"
+fi
+exit "$rc"
