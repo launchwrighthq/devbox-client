@@ -1,0 +1,318 @@
+#!/bin/bash
+# Parse and check a project's .devbox/steps into the STEP_* variables that the
+# plan and the runner read (docs/specs/2026-11-14-client-owns-the-gate-design.md,
+# sections 4.2 and 6.7).
+# shellcheck shell=bash
+
+# Every rule of section 4.2 is checked here, on the laptop, before any target is
+# asked (D2). A broken file found on the host would fail the gate only after the
+# queue wait, the sync and the setup had spent their minutes on it.
+
+# One stderr line per refusal. It prints and returns 0, and its caller returns 2,
+# so a caller that runs under `set -e` still gets the 2 instead of an exit on
+# the print.
+_devbox_steps_refuse() {
+  echo "devbox verify: .devbox/steps line $1: $2" >&2
+}
+
+# Clear every variable of section 6.7. `declare -g` because the caller is often
+# a function, and a plain `declare` there would make the arrays local to this
+# one and gone on return.
+_devbox_steps_reset() {
+  declare -ga STEP_NAMES=()
+  declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
+    STEP_SELECT=() STEP_RERUN=() STEP_CMD=() STEP_SOURCE=()
+}
+
+# Print the directories under <root> that the `each` pattern <pattern> names,
+# relative to <root>, each with its trailing `/`, in byte order. A directory
+# counts only when it holds a regular file somewhere under it: a directory left
+# empty on disk after a branch switch would otherwise become a step whose
+# command fails on a missing tsconfig or project. Git tracks no empty
+# directory, so the sync never ships one.
+#
+# In a subshell, because a caller's noglob, failglob, dotglob or nocaseglob
+# would change what the pattern matches, and the shopt state must not leak back.
+devbox_steps_each_dirs() {
+  local root="$1" pattern="$2"
+  (
+    set +f
+    shopt -s nullglob
+    shopt -u failglob dotglob nocaseglob
+    local IFS='' d
+    # shellcheck disable=SC2086 # the pattern must glob; IFS is empty, so it is never split
+    for d in "$root"/$pattern; do
+      [ -d "$d" ] || continue
+      [ -n "$(find "$d" -type f -print -quit)" ] || continue
+      printf '%s\n' "${d#"$root"/}"
+    done | LC_ALL=C sort
+  )
+}
+
+# Replace {dir} and {name} in $1 with $2 and $3. The replacement is quoted,
+# because bash 5.2 reads an unquoted `&` there as the matched text.
+_devbox_steps_sub() {
+  local s="$1"
+  s="${s//'{dir}'/"$2"}"
+  s="${s//'{name}'/"$3"}"
+  printf '%s' "$s"
+}
+
+# Add one expanded step. Runs inside devbox_steps_load and writes its locals
+# _line_of, _after_raw and _tmpl.
+#   $1 line  $2 name  $3 after (comma list)  $4 inputs (comma list)  $5 command
+#   $6 runner  $7 narrow  $8 select  $9 rerun  $10 the template name of an
+#   `each` line, or empty
+_devbox_steps_add() {
+  local n="$1" name="$2" after="$3" inputs="$4" cmd="$5" stripped count
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9:_-]*$ ]]; then
+    _devbox_steps_refuse "$n" "step name \"$name\" is not [a-z0-9][a-z0-9:_-]*"; return 2
+  fi
+  if [ -n "${_line_of[$name]+x}" ]; then
+    _devbox_steps_refuse "$n" "step name \"$name\" is already used on line ${_line_of[$name]}"; return 2
+  fi
+  # select=related rewrites `vitest run` into `vitest related --run`
+  # (section 6.4), so the command must name it once: with none there is nothing
+  # to rewrite, and with two the client cannot know which run to narrow.
+  if [ "$8" = related ]; then
+    stripped="${cmd//vitest run/}"
+    count=$(( (${#cmd} - ${#stripped}) / 10 ))
+    if [ "$count" -ne 1 ]; then
+      _devbox_steps_refuse "$n" "select=related needs \"vitest run\" exactly once in the command, and it holds $count"; return 2
+    fi
+  fi
+  _line_of[$name]="$n"
+  _after_raw[$name]="$after"
+  STEP_NAMES+=("$name")
+  STEP_INPUTS[$name]="${inputs//,/$'\n'}"
+  STEP_RUNNER[$name]="$6"
+  STEP_NARROW[$name]="$7"
+  STEP_SELECT[$name]="$8"
+  STEP_RERUN[$name]="$9"
+  STEP_CMD[$name]="$cmd"
+  STEP_AFTER[$name]=""
+  [ -z "${10}" ] || _tmpl[${10}]+="$name "
+}
+
+# Parse one line that is neither blank nor a comment. Runs inside
+# devbox_steps_load. $1 the line number, $2 the trimmed line, $3 the root.
+_devbox_steps_line() {
+  local n="$1" line="$2" root="$3" head rest cmd name w key val given=" "
+  local a_each="" a_after="" a_inputs="" a_runner="" a_narrow="" a_select="" a_rerun=""
+  local dirs dir mod
+  local -a words
+  case "$line" in --|--[[:space:]]*)
+    _devbox_steps_refuse "$n" "the line names no step before \" -- \""; return 2 ;;
+  esac
+  # The first ` -- ` ends the words, and everything after it is the command as
+  # written, a later ` -- ` included: `npm test -- --run` must reach the
+  # workspace bash unchanged.
+  head="${line%%[[:space:]]--[[:space:]]*}"
+  if [ "$head" = "$line" ]; then
+    case "$line" in *[[:space:]]--)
+      _devbox_steps_refuse "$n" "the command after \" -- \" is empty"; return 2 ;;
+    esac
+    _devbox_steps_refuse "$n" "no \" -- \" between the step and its command"; return 2
+  fi
+  rest="${line:${#head}+3}"
+  cmd="${rest#"${rest%%[![:space:]]*}"}"
+
+  read -ra words <<<"$head"
+  name="${words[0]}"
+  for w in "${words[@]:1}"; do
+    case "$w" in *=*) ;; *)
+      _devbox_steps_refuse "$n" "attribute \"$w\" has no \"=\""; return 2 ;;
+    esac
+    key="${w%%=*}"
+    val="${w#*=}"
+    case "$key" in each|after|inputs|runner|narrow|select|rerun) ;; *)
+      _devbox_steps_refuse "$n" "unknown attribute \"$key\""; return 2 ;;
+    esac
+    case "$given" in *" $key "*)
+      _devbox_steps_refuse "$n" "attribute \"$key\" is given twice"; return 2 ;;
+    esac
+    given+="$key "
+    if [ -z "$val" ]; then
+      _devbox_steps_refuse "$n" "attribute \"$key\" has no value"; return 2
+    fi
+    printf -v "a_$key" '%s' "$val"
+  done
+
+  case "$a_runner" in ""|vitest|pytest) ;; *)
+    _devbox_steps_refuse "$n" "runner must be vitest or pytest, not \"$a_runner\""; return 2 ;;
+  esac
+  case "$a_narrow" in ""|failed) ;; *)
+    _devbox_steps_refuse "$n" "narrow must be failed, not \"$a_narrow\""; return 2 ;;
+  esac
+  case "$a_select" in ""|related) ;; *)
+    _devbox_steps_refuse "$n" "select must be related, not \"$a_select\""; return 2 ;;
+  esac
+  case "$a_rerun" in ""|always) ;; *)
+    _devbox_steps_refuse "$n" "rerun must be always, not \"$a_rerun\""; return 2 ;;
+  esac
+  for key in after inputs; do
+    val="a_$key"
+    [ -n "${!val}" ] || continue
+    case ",${!val}," in *,,*)
+      _devbox_steps_refuse "$n" "$key=${!val} holds an empty entry"; return 2 ;;
+    esac
+  done
+  # narrow=failed needs the runner's ledger to know which files failed, and
+  # select=related needs vitest's own import graph (section 6.4, D14).
+  if [ -n "$a_narrow" ] && [ -z "$a_runner" ]; then
+    _devbox_steps_refuse "$n" "narrow=failed needs runner=vitest or runner=pytest"; return 2
+  fi
+  if [ -n "$a_select" ] && [ "$a_runner" != vitest ]; then
+    _devbox_steps_refuse "$n" "select=related needs runner=vitest"; return 2
+  fi
+
+  if [ -z "$a_each" ]; then
+    _devbox_steps_add "$n" "$name" "$a_after" "$a_inputs" "$cmd" \
+      "$a_runner" "$a_narrow" "$a_select" "$a_rerun" "" || return 2
+    return 0
+  fi
+  case "$a_each" in */) ;; *)
+    _devbox_steps_refuse "$n" "each=$a_each must end in \"/\""; return 2 ;;
+  esac
+  # Without {name}, every module's step would carry one name, and the second
+  # module would read as a duplicate of the first.
+  case "$name" in *'{name}'*) ;; *)
+    _devbox_steps_refuse "$n" "a step with each= must hold {name} in its name"; return 2 ;;
+  esac
+  dirs="$(devbox_steps_each_dirs "$root" "$a_each")"
+  if [ -z "$dirs" ]; then
+    _devbox_steps_refuse "$n" "each=$a_each matches no directory that holds a file"; return 2
+  fi
+  while IFS= read -r dir; do
+    mod="${dir%/}"
+    mod="${mod##*/}"
+    _devbox_steps_add "$n" "$(_devbox_steps_sub "$name" "$dir" "$mod")" \
+      "$(_devbox_steps_sub "$a_after" "$dir" "$mod")" \
+      "$(_devbox_steps_sub "$a_inputs" "$dir" "$mod")" \
+      "$(_devbox_steps_sub "$cmd" "$dir" "$mod")" \
+      "$a_runner" "$a_narrow" "$a_select" "$a_rerun" "$name" || return 2
+  done <<<"$dirs"
+}
+
+# Depth-first walk of the `after` graph from $1. $2 is the walk so far, space
+# padded. Runs inside devbox_steps_load and writes its local _color. Without
+# this check, two steps that wait on each other would hold a granted host with
+# no step running, until the watchdog stops the gate for doing no work.
+_devbox_steps_visit() {
+  local s="$1" walk="$2" next rest
+  local -a nexts
+  _color[$s]=1
+  read -ra nexts <<<"${STEP_AFTER[$s]}"
+  for next in "${nexts[@]+"${nexts[@]}"}"; do
+    case "${_color[$next]:-0}" in
+      1)
+        rest="${walk#*" $next "}"
+        rest="$next $rest$next"
+        _devbox_steps_refuse "${_line_of[$s]}" "after makes a cycle: ${rest// / -> }"
+        return 2 ;;
+      0) _devbox_steps_visit "$next" "$walk$next " || return 2 ;;
+    esac
+  done
+  _color[$s]=2
+}
+
+# The expanded step as one canonical string, which the step key hashes: the
+# name, then each attribute that is set in a fixed order with its list sorted,
+# then ` -- ` and the command. Two spellings of one step, attributes in another
+# order or extra blanks between words, give one string, so a cosmetic edit of
+# the file does not throw away every carried pass.
+_devbox_steps_source() {
+  local name="$1" src="$1" list="" item
+  local -a items
+  read -ra items <<<"${STEP_AFTER[$name]}"
+  if [ "${#items[@]}" -gt 0 ]; then
+    while IFS= read -r item; do list+="${list:+,}$item"; done \
+      < <(printf '%s\n' "${items[@]}" | LC_ALL=C sort -u)
+    src+=" after=$list"
+  fi
+  list=""
+  if [ -n "${STEP_INPUTS[$name]}" ]; then
+    while IFS= read -r item; do list+="${list:+,}$item"; done \
+      < <(printf '%s\n' "${STEP_INPUTS[$name]}" | LC_ALL=C sort -u)
+    src+=" inputs=$list"
+  fi
+  [ -z "${STEP_NARROW[$name]}" ] || src+=" narrow=${STEP_NARROW[$name]}"
+  [ -z "${STEP_RERUN[$name]}" ] || src+=" rerun=${STEP_RERUN[$name]}"
+  [ -z "${STEP_RUNNER[$name]}" ] || src+=" runner=${STEP_RUNNER[$name]}"
+  [ -z "${STEP_SELECT[$name]}" ] || src+=" select=${STEP_SELECT[$name]}"
+  STEP_SOURCE[$name]="$src -- ${STEP_CMD[$name]}"
+}
+
+# devbox_steps_load <file> [<root>]
+# Fill the STEP_* variables of section 6.7 from <file>, or return 2 with one
+# line on stderr. <root> is the checkout that `each` patterns match against,
+# the parent of the file's directory when it is not given.
+devbox_steps_load() {
+  local file="$1" root="${2:-}" n=0 line name tok resolved t
+  local -a toks list
+  local -A _line_of=() _after_raw=() _tmpl=() _color=()
+  [ -n "$root" ] || root="$(dirname "$(dirname "$file")")"
+  _devbox_steps_reset
+  if [ ! -r "$file" ]; then
+    echo "devbox verify: cannot read $file" >&2; return 2
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ""|"#"*) continue ;; esac
+    _devbox_steps_line "$n" "$line" "$root" || return 2
+  done <"$file"
+
+  # `after` resolves only once the whole file is read, so a step may name one
+  # defined below it. A name that holds {name} on a line without each= waits
+  # for every module's step of that each= line.
+  for name in "${STEP_NAMES[@]+"${STEP_NAMES[@]}"}"; do
+    [ -n "${_after_raw[$name]}" ] || continue
+    resolved=" "
+    IFS=, read -ra toks <<<"${_after_raw[$name]}"
+    for tok in "${toks[@]}"; do
+      if [ -n "${_line_of[$tok]+x}" ]; then
+        list=("$tok")
+      elif [ -n "${_tmpl[$tok]+x}" ]; then
+        read -ra list <<<"${_tmpl[$tok]}"
+      else
+        _devbox_steps_refuse "${_line_of[$name]}" "after names \"$tok\", which is no step"; return 2
+      fi
+      for t in "${list[@]}"; do
+        case "$resolved" in *" $t "*) ;; *) resolved+="$t " ;; esac
+      done
+    done
+    resolved="${resolved# }"
+    STEP_AFTER[$name]="${resolved% }"
+  done
+
+  for name in "${STEP_NAMES[@]+"${STEP_NAMES[@]}"}"; do
+    if [ "${_color[$name]:-0}" = 0 ]; then
+      _devbox_steps_visit "$name" " $name " || return 2
+    fi
+  done
+  for name in "${STEP_NAMES[@]+"${STEP_NAMES[@]}"}"; do
+    _devbox_steps_source "$name"
+  done
+}
+
+# devbox_steps_from_verify <command>
+# A project with no .devbox/steps and a DEVBOX_VERIFY runs that command as one
+# step named `verify`, with no attribute (section 6.7).
+devbox_steps_from_verify() {
+  _devbox_steps_reset
+  if [ -z "$1" ]; then
+    echo "devbox verify: DEVBOX_VERIFY is empty, so there is no step to run" >&2; return 2
+  fi
+  STEP_NAMES=(verify)
+  STEP_AFTER[verify]=""
+  STEP_INPUTS[verify]=""
+  STEP_RUNNER[verify]=""
+  STEP_NARROW[verify]=""
+  STEP_SELECT[verify]=""
+  STEP_RERUN[verify]=""
+  STEP_CMD[verify]="$1"
+  # shellcheck disable=SC2034 # read by the plan, which the caller sources beside this file
+  STEP_SOURCE[verify]="verify -- $1"
+}

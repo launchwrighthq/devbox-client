@@ -65,15 +65,51 @@ devbox_kv_parse() {
 DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
 DEVBOX_FORWARD_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR DEVBOX_RUNPOD_IMAGE \
 DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
-DEVBOX_MAX_RESUMES "
+DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS DEVBOX_LOCAL_GATE "
 
+# A path of DEVBOX_SETUP_INPUTS or DEVBOX_SHARED_INPUTS, relative to the
+# checkout root. The laptop hashes each one, and the steps hand them to other
+# tools, so a path that leaves the checkout, starts with a dash, or holds a
+# glob, a quote or a space is refused here, once, before anything reads it.
+devbox_config_paths_ok() {
+  local key="$1" value="$2" file="$3" path
+  local -a paths=()
+  read -r -a paths <<<"$value"
+  for path in ${paths[@]+"${paths[@]}"}; do
+    if [[ ! "$path" =~ ^[A-Za-z0-9._+@][A-Za-z0-9._+@/-]*$ ]] || [[ "/$path/" == */../* ]]; then
+      echo "devbox: $file: refusing $key '$path': write paths relative to the checkout root, separated by spaces, with no '..', no leading '/' or '-', and only letters, digits and . _ + @ / -" >&2
+      return 2
+    fi
+  done
+}
+
+# shellcheck disable=SC2034  # DEVBOX_RERUN_CONFIG is read by devbox-verify
 devbox_config_parse() {
-  local file="$1" image="${DEVBOX_RUNPOD_IMAGE:-}" key
-  devbox_kv_parse "$file" "$DEVBOX_CONFIG_KEYS" || return 2
+  local file="$1" image="${DEVBOX_RUNPOD_IMAGE:-}" key rc=0 rerun_file
+  local rerun_env="${DEVBOX_RERUN-}" rerun_env_set="${DEVBOX_RERUN+x}"
+  devbox_kv_parse "$file" "$DEVBOX_CONFIG_KEYS" || rc=2
+  # DEVBOX_RERUN (spec D13): a flag beats the environment, the environment
+  # beats this file, and the file beats `changed`. The parser sets each key it
+  # reads as a shell variable of the same name, so a file line would replace
+  # the value a developer exported, and the caller could no longer tell the
+  # two apart. The file's value goes to DEVBOX_RERUN_CONFIG below, and
+  # DEVBOX_RERUN is put back as the environment left it, on a refusal too.
+  rerun_file="${DEVBOX_RERUN-}"
+  if [ -n "$rerun_env_set" ]; then DEVBOX_RERUN="$rerun_env"; else unset DEVBOX_RERUN; fi
+  [ "$rc" = 0 ] || return 2
   # The image is a default: a developer's .devbox.env, read first, may pick another.
   [ -z "$image" ] || DEVBOX_RUNPOD_IMAGE="$image"
   for key in DEVBOX_PROJECT DEVBOX_SETUP DEVBOX_VERIFY; do
-    case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) echo "devbox: $file sets no $key" >&2; return 2 ;; esac
+    case "$DEVBOX_KV_SEEN" in *" $key "*) continue ;; esac
+    # A project that describes its gate in .devbox/steps beside this file
+    # needs no DEVBOX_VERIFY (client-owns-the-gate spec, D2): a migrated
+    # project that had to keep a dead command here would keep a second gate
+    # that nothing runs.
+    if [ "$key" = DEVBOX_VERIFY ] && [ -f "$(dirname "$file")/steps" ]; then
+      DEVBOX_VERIFY=""
+      continue
+    fi
+    echo "devbox: $file sets no $key" >&2; return 2
   done
   # DEVBOX_LANES, the workspaces one worktree may hold on each target. MEASURED:
   # several runs of one worktree waited on one host's lock for tens of minutes
@@ -104,6 +140,52 @@ devbox_config_parse() {
       esac ;;
     *) DEVBOX_MAX_RESUMES=1 ;;
   esac
+  case "$DEVBOX_KV_SEEN" in
+    *" DEVBOX_RERUN "*)
+      case "$rerun_file" in
+        changed|full) DEVBOX_RERUN_CONFIG="$rerun_file" ;;
+        *) echo "devbox: $file: refusing DEVBOX_RERUN '$rerun_file': write changed or full" >&2; return 2 ;;
+      esac ;;
+    *) DEVBOX_RERUN_CONFIG="" ;;
+  esac
+  # The two input lists and the local gate rule come from the committed file
+  # alone, as DEVBOX_LANES does: an exported DEVBOX_SETUP_INPUTS would skip a
+  # setup the project's lock files say must run, and an exported
+  # DEVBOX_LOCAL_GATE would run a gate on a laptop the project refused (D11).
+  for key in DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS; do
+    case "$DEVBOX_KV_SEEN" in
+      *" $key "*) devbox_config_paths_ok "$key" "${!key}" "$file" || return 2 ;;
+      *) printf -v "$key" '%s' "" ;;
+    esac
+  done
+  case "$DEVBOX_KV_SEEN" in
+    *" DEVBOX_LOCAL_GATE "*)
+      case "$DEVBOX_LOCAL_GATE" in
+        always|ci|never) ;;
+        *) echo "devbox: $file: refusing DEVBOX_LOCAL_GATE '$DEVBOX_LOCAL_GATE': write always, ci or never" >&2; return 2 ;;
+      esac ;;
+    *) DEVBOX_LOCAL_GATE=always ;;
+  esac
+}
+
+# Whether a checkout with no .devbox.env may run its gate on this machine
+# (spec D11). $1 is 1 when the developer passed --local, else 0. Returns 0 to
+# run it, and 1 with the refusal on stderr; the caller exits 2.
+#
+# A missing .devbox.env ran the whole gate on the laptop with one notice line:
+# concurrent gates of several worktrees put more test workers on one laptop
+# than it had cores. `ci` keeps a CI job, which has no .devbox.env, and a
+# developer who asks by name. `never` refuses both.
+devbox_local_gate_allowed() {
+  case "${DEVBOX_LOCAL_GATE:-always}" in
+    always) return 0 ;;
+    ci)
+      [ -z "${CI:-}" ] && [ "${1:-0}" != 1 ] || return 0
+      echo "devbox verify: no .devbox.env, and DEVBOX_LOCAL_GATE=ci refuses a gate on this machine; pass --local, or set CI in a CI job" >&2 ;;
+    *)
+      echo "devbox verify: no .devbox.env, and DEVBOX_LOCAL_GATE=$DEVBOX_LOCAL_GATE refuses a gate on this machine; write a .devbox.env that names a target" >&2 ;;
+  esac
+  return 1
 }
 
 # Load the config of the checkout in $PWD. Sets DEVBOX_CONFIG, the file to name
@@ -349,11 +431,115 @@ devbox_forward_name() {
 # command from config.env ever becomes part of an ssh argv. The remote entry
 # still ends in `devbox_setup` or `devbox_verify`, a stable name that a caller
 # can match.
+#
+# With DEVBOX_SETUP_INPUTS set, devbox_setup skips the project's setup when
+# the key of devbox_setup_key equals the key the last passed setup wrote in
+# this workspace, and its outputs exist (spec section 6.6). MEASURED: a
+# one-file test run lost its grant twice, because the sync and a full `npm ci`
+# of an unchanged lock file outlasted DEVBOX_HOLD_PREP_SECONDS each time. The
+# key crosses as a constant in this text: it is a hash, never a secret. The
+# setup body keeps its own function, called as a plain command, so set -e
+# stops it on a failed line as it did when it was devbox_setup itself; a call
+# under `||` or `if` would switch set -e off for the whole body.
+#
+# The key files live in DEVBOX_SETUP_KEY_DIR, the workspace home volume, which
+# a collected workspace loses with its node_modules/. A caller that runs the
+# hooks on this machine sets it to a directory of its own before it calls
+# devbox_hooks_script; the value is fixed into the text here.
+DEVBOX_SETUP_KEY_DIR=/home/dev/.devbox/setup
 devbox_hooks_script() {
+  local key=""
+  if [ -n "${DEVBOX_SETUP_INPUTS:-}" ]; then
+    key="$(devbox_setup_key)" || return 1
+  fi
   printf 'devbox_environment() {\n%s\n}\n' "${DEVBOX_ENVIRONMENT:-:}"
   [ -z "${DEVBOX_PROVISION:-}" ] || printf 'devbox_provision() {\n%s\n}\n' "$DEVBOX_PROVISION"
-  printf 'devbox_setup() {\n%s\n}\n' "$DEVBOX_SETUP"
-  printf 'devbox_verify() {\n%s\n}\n' "$DEVBOX_VERIFY"
+  if [ -z "$key" ]; then
+    printf 'devbox_setup() {\n%s\n}\n' "$DEVBOX_SETUP"
+  else
+    printf '_devbox_setup_body() {\n%s\n}\n' "$DEVBOX_SETUP"
+    printf 'devbox_setup() {\n'
+    printf '  local _devbox_setup_dir=%q _devbox_setup_want=%q _devbox_setup_inputs=%q\n' \
+      "$DEVBOX_SETUP_KEY_DIR" "$key" "$DEVBOX_SETUP_INPUTS"
+    printf '  local _devbox_setup_file=%q _devbox_setup_have="" _devbox_setup_rc\n' \
+      "$DEVBOX_SETUP_KEY_DIR/$DEVBOX_PROJECT.key"
+    cat <<'SETUP'
+  # A key file with no complete line reads as no key, so the setup runs.
+  [ ! -r "$_devbox_setup_file" ] || read -r _devbox_setup_have <"$_devbox_setup_file" || _devbox_setup_have=""
+  # A collected volume, or a project that removed node_modules/, keeps no
+  # outputs, and an equal key must not skip the setup that makes them. Only a
+  # lock file the inputs name asks for its output, beside it: a lock file
+  # the setup does not install gets no output, and a test of every root lock
+  # file ran the whole setup on every gate, MEASURED.
+  local _devbox_setup_in _devbox_setup_d _devbox_setup_out=1
+  for _devbox_setup_in in $_devbox_setup_inputs; do
+    [ -f "$_devbox_setup_in" ] || continue
+    case "$_devbox_setup_in" in */*) _devbox_setup_d="${_devbox_setup_in%/*}" ;; *) _devbox_setup_d=. ;; esac
+    case "${_devbox_setup_in##*/}" in
+      package-lock.json) [ -d "$_devbox_setup_d/node_modules" ] || _devbox_setup_out=0 ;;
+      uv.lock) [ -d "$_devbox_setup_d/.venv" ] || _devbox_setup_out=0 ;;
+    esac
+  done
+  if [ "$_devbox_setup_want" = "$_devbox_setup_have" ] && [ "$_devbox_setup_out" = 1 ]; then
+    echo "==> setup: skipped, $_devbox_setup_inputs unchanged since the last setup here"
+    return 0
+  fi
+  # Removed before the setup runs: a setup that fails halfway must not leave
+  # the key of the last one that passed.
+  rm -f -- "$_devbox_setup_file" || return
+  _devbox_setup_body
+  _devbox_setup_rc=$?
+  [ "$_devbox_setup_rc" -eq 0 ] || return "$_devbox_setup_rc"
+  if ! { mkdir -p -- "$_devbox_setup_dir" &&
+    printf '%s\n' "$_devbox_setup_want" >"$_devbox_setup_file.tmp" &&
+    mv -f -- "$_devbox_setup_file.tmp" "$_devbox_setup_file"; }; then
+    echo "devbox: the setup passed, and $_devbox_setup_file could not be written, so the next gate here runs the setup again" >&2
+  fi
+}
+SETUP
+  fi
+  if [ -n "${DEVBOX_VERIFY:-}" ]; then
+    printf 'devbox_verify() {\n%s\n}\n' "$DEVBOX_VERIFY"
+  else
+    # A project with .devbox/steps sets no DEVBOX_VERIFY, and an empty function
+    # body is a syntax error in the workspace bash. The body fails, so a gate
+    # whose step hooks did not arrive can never pass by running nothing.
+    printf 'devbox_verify() {\necho "devbox: this gate has no DEVBOX_VERIFY and no step plan reached the workspace, so nothing ran" >&2\nreturn 2\n}\n'
+  fi
+  # The step runner and the plan, when devbox-verify planned a gate
+  # (devbox_steps_hooks below). Here, and not appended by each caller, because
+  # three paths send these hooks: a deployed target and the rented Hetzner
+  # server in the gate's stdin, a RunPod pod in its run script, and this
+  # machine for --local.
+  [ -z "${DEVBOX_STEPS_HOOKS:-}" ] || printf '%s\n' "$DEVBOX_STEPS_HOOKS"
+}
+
+# Print the setup key: the sha256 of the DEVBOX_SETUP text and of each
+# DEVBOX_SETUP_INPUTS file, in the list's order, read on the laptop from the
+# checkout in $PWD, before the sync sends the same files. A missing file
+# enters the key as `missing <path>`, never as an error: a lock file the
+# project deleted changes the key, so the setup runs. Every line is fixed in
+# form, and the setup text enters as its own hash, so no setup text can pose
+# as a file line.
+devbox_setup_key() {
+  local path sum text
+  local -a paths=()
+  sum="$(printf '%s' "${DEVBOX_SETUP-}" | sha256sum)" || return 1
+  text="setup ${sum%% *}"$'\n'
+  read -r -a paths <<<"${DEVBOX_SETUP_INPUTS:-}"
+  for path in ${paths[@]+"${paths[@]}"}; do
+    if [ -f "$path" ]; then
+      sum="$(sha256sum <"$path")" || { echo "devbox: could not read $path, a DEVBOX_SETUP_INPUTS file" >&2; return 1; }
+      text+="file $path ${sum%% *}"$'\n'
+    elif [ -e "$path" ]; then
+      echo "devbox: DEVBOX_SETUP_INPUTS names $path, which is not a file" >&2
+      return 1
+    else
+      text+="missing $path"$'\n'
+    fi
+  done
+  sum="$(printf '%s' "$text" | sha256sum)" || return 1
+  printf '%s\n' "${sum%% *}"
 }
 
 # ── the ledger of a resumable gate ───────────────────────────────────────────
@@ -383,7 +569,15 @@ devbox_ledger_key_input() {
   shift 2
   { printf 'version\n' && cat -- "$version"; } || return 1
   printf 'files\n'
-  devbox_sync_manifest "$dest" || return 1
+  # devbox-verify lists the files once, for the step keys of its plan, and
+  # names that listing in DEVBOX_MANIFEST_FILE. A second rsync dry run and a
+  # second sha256 of every synced file would double the wait before the queue
+  # on a large checkout.
+  if [ -n "${DEVBOX_MANIFEST_FILE:-}" ]; then
+    cat -- "$DEVBOX_MANIFEST_FILE" || return 1
+  else
+    devbox_sync_manifest "$dest" || return 1
+  fi
   { printf 'config\n' && cat -- "$DEVBOX_CONFIG"; } || return 1
   printf 'forward\n'
   [ "$#" -eq 0 ] || sorted="$(printf '%s\n' "$@" | LC_ALL=C sort)" || return 1
@@ -432,4 +626,72 @@ devbox_ledger_hooks() {
   # shellcheck disable=SC2016  # expanded by the workspace bash, never here
   printf '  export DEVBOX_LEDGER="$d/ledger/%s.ledger" DEVBOX_RESUME=%s DEVBOX_LEDGER_TOOLS="$d/ledger-tools"\n}\n' "$project" "$resume"
   printf '_devbox_ledger_prepare || { echo "devbox: could not write the ledger or its tools under %s in the workspace, so the gate did not run" >&2; false; }\n' "$home"
+}
+
+# ── the step runner of a planned gate ────────────────────────────────────────
+#
+# Every consumer ran its steps with a runner of its own, in front of the
+# client, and two copies of one design already disagreed
+# (docs/specs/2026-11-14-client-owns-the-gate-design.md, section 1). The
+# client's runner, client/share/steps/devbox-steps, runs them now.
+DEVBOX_STEPS_RUNNER="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/..")/share/steps/devbox-steps"
+
+# Print the shell text that replaces devbox_verify with the runner and its
+# plan (section 6.3). devbox_hooks_script appends it from DEVBOX_STEPS_HOOKS.
+#   $1  remote: the runner and the plan cross as base64 inside single quotes,
+#       as the ledger tools do, and are written under $2 in the workspace;
+#       local: the runner is this client's own file and the plan stays where
+#       it is, with only the logs under $2
+#   $2  the directory of the logs, and in a workspace of the runner and plan
+#   $3  the plan file on this machine
+#   $4  the run id, the name of this gate's log directory
+#   $5  1 when the runner writes its own `step` ledger lines, 0 for the one
+#       step of a DEVBOX_VERIFY gate, which writes its own ledger
+#
+# The function ends in exec, so the workspace's gate process is the runner
+# itself: a signal to the gate reaches the runner's own trap, which stops the
+# process group of every step it started. A shell in between would die of the
+# signal with no trap, and leave the steps running.
+#
+# Only the logs of this run stay in the directory. Without that, a workspace
+# volume would keep the step logs of every gate it ran, and the collector that
+# runs when the disk is nearly full evicts whole workspaces.
+devbox_steps_hooks() {
+  local mode="$1" home="$2" plan="$3" run="$4" lines="$5" b64 runner_b64
+  printf '_devbox_steps_home=%q\n' "$home"
+  printf 'devbox_verify() {\n'
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf '  local _d="$_devbox_steps_home" _o\n'
+  if [ "$mode" = remote ]; then
+    runner_b64="$(base64 <"$DEVBOX_STEPS_RUNNER" | tr -d '\n')" || return 1
+    b64="$(base64 <"$plan" | tr -d '\n')" || return 1
+    # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+    printf '  if ! { mkdir -p "$_d/steps" "$_d/logs" &&\n'
+    printf "    printf '%%s' '%s' | base64 -d >\"\$_d/steps/devbox-steps.tmp\" &&\n" "$runner_b64"
+    # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+    printf '    mv -f "$_d/steps/devbox-steps.tmp" "$_d/steps/devbox-steps" &&\n'
+    printf "    printf '%%s' '%s' | base64 -d >\"\$_d/steps/plan\"; }; then\n" "$b64"
+    # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+    printf '    echo "devbox: could not write the step runner or its plan under $_d, so the gate did not run" >&2\n'
+    printf '    return 2\n  fi\n'
+  else
+    # shellcheck disable=SC2016  # expanded by the bash that runs the gate, never here
+    printf '  mkdir -p "$_d/logs" || { echo "devbox: could not create $_d/logs, so the gate did not run" >&2; return 2; }\n'
+  fi
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf '  for _o in "$_d"/logs/*; do [ "$_o" = "$_d/logs/%s" ] || rm -rf -- "$_o"; done\n' "$run"
+  if [ "$mode" = remote ]; then
+    # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+    printf '  export DEVBOX_STEPS_PLAN="$_d/steps/plan"'
+  else
+    printf '  export DEVBOX_STEPS_PLAN=%q' "$plan"
+  fi
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf ' DEVBOX_STEPS_LOGS="$_d/logs/%s" DEVBOX_RUN_ID=%q DEVBOX_STEPS_STEP_LINES=%q\n' "$run" "$run" "$lines"
+  if [ "$mode" = remote ]; then
+    # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+    printf '  exec bash "$_d/steps/devbox-steps"\n}\n'
+  else
+    printf '  exec bash %q\n}\n' "$DEVBOX_STEPS_RUNNER"
+  fi
 }

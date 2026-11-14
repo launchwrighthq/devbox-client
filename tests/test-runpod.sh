@@ -117,8 +117,13 @@ mkdir -p "$TMP/client/client/libexec" "$TMP/client/client/bin" "$TMP/client/lib"
 cp "$REPO/client/bin/devbox" "$TMP/client/client/bin/"
 cp "$REPO/client/libexec/devbox-verify" "$REPO/client/libexec/devbox-run" "$REPO/client/libexec/devbox-config" \
   "$REPO/client/libexec/devbox-transport" "$REPO/client/libexec/devbox-targets" "$REPO/client/libexec/devbox-askpass" "$REPO/client/libexec/devbox-sync" \
+  "$REPO/client/libexec/devbox-steps-file" "$REPO/client/libexec/devbox-plan" "$REPO/client/libexec/devbox-record" "$REPO/client/libexec/devbox-cancel" \
   "$TMP/client/client/libexec/"
 cp "$REPO/lib/devbox-lib.sh" "$TMP/client/lib/"
+# The plan keys every step by the client version, and the step runner crosses
+# in the hooks, so the tree needs both.
+cp "$REPO/VERSION" "$TMP/client/"
+cp -R "$REPO/client/share" "$TMP/client/client/"
 cat > "$TMP/client/client/libexec/devbox-runpod" <<'BACKEND'
 printf 'target=%s action=%s mode=%s\n' "${FORCE_TARGET:-rent}" "$RUNPOD_ACTION" "$RUN_MODE"
 if [ "$RUN_MODE" = 1 ]; then eval "$RUN_SCRIPT"; else exit 17; fi
@@ -240,7 +245,11 @@ case "$inner" in
     [ "${POD_SSH_FAILS:-0}" != 1 ] || exit 255
     inner="${inner#runuser -u dev -- }"
     exec bash -c "${inner//\/opt\/devbox\/client\/libexec/$POD_LIBEXEC}" ;;
-  *) [ -t 0 ] || cat >/dev/null ;;
+  *) [ -t 0 ] || cat >/dev/null
+     if [ -n "${POD_GATE_SLEEP-}" ] && [ "$inner" = 'runuser -u dev -- bash -se' ]; then
+       printf '%s\n' "$$" > "$POD_LOG.gate-pid"
+       exec sleep "$POD_GATE_SLEEP"
+     fi ;;
 esac
 SSH
 chmod +x "$TMP/podbin/rsync" "$TMP/podbin/ssh"
@@ -290,4 +299,35 @@ assert_eq 0 "$(cat "$TMP/own-exit")" 'and is not marked as a refusal'
 pod_run ''
 assert_eq 0 "$?" 'a project with no DEVBOX_REQUIRES runs its gate'
 assert_fail 'and pays no check' grep -q devbox-requires-local "$TMP/pod.log"
+
+# A cancel of a verify gate on a pod. The gate ran as a foreground pipeline, and
+# bash runs a trap only after a foreground command ends, so a newer gate's TERM
+# waited for the whole pod gate, and the gate's real result was then reported as
+# cancelled. The stop helper is devbox-verify's own.
+cat > "$TMP/execute-steps.sh" <<'DRIVER'
+eval "$(sed -n '/^steps_stop_job() {/,/^}/p' "$REPO/client/libexec/devbox-verify")"
+STEPS_JOB_PID="" STEPS_ACTIVE=1
+steps_display() { tee "$1"; }
+steps_gate_finish() { STEPS_GATE_CODE="$2"; }
+steps_on_term() { steps_stop_job; exit 143; }
+steps_on_int() { steps_stop_job; exit 130; }
+trap steps_on_term TERM
+DRIVER
+sed '/^runpod_execute$/d' "$TMP/execute.sh" > "$TMP/execute-term.sh"
+# shellcheck disable=SC2016  # the driver expands $TMP when it runs, not here
+printf 'source "$TMP/execute-steps.sh"\nrunpod_execute\n' >> "$TMP/execute-term.sh"
+rm -f "$TMP/pod.log" "$TMP/pod.log.gate-pid"
+POD_REQUIRES='' POD_GATE_SLEEP=60 POD_LOG="$TMP/pod.log" POD_LIBEXEC="$REPO/client/libexec" \
+  PATH="$TMP/podbin:$PATH" bash "$TMP/execute-term.sh" >"$TMP/pod.out" 2>"$TMP/pod.err" &
+term_pid=$!
+n=0
+while ! [ -s "$TMP/pod.log.gate-pid" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+assert_ok 'the pod gate of a verify run started' test -s "$TMP/pod.log.gate-pid"
+gate_pid="$(cat "$TMP/pod.log.gate-pid" 2>/dev/null)"
+term_at=$SECONDS
+kill -TERM "$term_pid"
+wait "$term_pid"
+assert_eq 143 "$?" 'a TERM ends a verify gate on a pod with 143 from the trap'
+assert_ok 'within 5 s, while the 60 s pod gate still had most of its time' test $((SECONDS - term_at)) -le 5
+assert_fail 'and the ssh session of the gate is stopped' kill -0 "$gate_pid"
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

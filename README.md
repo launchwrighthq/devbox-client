@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.2.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.3.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.2.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.3.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.2.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.3.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.2.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.3.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -84,11 +84,12 @@ chooses between remote and local. A call to it from inside `DEVBOX_VERIFY` recur
 
 ## Configuration
 
-Three files. The split decides who owns each value.
+Four files. The split decides who owns each value.
 
 | File | Committed | Owner | Holds |
 |---|---|---|---|
 | `.devbox/config.env` | yes | the project | how to set up, how to verify, how much machine to ask for |
+| `.devbox/steps` | yes | the project | the steps of the gate, their order and the files each step reads |
 | `.devbox/exclude` | yes | the project | rsync patterns for files that must not reach the workspace |
 | `.devbox.env` | no, add it to `.gitignore` | the developer | which targets, the gate password, what to rent, and how long to queue |
 
@@ -113,7 +114,11 @@ DEVBOX_VERIFY="npm run verify:local"
 | `DEVBOX_PROJECT` | yes | the directory name of this checkout on the remote machine; `A-Za-z0-9._+-` only, not all dots |
 | `DEVBOX_WANT_TOKENS`, `DEVBOX_MIN_TOKENS` | yes | the vCPU count the gate asks for, and the count below which it waits |
 | `DEVBOX_SETUP` | yes | the command that installs dependencies in the workspace |
-| `DEVBOX_VERIFY` | yes | the command that is the gate |
+| `DEVBOX_VERIFY` | yes, without `.devbox/steps` | the command that is the gate, run as one step named `verify`; with `.devbox/steps` it is not run |
+| `DEVBOX_RERUN` | no | `changed`, the default, carries unchanged steps and narrows or selects tests; `full` runs every step in full; the environment wins over the file |
+| `DEVBOX_SETUP_INPUTS` | no | files, such as lock files, whose content decides whether `DEVBOX_SETUP` runs again |
+| `DEVBOX_SHARED_INPUTS` | no | files every step reads; a change to one runs every step |
+| `DEVBOX_LOCAL_GATE` | no | with no `.devbox.env`: `always` (default) runs the gate on this machine, `ci` only with `CI` set or `--local`, `never` exits 2 |
 | `DEVBOX_ENVIRONMENT` | no | a command that runs in the same shell before every other command |
 | `DEVBOX_PROVISION` | no | a command that RunPod runs as root before setup |
 | `DEVBOX_REQUIRES` | no | what the workspace image must carry |
@@ -149,6 +154,46 @@ one is skipped, and the run exits 6 when no target satisfies it. This check stop
 gate that is weaker than the local gate. A project's first remote run reported green after a
 set of its tests errored on an image that lacked a required system tool, and the skip count
 changed with no warning.
+
+### `.devbox/steps`
+
+`devbox verify` runs the steps of `.devbox/steps`. A project without the file runs its
+`DEVBOX_VERIFY` as one step named `verify`. One step per line, `#` for a comment; the words
+before ` -- ` are the name and its attributes, and the words after it are the command:
+
+```
+<name> [each=<dir>/] [after=<step>,<step>] [inputs=<path>,<path>] [runner=vitest|pytest]
+       [narrow=failed] [select=related] [rerun=always] -- <command>
+```
+
+| Attribute | Meaning |
+|---|---|
+| `each=apps/*/` | one step per matching directory; `{dir}` and `{name}` are replaced in the name, `inputs`, `after` and the command |
+| `after=a,b` | start once those steps ended, passed or not |
+| `inputs=src/,tests/` | the files the step reads; default every synced file |
+| `runner=vitest\|pytest` | the client adds the ledger plug-in and the file filters on the command line |
+| `narrow=failed` | after a failure of named test files with code 1, run only those and the changed test files |
+| `select=related` | a vitest step runs `vitest related --run` on the input files that changed since its last pass |
+| `rerun=always` | always run in full |
+
+```
+# .devbox/steps
+typecheck   inputs=src/,tsconfig.json                             -- npm run typecheck
+lint        inputs=src/,eslint.config.js                          -- npm run lint
+test        runner=vitest narrow=failed inputs=src/               -- npx vitest run
+```
+
+A step whose key (the client version, `.devbox/config.env`, its line, the forwarded variables,
+its inputs and `DEVBOX_SHARED_INPUTS`) passed in a complete record carries and does not run.
+When every step carries, `devbox verify` prints green and asks no host. A broken line exits 2
+before any target is asked. The last line of a run is `devbox: green (...)` or
+`devbox: red (...)`, and the exit code is the code of the first failed step in plan order.
+
+Every gate writes a record under `<git common dir>/devbox/records/`, and `devbox result` prints
+the newest. A new `devbox verify` cancels the older gate of the same worktree, which exits 14;
+`devbox cancel` does the same by hand. A gate stopped by any other SIGTERM exits 143. With
+`DEVBOX_SETUP_INPUTS`, the workspace skips the setup when the setup text and those files did
+not change since the last setup that passed there.
 
 ### Resumable gates
 
@@ -370,9 +415,14 @@ minutes, and 4 when another run of this worktree held the creation for 15 minute
 
 | Command | What it does |
 |---|---|
-| `devbox verify` | Waits in the queue of every eligible target, holding a free lane of this worktree on each, and on the first that grants syncs the worktree, runs `DEVBOX_SETUP` and `DEVBOX_VERIFY` there, and returns the gate's exit code. |
+| `devbox verify` | Plans the steps, cancels this checkout's older gate, waits in the queue of every eligible target, holding a free lane of this worktree on each, and on the first that grants syncs the worktree, runs `DEVBOX_SETUP` and every step that does not carry there, writes the record, and exits with the code of the first failed step. |
 | `devbox verify --target <name>` | The same, on one target: a name from `DEVBOX_TARGETS`, `runpod` or `hetzner`. |
-| `devbox verify --local` | Runs the local gate and opens no connection. |
+| `devbox verify --local` | Runs the same steps here, with the same runner and record, and opens no connection. |
+| `devbox verify --full`, `--changed`, `--fresh` | `DEVBOX_RERUN` for this run; `--fresh` is `--full` and also discards the ledger of a stopped gate. |
+| `devbox verify --step <name>` | Runs only the named steps; the record is partial and never green. |
+| `devbox verify --plan` | Prints what each step would do and why, and runs nothing. |
+| `devbox result [--failed-files [<step>] \| --log <step>]` | Prints the newest record, its failed test files, or one step's saved log. |
+| `devbox cancel` | Cancels this checkout's running gate, here and on its target. |
 | `devbox run [--target <name>] -- <command>` | Runs one command in the remote workspace after setup. It never runs locally. |
 | `devbox runpod up\|status\|down` | Manages this checkout's RunPod pod. |
 | `devbox hetzner up\|status\|down` | Manages this checkout's Hetzner server. |
@@ -477,8 +527,11 @@ library or a gate verb changes.
 | 9 | a Git LFS file is a pointer; run `git lfs pull` |
 | 10 | the watchdog on the target stopped the gate: past `DEVBOX_GATE_MAX_SECONDS`, or no CPU used for too long. This is not a test result |
 | 11 | the pool on the target lost the gate's queue ticket and could not restore it; the gate did not run |
-| 12 | the pool released the grant because the sync and the setup took longer than the host's `DEVBOX_HOLD_PREP_SECONDS`; the gate did not run. This is not a test result. A cold lane is the usual cause, and the next run there is warm |
+| 12 | the pool released the grant twice because the sync and the setup took longer than the host's `DEVBOX_HOLD_PREP_SECONDS`; the gate did not run. The first release queues the run once more by itself. This is not a test result. The lane is warm afterwards |
+| 14 | a newer `devbox verify` of this checkout, or `devbox cancel`, cancelled this gate. This is not a test result |
 | 75 | the pool on the host stopped waiting and ran nothing |
+
+A SIGTERM from anything else gives 143 and `devbox verify: stopped by SIGTERM`.
 
 A caller that must know whether the remote gate ran sets `DEVBOX_STRICT=1` in the environment.
 Then devbox never falls back to a local gate, the environment wins over `.devbox.env`, and
@@ -501,9 +554,10 @@ devbox's own codes move to 64 to 79:
 | 76 | 10 | `watchdog` |
 | 77 | 11 | `pool-ticket` |
 | 78 | 12 | `prep-limit` |
+| 79 | 14 | `cancelled` |
 
-An OOM kill, a queue timeout, a watchdog stop, a lost ticket, a prep limit or a pool deadline
-also prints one `::devbox-infra::<name>` line on stderr.
+An OOM kill, a queue timeout, a watchdog stop, a lost ticket, a prep limit, a cancel or a pool
+deadline also prints one `::devbox-infra::<name>` line on stderr.
 
 ## Tests
 

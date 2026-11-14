@@ -28,6 +28,11 @@ set -euo pipefail
 # cannot switch it, because the caller that needs it is not the developer.
 STRICT=0
 [ "${DEVBOX_STRICT:-}" = 1 ] && STRICT=1
+# DEVBOX_RERUN as the environment holds it, read before any config load: the
+# config parser sets a key it reads as the shell variable of the same name, so
+# after it a developer's `DEVBOX_RERUN=full` could no longer be told from the
+# project's line, and D13 puts the environment above the file.
+DEVBOX_RERUN_ENV="${DEVBOX_RERUN-}"
 # 1 from the moment the gate's own process runs: from then on the exit status is
 # the gate's, and strict mode passes it through unmapped.
 GATE_OWNS_EXIT=0
@@ -93,6 +98,12 @@ devbox_exit_code() {
     # a stuck client must not keep tokens that other runs wait for. The gate
     # did not run, so the code must never read as a test result.
     12) code=78; echo '::devbox-infra::prep-limit' >&2 ;;
+    # A newer `devbox verify` of this checkout, or `devbox cancel`, cancelled
+    # this gate (client-owns-the-gate spec, D7). A consumer's wrapper printed a
+    # cancel for every SIGTERM, and an agent reported a cancel by another
+    # session that never happened, so a cancel has a code of its own and is
+    # never a test result.
+    14) code=79; echo '::devbox-infra::cancelled' >&2 ;;
     75) code=74; echo '::devbox-infra::pool-deadline' >&2 ;;
     *) echo "devbox verify: a step before the gate stopped with status $code" >&2; code=65 ;;
   esac
@@ -113,6 +124,8 @@ devbox_on_exit() {
   # The run file of `devbox status` goes with the run. Guarded, because a run
   # that ends before devbox-transport is sourced has no such function.
   ! declare -F devbox_runfile_remove >/dev/null || devbox_runfile_remove
+  # The gate marker of this checkout and the plan's files go with the run too.
+  ! declare -F steps_exit >/dev/null || steps_exit
   [ -z "${1:-}" ] || "$1"
   [ "$STRICT" = 1 ] || return 0
   exit "$code"
@@ -143,6 +156,20 @@ source "$_here/devbox-transport"
 # list before any target is joined, and the local fallback reads it too.
 # shellcheck source=client/libexec/devbox-sync
 source "$_here/devbox-sync"
+# The steps of the gate, their plan and the record of each gate
+# (docs/specs/2026-11-14-client-owns-the-gate-design.md). Here, because the
+# plan is made before any target is asked, and a gate on this laptop needs it too.
+# shellcheck source=client/libexec/devbox-steps-file
+source "$_here/devbox-steps-file"
+# shellcheck source=client/libexec/devbox-plan
+source "$_here/devbox-plan"
+# devbox-targets defines functions only. It is sourced here, beside the cancel
+# that calls into it before the targets are checked, and a gate on this laptop
+# cancels an older gate of this checkout as well.
+# shellcheck source=client/libexec/devbox-targets
+source "$_here/devbox-targets"
+# shellcheck source=client/libexec/devbox-cancel
+source "$_here/devbox-cancel"
 
 # ── the arguments ────────────────────────────────────────────────────────────
 #
@@ -160,6 +187,16 @@ source "$_here/devbox-sync"
 #
 # `--fresh` ignores and discards the ledger of an unfinished gate of this
 # worktree, and runs the gate in full (resumable gates spec, section 5).
+#
+# `--full` and `--changed` set DEVBOX_RERUN for this run alone, above the
+# environment and the config (client-owns-the-gate spec, D13); `--fresh` is
+# `--full` too. `--step <name>` runs only the named steps, as a CI shard does,
+# and its record is partial. `--plan` prints what each step would do and runs
+# nothing. `devbox cancel` arrives as `--cancel`.
+#
+# The arguments are kept whole, because a grant released before the gate
+# starts this script again with them (refuse_prep_limit).
+DEVBOX_VERIFY_ARGS=("$@")
 RUNPOD_ACTION=""
 HETZNER_ACTION=""
 RUN_MODE=0
@@ -167,10 +204,30 @@ RUN_SCRIPT=""
 LOCAL_ONLY=0
 FORCE_TARGET=""
 FRESH=0
+RERUN_FLAG=""
+STEPS_ASKED=()
+PLAN_ONLY=0
+CANCEL_MODE=0
 refuse_args() { echo "devbox verify: $*" >&2; devbox_die 2; }
+# One rerun word per run: two would leave the reader to guess which one won.
+rerun_flag() {
+  [ -z "$RERUN_FLAG" ] || [ "$RERUN_FLAG" = "$1" ] \
+    || refuse_args "--$RERUN_FLAG and $2 name two settings of DEVBOX_RERUN; pass one"
+  RERUN_FLAG="$1"
+}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --run) RUN_MODE=1; shift ;;
+    --cancel) CANCEL_MODE=1; shift ;;
+    --full) rerun_flag full --full; shift ;;
+    --changed) rerun_flag changed --changed; shift ;;
+    --plan) PLAN_ONLY=1; shift ;;
+    --step)
+      [ -n "${2:-}" ] || refuse_args "--step needs the name of a step of this gate"
+      STEPS_ASKED+=("$2"); shift 2 ;;
+    --step=*)
+      [ -n "${1#--step=}" ] || refuse_args "--step needs the name of a step of this gate"
+      STEPS_ASKED+=("${1#--step=}"); shift ;;
     --runpod-action)
       RUNPOD_ACTION="${2:-status}"
       FORCE_TARGET=runpod
@@ -183,7 +240,7 @@ while [ "$#" -gt 0 ]; do
     --runpod)
       refuse_args "--runpod is no longer read. Run 'devbox verify --target runpod', or 'devbox runpod up|status|down' to manage the rental." ;;
     --local) LOCAL_ONLY=1; shift ;;
-    --fresh) FRESH=1; shift ;;
+    --fresh) FRESH=1; rerun_flag full --fresh; shift ;;
     --target)
       [ -n "${2:-}" ] || refuse_args "--target needs a name: a target in DEVBOX_TARGETS, runpod or hetzner"
       FORCE_TARGET="$2"; shift 2 ;;
@@ -194,25 +251,448 @@ while [ "$#" -gt 0 ]; do
     --) shift; break ;;
     *)
       [ "$RUN_MODE" = "1" ] && break
-      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>] [--fresh]" ;;
+      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--plan]" ;;
   esac
 done
 if [ "$RUN_MODE" = "1" ]; then
   [ "$#" -gt 0 ] || { echo "devbox run: name a command: devbox run [--target <name>] -- <command> [args]" >&2; devbox_die 2; }
   [ "$LOCAL_ONLY" = "0" ] || { echo "devbox run: a run never runs on this machine, so it takes no --local" >&2; devbox_die 2; }
   [ "$FRESH" = "0" ] || { echo "devbox run: a run keeps no ledger, so it takes no --fresh" >&2; devbox_die 2; }
+  # A run is one command, so it has no steps to plan, carry or name.
+  if [ -n "$RERUN_FLAG" ] || [ "${#STEPS_ASKED[@]}" -gt 0 ] || [ "$PLAN_ONLY" = 1 ]; then
+    echo "devbox run: a run is one command with no steps, so it takes no --full, --changed, --step or --plan" >&2
+    devbox_die 2
+  fi
   RUN_SCRIPT="$(printf '%q ' "$@")"
+fi
+if [ "$CANCEL_MODE" = 1 ] && [ "${#DEVBOX_VERIFY_ARGS[@]}" -ne 1 ]; then
+  refuse_args "devbox cancel takes no argument: it cancels this checkout's running gate"
 fi
 [ "$LOCAL_ONLY" = "0" ] || [ -z "$FORCE_TARGET" ] || refuse_args "--local and --target name two places; pass one"
 # `devbox runpod|hetzner up|status|down` manage a rental and run no gate, so
-# they keep no run file for devbox status.
+# they keep no run file for devbox status, and neither does `devbox cancel`.
 [ -z "$RUNPOD_ACTION$HETZNER_ACTION" ] || DEVBOX_RUNFILE_OFF=1
+[ "$CANCEL_MODE" = 0 ] || DEVBOX_RUNFILE_OFF=1
 RUNFILE_MODE=verify
 [ "$RUN_MODE" = "0" ] || RUNFILE_MODE=run
 
+# ── this checkout's lanes and this run's id ─────────────────────────────────
+#
+# Set once, by the first path that needs them: a gate plans and cancels its
+# checkout's older gate before it chooses a target, and a gate on this laptop
+# names its marker by the lane-1 slug too.
+RUN_IDENTITY=0
+run_identity() {
+  [ "$RUN_IDENTITY" = 0 ] || return 0
+  MACHINE_ID="$(devbox_machine_id)"
+  MACHINE="$(devbox_machine_label)"
+  # Every lane of this worktree, lane 1 first (spec section 5). The `lock` verb
+  # takes them in this order on each target, so lane 2 is used only while lane 1
+  # is busy. Lane 1 keeps the slug of protocol 2, so every warm workspace stays
+  # warm, and it labels this worktree's history on every target: the pool records
+  # the duration of every lane under it.
+  LANE_TEXT="$(devbox_lane_slugs "$MACHINE" "$MACHINE_ID" "$DEVBOX_PROJECT" "$ROOT" "$DEVBOX_LANES")"
+  mapfile -t LANE_SLUGS <<<"$LANE_TEXT"
+  SLUG="${LANE_SLUGS[0]}"
+  HISTORY_SLUG="$SLUG"
+  # The run id, `<hash of the machine id>.<pid>`, in every ticket this run holds
+  # and in its run file, so `devbox status` shows one run that waits on three
+  # targets once. devbox_run_id_prefix says why it is a hash. require_run_id is
+  # the host's rule, applied before anything crosses.
+  RUN_ID="$(devbox_run_id_prefix "$MACHINE_ID")" || {
+    echo "devbox verify: cannot hash this machine's id into a run id: sha256sum failed" >&2
+    devbox_die 2
+  }
+  RUN_ID="$RUN_ID.$$"
+  require_run_id "$RUN_ID" "this machine's id"
+  RUN_IDENTITY=1
+}
+
+# ── the steps of the gate ────────────────────────────────────────────────────
+#
+# No consumer called `devbox verify` directly. Each put a wrapper of its own in
+# front of it, with its own plan, record, retry and cancel, and the copies of
+# one design disagreed. MEASURED: one wrapper cancelled nothing on every run,
+# because it read a key this client refuses, and another printed a cancel for
+# every SIGTERM, so a time limit read as another session's cancel
+# (docs/specs/2026-11-14-client-owns-the-gate-design.md, section 1). The client
+# owns all of it now. The steps are those of .devbox/steps, or DEVBOX_VERIFY as
+# one step named `verify`. A step whose key passed in a complete record carries,
+# devbox-steps runs the rest in the workspace or here, and every gate writes one
+# record under the git common dir. A `devbox run` is one command and plans
+# nothing.
+STEPS_ACTIVE=0
+STEPS_DIR=""
+STEPS_FROM_VERIFY=0
+# The target the record names, the gate's stdout as it streamed, and the ledger
+# the record reads its file lines from.
+STEPS_TARGET="-"
+STEPS_RAW=""
+STEPS_LEDGER=""
+STEPS_GATE_CODE=0
+STEPS_MARKED=0
+STEPS_NO_MANIFEST=0
+STEPS_JOB_PID=""
+declare -A STEPS_RESULT=()
+
+# Plan the gate, before any target is asked (spec section 6.1). --plan prints
+# the plan and exits 0, and a plan whose every step carries writes its record
+# and exits 0, both with no ssh at all.
+steps_prepare() {
+  local rerun rc=0 step all=1
+  [ "$STEPS_ACTIVE" = 0 ] && [ "$RUN_MODE" = 0 ] || return 0
+  run_identity
+  if [ -f "$ROOT/.devbox/steps" ]; then
+    devbox_steps_load "$ROOT/.devbox/steps" "$ROOT" || devbox_die 2
+    [ -z "${DEVBOX_VERIFY:-}" ] \
+      || echo "devbox verify: .devbox/steps is this gate, so DEVBOX_VERIFY in $DEVBOX_CONFIG does not run" >&2
+  else
+    devbox_steps_from_verify "${DEVBOX_VERIFY:-}" || devbox_die 2
+    STEPS_FROM_VERIFY=1
+  fi
+  # A gate of no step would pass having run nothing, the silent green this
+  # repository keeps finding in its own history.
+  if [ "${#STEP_NAMES[@]}" -eq 0 ]; then
+    echo "devbox verify: $ROOT/.devbox/steps names no step, so there is no gate to run" >&2
+    devbox_die 2
+  fi
+  rerun="$(devbox_rerun_setting)" || devbox_die 2
+  STEPS_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed, so the gate has no plan and did not run" >&2; devbox_die 1; }
+  if devbox_sync_manifest "$STEPS_DIR/none" >"$STEPS_DIR/manifest"; then
+    # The ledger key reads this listing instead of making a second one.
+    DEVBOX_MANIFEST_FILE="$STEPS_DIR/manifest"
+  else
+    # A key over a list that could not be read would match a pass of other
+    # files, so every step runs and the record never carries. The gate still
+    # runs, as it did when only the ledger key read this list: the sync names
+    # its own failure when it is the same one.
+    echo "devbox verify: could not list and hash the files the sync sends, so every step runs in full and this gate's record does not carry" >&2
+    : >"$STEPS_DIR/manifest"
+    STEPS_NO_MANIFEST=1
+    rerun=full
+  fi
+  devbox_plan_build "$rerun" "$STEPS_DIR/manifest" ${STEPS_ASKED[@]+"${STEPS_ASKED[@]}"} >"$STEPS_DIR/plan" || rc=$?
+  [ "$rc" = 0 ] || devbox_die "$rc"
+  STEPS_ACTIVE=1
+  if [ "$PLAN_ONLY" = 1 ]; then
+    devbox_plan_print
+    devbox_die 0
+  fi
+  for step in "${PLAN_STEPS[@]}"; do
+    [ "${PLAN_ACTION[$step]}" = carry ] || all=0
+  done
+  if [ "$all" = 1 ]; then
+    steps_record_finish "" 1 1
+    devbox_die 0
+  fi
+  DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks remote /home/dev/.devbox "$STEPS_DIR/plan" "$RUN_ID" "$((1 - STEPS_FROM_VERIFY))")" || {
+    echo "devbox verify: could not encode the step runner or its plan for the workspace (base64 failed), so the gate did not run" >&2
+    devbox_die 1
+  }
+}
+
+# Cancel this checkout's older gate, here and on its target (D7, section 6.5),
+# and arm the TERM trap that tells a cancel from any other SIGTERM. The marker
+# is written first, inside devbox_cancel_older, so the older gate's trap reads
+# this newer pid. A marker that cannot be written leaves its own line, and the
+# gate runs: a gate that cannot be cancelled is still a gate.
+steps_cancel_older() {
+  [ "$STEPS_ACTIVE" = 1 ] && [ "$STEPS_MARKED" = 0 ] || return 0
+  if devbox_cancel_older "$HISTORY_SLUG" "$MACHINE_ID" "$RUN_ID"; then
+    STEPS_MARKED=1
+  fi
+  trap steps_on_term TERM
+}
+
+# The TERM trap of a gate (section 6.5). A gate job, on this laptop or a RunPod
+# pod, stops first, so its steps end with it. Then the cancel verb for this gate's own run goes to its target,
+# when a grant named one, and devbox_cancel_on_term decides: 14 when a newer
+# gate of this checkout wrote the marker, 143 and `stopped by SIGTERM`
+# otherwise. 143 is the gate's own end under strict mode as well: it is neither
+# a test result devbox chose nor one of its own codes, and a shell gives 143.
+# shellcheck disable=SC2317  # reached through the TERM trap, never by name
+steps_on_term() {
+  local rc=0 target="$STEPS_TARGET"
+  trap - TERM
+  steps_stop_job
+  # This laptop and a RunPod pod have no gate account, so no verb goes there.
+  case "$target" in local|runpod) target=- ;; esac
+  devbox_cancel_own_run "$target" "$HISTORY_SLUG" "$MACHINE_ID" "$RUN_ID"
+  devbox_cancel_on_term "$HISTORY_SLUG" || rc=$?
+  [ -z "$STEPS_RAW" ] || steps_record_finish "$STEPS_RAW" 0 0
+  [ "$rc" != 14 ] || devbox_die 14
+  GATE_OWNS_EXIT=1
+  exit 143
+}
+
+# The INT trap of a gate on this laptop. The gate runs as a background job,
+# which a non-interactive bash starts with SIGINT ignored, so a Ctrl-C reaches
+# only this shell, and the gate is stopped from here.
+# shellcheck disable=SC2317  # reached through the INT trap, never by name
+steps_on_int() {
+  trap - INT
+  steps_stop_job
+  echo "devbox verify: stopped by SIGINT" >&2
+  [ -z "$STEPS_RAW" ] || steps_record_finish "$STEPS_RAW" 0 0
+  GATE_OWNS_EXIT=1
+  exit 130
+}
+
+# Stop the gate job and wait for it. On this laptop the job is devbox-steps,
+# which stops the process group of every step on its TERM. On a RunPod pod the
+# job is the ssh session, and its end stops the pod's gate. The job may have ended already, and that end
+# is the one asked for, so a kill or a wait that finds nothing is no failure.
+# shellcheck disable=SC2317  # reached through the traps above
+steps_stop_job() {
+  [ -n "$STEPS_JOB_PID" ] || return 0
+  kill -TERM "$STEPS_JOB_PID" 2>/dev/null || true
+  wait "$STEPS_JOB_PID" 2>/dev/null || true
+  STEPS_JOB_PID=""
+}
+
+# At every exit: the marker, when it still names this process, and the plan's
+# files. A marker that cannot be removed names a pid that is gone, which no
+# reader takes for a live gate.
+# shellcheck disable=SC2317  # reached through the EXIT traps here and in devbox-runpod
+steps_exit() {
+  [ "$STEPS_MARKED" = 0 ] || devbox_gate_marker_remove "$HISTORY_SLUG" || true
+  [ -z "$STEPS_DIR" ] || rm -rf "$STEPS_DIR"
+}
+
+# Before this script starts itself again by exec: the plan's files go, and the
+# marker stays, because exec keeps the pid and its identity, so the marker
+# still names the running gate.
+steps_before_exec() {
+  [ -z "$STEPS_DIR" ] || rm -rf "$STEPS_DIR"
+}
+
+# Copy the gate's stdout to the file $1 byte for byte, and pass it on without
+# the runner's `devbox-steps: result` lines, which are for the record and not
+# for the reader.
+#
+# grep, never awk: Debian's awk is mawk, which fills a block of its input before
+# it handles a line. MEASURED on a real gate: every step line of a long
+# gate reached run.out, and the terminal showed none of them until it ended.
+# grep handles each line as it arrives. grep exits 1 when every line was a
+# result line, which is no failure of the display.
+# shellcheck disable=SC2317  # started in a process substitution
+steps_display() {
+  local rc=0
+  tee -- "$1" | grep --line-buffered -v '^devbox-steps: result ' || rc=$?
+  [ "$rc" -le 1 ] || return "$rc"
+}
+
+# Fill STEPS_RESULT[<step>] with `<outcome> <seconds> <code>` from the result
+# lines the runner printed last in the file $1. Only the trailing block counts:
+# a streamed step's own output may hold a line that looks like one.
+steps_results() {
+  local name outcome secs code
+  STEPS_RESULT=()
+  [ -r "$1" ] || return 0
+  while read -r _ _ name outcome secs code; do
+    [ -n "${PLAN_ACTION[$name]+x}" ] || continue
+    case "$outcome" in pass|fail|resumed|carried) ;; *) continue ;; esac
+    if ! is_uint "$secs" || ! is_uint "$code"; then continue; fi
+    STEPS_RESULT[$name]="$outcome $secs $code"
+  done < <(awk '/^devbox-steps: result / { block[++n] = $0; next } /./ { n = 0 } END { for (i = 1; i <= n; i++) print block[i] }' "$1")
+}
+
+# Set STEPS_GATE_CODE: the code of the first failed step in plan order, 0 when
+# none failed. With one step, the DEVBOX_VERIFY of a project that has not
+# moved to .devbox/steps, that is the code its gate returned before, so strict
+# mode, the OOM report and every caller that reads the code see what they saw.
+# A gate that printed no result keeps the status $2 it ended with.
+steps_gate_code() {
+  local step outcome code
+  steps_results "$1"
+  if [ "${#STEPS_RESULT[@]}" -eq 0 ]; then
+    echo "devbox verify: the gate printed no step result, so its record is incomplete and nothing carries from it" >&2
+    STEPS_GATE_CODE="$2"
+    return 0
+  fi
+  STEPS_GATE_CODE=0
+  for step in "${PLAN_STEPS[@]}"; do
+    read -r outcome _ code <<<"${STEPS_RESULT[$step]-}"
+    [ "$outcome" = fail ] || continue
+    STEPS_GATE_CODE="$code"
+    [ "$code" != 0 ] || STEPS_GATE_CODE=1
+    break
+  done
+  # A session cut while the runner printed its result block leaves some pass
+  # lines and no fail line, and the gate's own non-zero end is then the only
+  # sign that it did not finish. Green needs both.
+  if [ "$STEPS_GATE_CODE" = 0 ] && [ "$2" != 0 ]; then
+    echo "devbox verify: no step result is a fail, but the gate ended with $2, so the run keeps $2" >&2
+    STEPS_GATE_CODE="$2"
+  fi
+}
+
+# True when the files the sync sends are as the plan hashed them (section 7).
+# A failed listing is a change: a result that cannot prove its tree does not
+# carry.
+steps_tree_unchanged() {
+  if ! devbox_sync_manifest "$STEPS_DIR/none.after" >"$STEPS_DIR/manifest.after"; then
+    echo "devbox verify: could not hash the synced files again after the gate, so this result does not carry" >&2
+    return 1
+  fi
+  cmp -s "$STEPS_DIR/manifest" "$STEPS_DIR/manifest.after" && return 0
+  echo "devbox verify: files changed while the gate ran, so this result does not carry" >&2
+  return 1
+}
+
+# The `file` lines of the record from the ledger STEPS_LEDGER: each test file's
+# last state, `open` for a `start` with no end. The ledger names a file's runner
+# and not its step, so a file goes to the steps of its runner that ran, and of
+# several, to those whose inputs hold it. A file of no running step's runner
+# goes to the one step that ran, the DEVBOX_VERIFY gate that writes its own
+# ledger.
+steps_file_lines() {
+  local runner path state step
+  local -a ran=() cands=() matched=()
+  [ -n "$STEPS_LEDGER" ] && [ -r "$STEPS_LEDGER" ] || return 0
+  for step in "${PLAN_STEPS[@]}"; do
+    [ "${PLAN_ACTION[$step]}" = carry ] || ran+=("$step")
+  done
+  [ "${#ran[@]}" -gt 0 ] || return 0
+  while IFS=$'\t' read -r runner path state; do
+    cands=()
+    for step in "${ran[@]}"; do
+      [ "${STEP_RUNNER[$step]-}" != "$runner" ] || cands+=("$step")
+    done
+    if [ "${#cands[@]}" -eq 0 ]; then
+      [ "${#ran[@]}" -eq 1 ] || continue
+      cands=("${ran[0]}")
+    fi
+    if [ "${#cands[@]}" -gt 1 ]; then
+      matched=()
+      for step in "${cands[@]}"; do
+        if [ -z "${STEP_INPUTS[$step]-}" ] \
+          || [ -n "$(printf '%064d  %s\n' 0 "$path" | _devbox_plan_match /dev/stdin "${STEP_INPUTS[$step]}")" ]; then
+          matched+=("$step")
+        fi
+      done
+      [ "${#matched[@]}" -eq 0 ] || cands=("${matched[@]}")
+    fi
+    for step in "${cands[@]}"; do
+      printf 'file\t%s\t%s\t%s\t%s\n' "$step" "$runner" "$path" "$state"
+    done
+  done < <(awk -F'\t' '
+    $1 == "file" && NF >= 4 {
+      id = $2 FS $3
+      if (!(id in st)) order[++n] = id
+      st[id] = ($4 == "start") ? "open" : $4
+    }
+    END { for (i = 1; i <= n; i++) if (st[order[i]] ~ /^(open|pass|fail)$/) print order[i] FS st[order[i]] }' "$STEPS_LEDGER")
+}
+
+# Write the record of section 7, and with $4 = 1 print its verdict last. $1 is
+# the gate's stdout file, saved beside the record as <run-id>.log, or empty for
+# a gate whose every step carried. $2 is 1 when the gate returned its own code
+# and 0 when it was cancelled, stopped or killed. A complete record also needs a
+# result for every planned step and the tree as the plan hashed it (D10a). A
+# record that cannot be written leaves its line and changes no exit code: the
+# gate's result is the gate's.
+steps_record_finish() {
+  local raw="$1" complete="$2" verdict="$3" rec="$STEPS_DIR/record" dir scope=full manifest="$STEPS_DIR/manifest"
+  local kind step action key outcome secs code mode version branch commit
+  [ -z "$raw" ] || steps_results "$raw"
+  if [ "$STEPS_NO_MANIFEST" = 1 ]; then complete=0 manifest=""; fi
+  if [ "$complete" = 1 ]; then
+    for step in "${PLAN_STEPS[@]}"; do
+      [ "${PLAN_ACTION[$step]}" = carry ] || [ -n "${STEPS_RESULT[$step]+x}" ] || complete=0
+    done
+  fi
+  if [ "$complete" = 1 ] && [ -n "$raw" ] && ! steps_tree_unchanged; then complete=0; fi
+  [ "${#STEPS_ASKED[@]}" -eq 0 ] || scope=partial
+  version="$(cat -- "$_here/../../VERSION")" || version=-
+  branch="$(git symbolic-ref --short -q HEAD)" || branch=-
+  commit="$(git rev-parse -q --verify HEAD)" || commit=-
+  {
+    printf 'run\t%s\nat\t%s\nclient\t%s\nbranch\t%s\ncommit\t%s\ntarget\t%s\nscope\t%s\ncomplete\t%s\n' \
+      "$RUN_ID" "$(date +%s)" "${version:--}" "$branch" "$commit" "$STEPS_TARGET" "$scope" "$complete"
+    while IFS=$'\t' read -r kind step action key _; do
+      [ "$kind" = step ] || continue
+      case "$action" in narrow) mode=narrowed ;; related) mode=related ;; *) mode=full ;; esac
+      if [ "$action" = carry ]; then
+        printf 'step\t%s\t%s\tcarried\t0\t0\t%s\n' "$step" "$key" "$mode"
+        continue
+      fi
+      [ -n "${STEPS_RESULT[$step]+x}" ] || continue
+      read -r outcome secs code <<<"${STEPS_RESULT[$step]}"
+      # A resumed step passed earlier in this same gate, on the tree the ledger
+      # key names, so its step key passed too.
+      [ "$outcome" != resumed ] || outcome=pass
+      printf 'step\t%s\t%s\t%s\t%s\t%s\t%s\n' "$step" "$key" "$outcome" "$secs" "$code" "$mode"
+    done <"$STEPS_DIR/plan"
+    steps_file_lines
+  } >"$rec"
+  if dir="$(devbox_record_dir)" && mkdir -p -- "$dir"; then
+    if [ -n "$raw" ] && [ -r "$raw" ]; then
+      { cp -- "$raw" "$dir/.$RUN_ID.log.$$" && mv -f -- "$dir/.$RUN_ID.log.$$" "$dir/$RUN_ID.log"; } \
+        || echo "devbox verify: could not save the gate's output as $dir/$RUN_ID.log, so devbox result --log has nothing for this gate" >&2
+    fi
+    devbox_record_write "$RUN_ID" "$rec" "$manifest" || true  # it named what it could not write
+  else
+    echo "devbox verify: could not create the record directory under the git common dir, so this gate left no record" >&2
+  fi
+  [ "$verdict" = 0 ] || devbox_record_summary "$rec" | tail -n 1
+}
+
+# The end of a gate on a rented RunPod pod, which devbox-runpod runs with its
+# own transport and its own EXIT trap: the gate's code from the result lines in
+# the output file $1, which also holds the pod's stderr, and the record, under
+# target runpod. $2 is the status the pod's gate ended with.
+# shellcheck disable=SC2317  # called from devbox-runpod, a source shellcheck does not follow
+steps_gate_finish() {
+  STEPS_TARGET=runpod
+  STEPS_RAW="$1"
+  steps_gate_code "$1" "$2"
+  steps_record_finish "$1" 1 1
+}
+
+# The gate on this laptop: the same steps, the same runner and the same record
+# as a remote gate (R3), its logs in the private dir and the ledger of
+# ledger_local. It runs as a background job, so a TERM reaches the trap at once:
+# bash runs a trap only after a foreground command ends, so a newer gate's
+# cancel of a gate in the foreground would wait for the whole gate.
+steps_run_local() {
+  local priv root_sum hooks fpid ofd rc=0 n=0
+  priv="$(devbox_gate_private_dir)" || devbox_die 1
+  root_sum="$(printf '%s' "$ROOT" | sha256sum)" || { echo "devbox verify: sha256sum failed, so the gate has no log directory and did not run" >&2; devbox_die 1; }
+  DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks local "$priv/steps/local-${root_sum:0:16}" "$STEPS_DIR/plan" "$RUN_ID" "$((1 - STEPS_FROM_VERIFY))")"
+  hooks="$(devbox_hooks_script)" || { echo "devbox verify: could not build the hooks of the gate, so it did not run" >&2; devbox_die 1; }
+  STEPS_TARGET=local
+  STEPS_RAW="$STEPS_DIR/local.out"
+  STEPS_LEDGER="$LOCAL_LEDGER"
+  GATE_OWNS_EXIT=1
+  exec {ofd}> >(steps_display "$STEPS_RAW")
+  fpid=$!
+  DEVBOX_LEDGER="$LOCAL_LEDGER" DEVBOX_RESUME=0 DEVBOX_LEDGER_TOOLS="$DEVBOX_LEDGER_TOOLS_DIR" \
+    bash -c "$hooks"$'\n''devbox_environment && devbox_verify' >&"$ofd" &
+  STEPS_JOB_PID=$!
+  exec {ofd}>&-
+  trap steps_on_int INT
+  wait "$STEPS_JOB_PID" || rc=$?
+  STEPS_JOB_PID=""
+  trap - INT
+  # The display must have printed its last line before the verdict. Bounded,
+  # because a child of the gate that outlived it may still hold the pipe.
+  while kill -0 "$fpid" 2>/dev/null && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+  steps_gate_code "$STEPS_RAW" "$rc"
+  steps_record_finish "$STEPS_RAW" 1 1
+  exit "$STEPS_GATE_CODE"
+}
+
 # A run has no local fallback: the laptop load it exists to remove is what a
 # fallback would put back. Every path below that would run here refuses instead.
+#
+# It never returns: the gate's code, or a refusal, ends the run. $1 is the
+# notice a fallback prints once the gate is allowed here. With no
+# .devbox.env, DEVBOX_LOCAL_GATE decides first (D11): concurrent gates of
+# several worktrees once put more test workers on one laptop than it had cores,
+# MEASURED, because a missing .devbox.env ran every gate here with one notice.
 run_local() {
+  local notice="${1-}"
   if [ "$RUN_MODE" = "1" ]; then
     echo "devbox run: NOT running '$RUN_SCRIPT' on this machine: no target is configured for $ROOT (.devbox.env missing, or it sets neither DEVBOX_TARGETS nor DEVBOX_RENT)." >&2
     devbox_die 2
@@ -223,10 +703,15 @@ run_local() {
   OWN_EXIT=1
   devbox_config_load
   OWN_EXIT=0
+  DEVBOX_ENV="$(devbox_env_find "$ROOT")" || DEVBOX_ENV=""
+  if [ -z "$DEVBOX_ENV" ] && ! devbox_local_gate_allowed "$LOCAL_ONLY"; then
+    devbox_die 2
+  fi
+  [ -z "$notice" ] || echo "$notice" >&2
+  steps_prepare
+  steps_cancel_older
   ledger_local
-  GATE_OWNS_EXIT=1
-  DEVBOX_LEDGER="$LOCAL_LEDGER" DEVBOX_RESUME=0 DEVBOX_LEDGER_TOOLS="$DEVBOX_LEDGER_TOOLS_DIR" \
-    bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_verify'
+  steps_run_local
 }
 # A gate on this laptop gets the contract of a remote one (resumable gates
 # spec, section 4.1): the tools from this client's own client/share/ledger/,
@@ -272,7 +757,25 @@ local_fallback_guard() {
   devbox_die 64
 }
 
-[ "$LOCAL_ONLY" = "1" ] && { run_local; exit $?; }
+# `devbox cancel`: this checkout's config, its .devbox.env when it has one, for
+# the address of the older gate's target, and the lane-1 slug its marker is
+# named by. Nothing else of a gate's path runs.
+if [ "$CANCEL_MODE" = 1 ]; then
+  OWN_EXIT=1
+  devbox_config_load
+  OWN_EXIT=0
+  DEVBOX_DEPLOYED=()
+  DEVBOX_RENTED=()
+  DEVBOX_ENV="$(devbox_env_find "$ROOT")" || DEVBOX_ENV=""
+  [ -z "$DEVBOX_ENV" ] || devbox_env_load "$DEVBOX_ENV" || devbox_die 2
+  run_identity
+  trap 'devbox_on_exit devbox_targets_close_all' EXIT
+  cancel_rc=0
+  devbox_cancel_command "$HISTORY_SLUG" "$MACHINE_ID" || cancel_rc=$?
+  devbox_die "$cancel_rc"
+fi
+
+[ "$LOCAL_ONLY" = "1" ] && run_local
 
 # ── the developer's .devbox.env ──────────────────────────────────────────────
 #
@@ -291,8 +794,7 @@ if [ -z "$DEVBOX_ENV" ]; then
     devbox_die 2
   fi
   local_fallback_guard "no .devbox.env in $ROOT"
-  [ "$RUN_MODE" = "1" ] || echo "devbox verify: no .devbox.env in $ROOT, running the gate locally" >&2
-  run_local; exit $?
+  run_local "devbox verify: no .devbox.env in $ROOT, running the gate locally"
 fi
 # In strict mode the environment wins over .devbox.env, for each DEVBOX_* key
 # of the file's list and each DEVBOX_TARGET_<NAME>. devbox_env_load reads the
@@ -307,7 +809,7 @@ devbox_env_load "$DEVBOX_ENV" || devbox_die 2
 if [ -z "$FORCE_TARGET" ] && [ "${#DEVBOX_DEPLOYED[@]}" -eq 0 ] && [ "${#DEVBOX_RENTED[@]}" -eq 0 ]; then
   local_fallback_guard "$DEVBOX_ENV sets neither DEVBOX_TARGETS nor DEVBOX_RENT"
   [ "$RUN_MODE" = "1" ] || echo "devbox verify: $DEVBOX_ENV sets neither DEVBOX_TARGETS nor DEVBOX_RENT, running the gate locally" >&2
-  run_local; exit $?
+  run_local
 fi
 case "$FORCE_TARGET" in
   "") ;;
@@ -572,8 +1074,18 @@ queue_fallback() {
     fi
   } >&2
   run_local
-  exit $?
 }
+
+# ── the plan, and one gate per checkout ──────────────────────────────────────
+#
+# Before any target is asked, the forced RunPod target included: a gate whose
+# every step carries asks no host, and the older gate of this checkout is
+# cancelled before this one joins a queue. A rental's up, status or down runs
+# no gate, so it plans nothing.
+if [ -z "$RUNPOD_ACTION$HETZNER_ACTION" ]; then
+  steps_prepare
+  steps_cancel_older
+fi
 
 if [ "$FORCE_TARGET" = runpod ]; then
   devbox_runfile_phase rent runpod - "$ROOT" "$RUNFILE_MODE"
@@ -582,34 +1094,13 @@ if [ "$FORCE_TARGET" = runpod ]; then
   devbox_die "$?"
 fi
 
-MACHINE_ID="$(devbox_machine_id)"
-MACHINE="$(devbox_machine_label)"
-# Every lane of this worktree, lane 1 first (spec section 5). The `lock` verb
-# takes them in this order on each target, so lane 2 is used only while lane 1
-# is busy. Lane 1 keeps the slug of protocol 2, so every warm workspace stays
-# warm, and it labels this worktree's history on every target: the pool records
-# the duration of every lane under it.
-LANE_TEXT="$(devbox_lane_slugs "$MACHINE" "$MACHINE_ID" "$DEVBOX_PROJECT" "$ROOT" "$DEVBOX_LANES")"
-mapfile -t LANE_SLUGS <<<"$LANE_TEXT"
-SLUG="${LANE_SLUGS[0]}"
-HISTORY_SLUG="$SLUG"
-# The run id, `<hash of the machine id>.<pid>`, in every ticket this run holds
-# and in its run file, so `devbox status` shows one run that waits on three
-# targets once. devbox_run_id_prefix says why it is a hash. require_run_id is
-# the host's rule, applied before anything crosses.
-RUN_ID="$(devbox_run_id_prefix "$MACHINE_ID")" || {
-  echo "devbox verify: cannot hash this machine's id into a run id: sha256sum failed" >&2
-  devbox_die 2
-}
-RUN_ID="$RUN_ID.$$"
-require_run_id "$RUN_ID" "this machine's id"
+run_identity
 DEVBOX_RUNFILE_RUN="$RUN_ID"
 
 # Every call below goes to the gate account through devbox-transport, sourced
 # at the top: one verb and its words, never a command string for a remote
-# shell. devbox-targets probes every deployed target and chooses one.
-# shellcheck source=client/libexec/devbox-targets
-source "$_here/devbox-targets"
+# shell. devbox-targets, sourced at the top, probes every deployed target and
+# chooses one.
 devbox_targets_check || devbox_die 2
 
 # ── the handshake, this laptop's half ────────────────────────────────────────
@@ -698,7 +1189,7 @@ declare -A JOIN_LOCK_FD=() JOIN_RUN_FD=() JOIN_PID=() JOIN_STATE=()
 # shellcheck disable=SC2317  # started in the background by join_start
 join_job() {
   set +e
-  local name="$1" maxwait="$2" d="$JOIN_DIR/$1" f answer slug lpid rpid efd tpid n
+  local name="$1" maxwait="$2" d="$JOIN_DIR/$1" f answer slug lpid rpid efd tpid ofd opid="" p n
   for f in "${JOIN_FDS[@]}"; do exec {f}>&-; done
   # The address was checked by devbox_targets_check, and its message went out
   # then; this second use only selects the target in this job.
@@ -735,14 +1226,23 @@ join_job() {
   [ ! -e "$d/abort" ] || exit 0
   exec {efd}> >(tee "$d/run.err" >&2)
   tpid=$!
+  # A gate's stdout carries the runner's result lines, which the record reads
+  # from run.out and the reader never sees. A run's stdout is its command's
+  # own, and passes untouched.
+  if [ "$STEPS_ACTIVE" = 1 ]; then
+    exec {ofd}> >(steps_display "$d/run.out")
+    opid=$!
+  else
+    exec {ofd}>&1
+  fi
   join_fifo_reader "$d/run.in"
   devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$maxwait" \
-    "$GATE_MAX_SECONDS" "$GATE_MODE" "$HISTORY_SLUG" "$RUN_ID" <&"$JOIN_READER" 2>&"$efd" \
-    || { exec {efd}>&-; echo "the run could not be sent" >"$d/end"; exit 0; }
+    "$GATE_MAX_SECONDS" "$GATE_MODE" "$HISTORY_SLUG" "$RUN_ID" <&"$JOIN_READER" 2>&"$efd" >&"$ofd" \
+    || { exec {efd}>&- {ofd}>&-; echo "the run could not be sent" >"$d/end"; exit 0; }
   exec {JOIN_READER}<&-
   rpid="$GATE_SPAWN_PID"
   printf '%s\n' "$rpid" >"$d/run.pid"
-  exec {efd}>&-
+  exec {efd}>&- {ofd}>&-
   while kill -0 "$rpid" 2>/dev/null; do
     if [ -e "$d/abort" ]; then
       # A held grant ends on the abort line at once. A pool still in its queue
@@ -760,10 +1260,13 @@ join_job() {
   printf '%s\n' "$?" >"$d/run.rc.tmp"
   # The tee must have written its last line before run.rc says the run ended.
   # Bounded, because a killed ssh's child may still hold the pipe, and a job
-  # that never ends holds this run's exit.
-  n=0
-  while kill -0 "$tpid" 2>/dev/null && [ "$n" -lt 25 ]; do sleep 0.2; n=$((n + 1)); done
-  kill "$tpid" 2>/dev/null
+  # that never ends holds this run's exit. The display of the gate's stdout
+  # likewise, because the record reads run.out once run.rc is there.
+  for p in "$tpid" $opid; do
+    n=0
+    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 25 ]; do sleep 0.2; n=$((n + 1)); done
+    kill "$p" 2>/dev/null
+  done
   mv -f "$d/run.rc.tmp" "$d/run.rc"
 }
 
@@ -1418,14 +1921,23 @@ ledger_mark() {
 # targets as any run does, so it may land on another target or lane (D6), and
 # it reads the marker and the local copy this function leaves. Every join of
 # this run ends first, or its lane lock would hold lane 1 against the resume.
+#
+# It starts by exec, and applies the strict map to its own code. A child
+# process would have a pid of its own, and the one-gate-per-checkout cancel of
+# its start would read this waiting process as the checkout's older gate and
+# stop it. exec keeps the pid, so the gate marker still names the running gate,
+# and the run id with it. The steps the run named and its rerun setting go
+# along. --fresh goes as --full: --fresh again would discard the ledger of the
+# gate that just stopped, which is the ledger the resume reads.
 ledger_after_stop() {
-  local base count rc=0
+  local base count step
   local -a again=()
   [ "$LEDGER_MARKED" = 1 ] || return 0
   if ! ledger_fetch "$TARGET" "$SLUG" "the stopped gate cannot resume"; then
     ledger_forget
     return 0
   fi
+  STEPS_LEDGER="$LEDGER_COPY"
   printf 'fetched\n' >>"$LEDGER_MARK"
   base="$(ledger_mark_get base)"
   ledger_hang_check "${base:-0}"
@@ -1435,27 +1947,31 @@ ledger_after_stop() {
     return 0
   fi
   [ -z "$FORCE_TARGET" ] || again=(--target "$FORCE_TARGET")
+  [ -z "$RERUN_FLAG" ] || again+=("--$RERUN_FLAG")
+  for step in ${STEPS_ASKED[@]+"${STEPS_ASKED[@]}"}; do again+=(--step "$step"); done
   cleanup_probe
-  trap devbox_on_exit EXIT
+  trap - EXIT
   devbox_runfile_remove
-  bash "$_here/devbox-verify" ${again[@]+"${again[@]}"} || rc=$?
-  # The resume applied the strict map to its own code, so this run passes it on.
-  GATE_OWNS_EXIT=1
-  exit "$rc"
+  steps_before_exec
+  exec bash "$_here/devbox-verify" ${again[@]+"${again[@]}"}
 }
 
 # After the gate returned its own code: fetch the ledger once and warn when it
 # holds no `step` and no `file` record (spec section 7, release 1). The code
 # stays the gate's. A fetch that fails says nothing here: the gate is over, and
-# the warning is advice about the next stop. Then the marker and the local copy
-# go, because a completed run is never resumed (section 2).
+# the warning is advice about the next stop. Then the record of the gate reads
+# its file lines from the fetched copy (client-owns-the-gate spec, section 7),
+# and the marker and the local copy go, because a completed run is never
+# resumed (section 2).
 ledger_finished() {
   [ "$RUN_MODE" = 0 ] || return 0
   if [ -n "$LEDGER_DIR" ] && ledger_fetch "$TARGET" "$SLUG" ""; then
     if [ -z "$(ledger_units "$LEDGER_COPY" 0 "")" ]; then
       echo "devbox verify: this gate wrote no ledger, so a stop cannot resume it" >&2
     fi
+    STEPS_LEDGER="$LEDGER_COPY"
   fi
+  [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 1 1
   ledger_forget
 }
 
@@ -1529,16 +2045,33 @@ refuse_lost_ticket() {
 # must not keep tokens other runs wait for. The pool then exits 80 with its
 # line. 80 alone is not enough, because a gate may exit 80 of its own, and that
 # one keeps its code.
+#
+# The first release queues the run once more, and only the second exits 12.
+# Exit 12 alone threw the finished sync and setup away: MEASURED, an agent's
+# one-file test run lost its grant on one target and then on another, each
+# after a long wait, and its third try, by hand, passed in a fraction of that
+# time on the lane the second try had warmed. The sync and the setup are done when the grant goes,
+# and affinity already names this target, so the second try pays only an
+# incremental sync. The script starts again by exec, after the cleanup its EXIT
+# trap would run, so the joins, the probe directory and the run file go first
+# and the pid stays the one a caller signals.
 PREP_LINE="devbox-pool: released the grant: no go within "
 refuse_prep_limit() {
   local status="$1" err="$2" target="$3" prep_line
   [ "$status" -eq 80 ] || return 0
   prep_line="$(grep -m1 -F "$PREP_LINE" "$err" 2>/dev/null)" || return 0
-  {
-    echo "devbox verify: the pool on $target released this run's grant before the gate started (${prep_line#devbox-pool: }), so the gate did not run"
-    echo "  this is not a test result. The sync and the setup took longer than DEVBOX_HOLD_PREP_SECONDS on $target allows: a cold lane is the usual cause, and the next run there is warm."
-  } >&2
+  echo "devbox verify: the pool on $target released this run's grant before the gate started (${prep_line#devbox-pool: }), so the gate did not run" >&2
   ledger_unmark
+  if [ "${DEVBOX_PREP_RETRY:-0}" != 1 ]; then
+    echo "  the sync and the setup took longer than DEVBOX_HOLD_PREP_SECONDS on $target allows. They are done, so this run queues once more, and $target is warm for it." >&2
+    trap - EXIT
+    cleanup_probe
+    devbox_runfile_remove
+    # The gate marker stays: exec keeps the pid, so it still names this run.
+    steps_before_exec
+    DEVBOX_PREP_RETRY=1 exec bash "$_here/devbox-verify" ${DEVBOX_VERIFY_ARGS[@]+"${DEVBOX_VERIFY_ARGS[@]}"}
+  fi
+  echo "  this is not a test result. The sync and the setup took longer than DEVBOX_HOLD_PREP_SECONDS on $target allows, on the second try too. The lane is warm now, so the next run there pays only an incremental sync." >&2
   devbox_die 12
 }
 
@@ -1837,6 +2370,13 @@ lane=1
 while [ "$lane" -lt "${#LANE_SLUGS[@]}" ] && [ "${LANE_SLUGS[lane - 1]}" != "$SLUG" ]; do lane=$((lane + 1)); done
 granted="$(sed -n 's/^devbox-pool: held \([0-9][0-9]*\) .*/\1/p' "$GATE_ERR" | sed -n 1p)"
 echo "==> devbox: granted ${granted:-?} tokens on $TARGET lane $lane after $((SECONDS - JOIN_T0))s${also:+ (also queued on $also)}"
+# The marker names the target from the grant on, so a newer gate of this
+# checkout reaches this gate's host with the cancel verb even when this client
+# is gone (section 6.5). A marker that cannot be written leaves its own line.
+if [ "$STEPS_ACTIVE" = 1 ]; then
+  STEPS_TARGET="$TARGET"
+  [ "$STEPS_MARKED" = 0 ] || devbox_gate_marker_write "$HISTORY_SLUG" "$RUN_ID" "$TARGET" || true
+fi
 
 # The held run must still hold its grant before each step that spends time on
 # it. A grant the host released, or a session that dropped, ends this run with
@@ -1909,6 +2449,12 @@ devbox_sync_push() {
 devbox_sync_finish() {
   devbox_gate sync-finish "$SLUG" "$DEVBOX_PROJECT" ${1:+"$1"}
 }
+# The sync and the setup run in the foreground, so a newer gate's TERM reaches
+# this gate's trap only when the current command returns. The newer gate waits
+# its 30 s grace and starts anyway. The marker names this target from the grant
+# on, so the newer gate's cancel verb frees the held grant at once, but a setup
+# already running in the workspace finishes first. Only the gate itself, after
+# `go`, stops at once.
 devbox_sync
 held_or_die
 
@@ -1999,6 +2545,7 @@ held_or_die
 # killed, since nothing will read the rest.
 devbox_runfile_phase gate
 [ "$RUN_MODE" = 1 ] || ledger_mark
+[ "$STEPS_ACTIVE" = 0 ] || STEPS_RAW="$WIN_DIR/run.out"
 printf 'go\n%s\n%s\n' "$GATE_HEADER" "$GATE_STDIN" >&"${JOIN_RUN_FD[$WINNER]}" &
 go_writer=$!
 join_close_fd "${JOIN_RUN_FD[$WINNER]}"
@@ -2012,6 +2559,19 @@ read -r status <"$WIN_DIR/run.rc" || status=1
 
 refuse_ssh_failure "$status" "$GATE_ERR" "$TARGET"
 refuse_prep_limit "$status" "$GATE_ERR" "$TARGET"
+
+# ── was it cancelled? ────────────────────────────────────────────────────────
+#
+# The pool stops a gate through one path, `devbox-pool stop`, for the watchdog
+# and for the `cancel` verb alike, and exits 79 with its line either way. The
+# reason tells them apart: a newer gate of this checkout, or `devbox cancel`,
+# stopped this one, and that is exit 14, never 10. A consumer's wrapper read
+# every stop as one kind, so an agent reported a cancel that never happened.
+if [ "$status" -eq 79 ] && [ "$STEPS_ACTIVE" = 1 ] && devbox_cancel_reason_is_newer "$GATE_ERR"; then
+  echo "devbox verify: $DEVBOX_CANCEL_REASON: the pool on $TARGET stopped this gate" >&2
+  steps_record_finish "$STEPS_RAW" 0 0
+  devbox_die 14
+fi
 
 # ── did the watchdog stop it? ────────────────────────────────────────────────
 #
@@ -2028,9 +2588,18 @@ if [ "$status" -eq 79 ] && stop_reason="$(grep -m1 -F "$WATCHDOG_LINE" "$GATE_ER
     echo "  this is not a test result. Do not rerun the gate unchanged: find the test that hangs or spins, or raise DEVBOX_GATE_MAX_SECONDS in $DEVBOX_CONFIG when the gate is really that long."
   } >&2
   ledger_after_stop
+  [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 0 0
   devbox_die 10
 fi
 refuse_lost_ticket "$status" "$GATE_ERR" "$TARGET"
+# From here the status is the gate's own. A planned gate's code is the code of
+# its first failed step in plan order, read from the runner's result lines: the
+# runner itself exits 1 for any failure, and a project's DEVBOX_VERIFY that
+# exited 3 must still make this run exit 3.
+if [ "$STEPS_ACTIVE" = 1 ]; then
+  steps_gate_code "$STEPS_RAW" "$status"
+  status="$STEPS_GATE_CODE"
+fi
 # A 75 is the gate's own here. The pool exits 75 only while it queues, before
 # its `held` line, and joins_failed reads that one. Before the hold mode a gate
 # of its own that exited exactly 75 was read as a pool that gave up, a known
@@ -2100,6 +2669,7 @@ if [ "$status" -ne 0 ] || [ "$STRICT" = 1 ]; then
     # 7 and not the gate's own status: this run says nothing about the tests.
     if [ "$oom_keeps_gate_status" != 1 ]; then
       ledger_after_stop
+      [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 0 0
       devbox_die 7
     fi
     echo '::devbox-infra::oom' >&2

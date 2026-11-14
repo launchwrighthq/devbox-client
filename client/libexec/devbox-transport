@@ -178,7 +178,11 @@ devbox_pid_identity() {
   local pid="${1-}" line rest st
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   if [ -r /proc/self/stat ]; then
-    read -r line <"/proc/$pid/stat" 2>/dev/null || return 1
+    # In braces: bash applies redirections in order, so the open of a gone
+    # pid's stat failed before a trailing 2>/dev/null applied, and every test
+    # of an ended gate printed "No such file or directory". A gone pid is the
+    # answer, and the return status says it.
+    { read -r line <"/proc/$pid/stat"; } 2>/dev/null || return 1
     rest="${line##*)}"
     [ "$rest" != "$line" ] || return 1
     local -a f

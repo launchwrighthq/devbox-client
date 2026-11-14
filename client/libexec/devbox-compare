@@ -78,10 +78,13 @@ main() {
   logs="$(mktemp -d)" || { echo "devbox-compare: mktemp -d failed; refusing to run without a log directory" >&2; exit 1; }
   trap 'rm -rf "$logs"' EXIT
 
+  # --full on both: the local gate writes a complete record, and the remote gate
+  # of the same tree would carry every step from it, run nothing, print no
+  # summary, and count zero against the local counts.
   echo "==> local gate"
-  "$devbox" verify --local 2>&1 | tee "$logs/local.log" | tail -3
+  "$devbox" verify --local --full 2>&1 | tee "$logs/local.log" | tail -3
   echo "==> remote gate"
-  "$devbox" verify ${target[@]+"${target[@]}"} 2>&1 | tee "$logs/remote.log" | tail -3
+  "$devbox" verify --full ${target[@]+"${target[@]}"} 2>&1 | tee "$logs/remote.log" | tail -3
 
   l="$(counts <"$logs/local.log")"
   r="$(counts <"$logs/remote.log")"

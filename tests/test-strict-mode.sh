@@ -20,6 +20,11 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# Every case runs the gate of one unchanged tree again, and the client carries
+# a step from the last complete record of its key (client-owns-the-gate spec,
+# D5), so a second case would run nothing. DEVBOX_RERUN=full runs every step
+# each time, and tests/test-verify-steps.sh proves the carry.
+export DEVBOX_RERUN=full
 # shellcheck source=tests/gate-stub-hold.sh
 source ./gate-stub-hold.sh
 REPO="$(cd .. && pwd)"

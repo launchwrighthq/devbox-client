@@ -30,11 +30,19 @@ usage() {
   cat <<'EOF'
 usage: devbox <command> [args]
 
-  verify [--local | --target <name>] [--fresh]
-                         run this checkout's gate on the first target whose pool grants;
-                         --local runs it here, --target joins one target from
-                         .devbox.env, runpod or hetzner; --fresh discards the
-                         ledger of a stopped gate instead of resuming it
+  verify [--local | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--plan]
+                         run this checkout's gate, the steps of .devbox/steps, on the
+                         first target whose pool grants; a step whose inputs did not
+                         change since it passed is carried; --local runs it here,
+                         --target joins one target from .devbox.env, runpod or
+                         hetzner; --full carries nothing, --changed carries what it
+                         can; --fresh is --full and discards the ledger of a stopped
+                         gate; --step runs only that step; --plan prints the plan
+                         and runs nothing
+  result [--failed-files [<step>] | --log <step>]
+                         print this checkout's newest gate record, its failed test
+                         files, or the saved log of one step
+  cancel                 cancel this checkout's running gate, here and on its target
   run [--target <name>] -- <command>
                          run one command in this checkout's workspace on a target, never here
   runpod up|status|down   manage this checkout's temporary CPU rental
@@ -92,6 +100,8 @@ runnable() {
 case "${1:-}" in
   verify)  shift; runnable "$LIBEXEC/devbox-verify" "$@"; exec "$LIBEXEC/devbox-verify" "$@" ;;
   run)     shift; runnable "$LIBEXEC/devbox-run" "$@"; exec "$LIBEXEC/devbox-run" "$@" ;;
+  result)  shift; runnable "$LIBEXEC/devbox-result" "$@"; exec "$LIBEXEC/devbox-result" "$@" ;;
+  cancel)  shift; runnable "$LIBEXEC/devbox-cancel" "$@"; exec "$LIBEXEC/devbox-cancel" "$@" ;;
   runpod) shift; runnable "$LIBEXEC/devbox-runpod" "$@"; exec "$LIBEXEC/devbox-runpod" "$@" ;;
   hetzner) shift; runnable "$LIBEXEC/devbox-hetzner" "$@"; exec "$LIBEXEC/devbox-hetzner" "$@" ;;
   compare) shift; runnable "$LIBEXEC/devbox-compare" "$@"; exec "$LIBEXEC/devbox-compare" "$@" ;;

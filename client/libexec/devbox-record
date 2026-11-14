@@ -1,0 +1,222 @@
+#!/bin/bash
+# The record of one gate (docs/specs/2026-11-14-client-owns-the-gate-design.md,
+# sections 6.7 and 7). Sourced by devbox-verify, devbox-plan and devbox-result,
+# after lib/devbox-lib.sh, whose require_run_id checks every run id that becomes
+# a file name here.
+# shellcheck shell=bash
+#
+# Each consumer kept its own record cache and printed it as one base64 line,
+# which every landing script parsed again. Consumers carried identical copies
+# of that code, and the copies of one design already disagreed. The
+# record is plain text now, one field per tab, in the style of the ledger:
+#
+#   run       <run-id>
+#   at        <epoch seconds>
+#   client    <VERSION>
+#   branch    <branch, or - when detached>
+#   commit    <sha>
+#   target    <target name, or local>
+#   scope     full | partial
+#   complete  1 | 0
+#   step      <name>  <key>  pass | fail | carried  <seconds>  <code>  full | narrowed | related
+#   file      <step>  <runner>  <path>  pass | fail | open
+#
+# A `file` line is `open` when the ledger holds the file's `start` and no end:
+# the gate ended while that file ran. Section 6.4 refuses to narrow such a step,
+# because the open file's result is unknown.
+#
+# Beside each `<run-id>.record` lie `<run-id>.files`, the manifest of the files
+# that run hashed, and `<run-id>.log`, the gate output the client saved. Only a
+# `complete 1` record answers a carry: a cancelled, stopped or killed gate, and
+# one whose files changed while it ran, wrote `complete 0`, and a pass in it
+# proves nothing about the tree it names.
+
+# The 200 newest records of a git common dir stay (section 7).
+DEVBOX_RECORD_KEEP=200
+
+# Print <git common dir>/devbox/records. The common dir, so every worktree of
+# one repository reads one set: a key holds the exact content of every input,
+# so a pass from another worktree or branch carries as well (section 6.2).
+devbox_record_dir() {
+  local common
+  common="$(git rev-parse --path-format=absolute --git-common-dir)" || return 1
+  printf '%s/devbox/records\n' "$common"
+}
+
+# The header fields every query of the records reads, one pass of awk over
+# every record. Each query defines begin(), called at the first line of each
+# file, its own line rules, and done(), called after the last line of each
+# file. A file with no line at all calls neither.
+# shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
+_DEVBOX_RECORD_AWK_HEAD='
+FNR == 1 { if (NR > 1) done(); run = ""; at = ""; complete = ""; branch = ""; scope = ""; file = FILENAME; begin() }
+$1 == "run" { run = $2 }
+$1 == "at" { at = $2 }
+$1 == "complete" { complete = $2 }
+$1 == "branch" { branch = $2 }
+$1 == "scope" { scope = $2 }
+END { if (NR > 0) done() }
+'
+
+# Run the awk program $1 over every record of this checkout, then print the
+# first field of the newest output line. Each output line of the program is
+# `<at><TAB><answer>`. Prints nothing when no record matches or none exists.
+# Ties on `at` fall back to the answer in reverse byte order, so the answer is
+# the same on every call.
+_devbox_record_query() {
+  local program="$1" dir best
+  local -a files
+  dir="$(devbox_record_dir)" || return 1
+  [ -d "$dir" ] || return 0
+  files=("$dir"/*.record)
+  [ -e "${files[0]}" ] || return 0
+  best="$(awk -F'\t' "$_DEVBOX_RECORD_AWK_HEAD$program" "${files[@]}" \
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2r | head -n 1)" || return 1
+  [ -z "$best" ] || printf '%s\n' "${best#*$'\t'}"
+}
+
+# Write the record text file $2 and the manifest file $3 of run $1 into the
+# record directory, each by rename, then keep the 200 newest records. $3 may be
+# empty: a record without its manifest still carries, and never selects
+# (section 7). The manifest lands first, so a record a carry finds always has
+# the manifest it was written with.
+devbox_record_write() {
+  local run="$1" record="$2" manifest="$3" dir
+  (require_run_id "$run" "the record of this gate") || return 2
+  dir="$(devbox_record_dir)" || return 1
+  mkdir -p -- "$dir" || { echo "devbox verify: could not create $dir, so this gate left no record" >&2; return 1; }
+  if [ -n "$manifest" ]; then
+    { cp -- "$manifest" "$dir/.$run.files.$$" && mv -f -- "$dir/.$run.files.$$" "$dir/$run.files"; } || {
+      echo "devbox verify: could not write $dir/$run.files, so this gate left no record" >&2
+      return 1
+    }
+  fi
+  { cp -- "$record" "$dir/.$run.record.$$" && mv -f -- "$dir/.$run.record.$$" "$dir/$run.record"; } || {
+    echo "devbox verify: could not write $dir/$run.record, so this gate left no record" >&2
+    return 1
+  }
+  devbox_record_prune "$dir"
+}
+
+# Remove every record of the directory $1 past the 200 newest by `at`, with its
+# manifest and its log. A `.log` with no record is a gate that still runs, and
+# stays.
+devbox_record_prune() {
+  local dir="$1" path
+  local -a files old
+  files=("$dir"/*.record)
+  [ -e "${files[0]}" ] || return 0
+  [ "${#files[@]}" -gt "$DEVBOX_RECORD_KEEP" ] || return 0
+  mapfile -t old < <(awk -F'\t' "$_DEVBOX_RECORD_AWK_HEAD"'
+    function begin() { }
+    function done() { print at "\t" file }' "${files[@]}" \
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2r | tail -n +"$((DEVBOX_RECORD_KEEP + 1))" | cut -f2-)
+  for path in "${old[@]}"; do
+    rm -f -- "$path" "${path%.record}.files" "${path%.record}.log" || {
+      echo "devbox verify: could not remove the old record $path" >&2
+      return 1
+    }
+  done
+}
+
+# Print the run id of the newest complete record in which step $1 passed under
+# the key $2. A `carried` step passed under that key in an earlier run, so it
+# answers too, and keeps a key alive after the run that first passed it is
+# pruned.
+devbox_record_find_pass() {
+  # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
+  RECORD_STEP="$1" RECORD_KEY="$2" _devbox_record_query '
+    function begin() { hit = 0 }
+    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && $3 == ENVIRON["RECORD_KEY"] && ($4 == "pass" || $4 == "carried") { hit = 1 }
+    function done() { if (complete == "1" && hit) print at "\t" run }'
+}
+
+# Print `<run-id> <outcome> <code>` of step $1's newest result in a complete
+# record.
+devbox_record_last_of() {
+  # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
+  RECORD_STEP="$1" _devbox_record_query '
+    function begin() { res = "" }
+    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] { res = $4 " " $6 }
+    function done() { if (complete == "1" && res != "") print at "\t" run " " res }'
+}
+
+# Print the run id of step $1's newest pass in a complete record, under any key.
+devbox_record_last_pass_of() {
+  # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
+  RECORD_STEP="$1" _devbox_record_query '
+    function begin() { hit = 0 }
+    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && ($4 == "pass" || $4 == "carried") { hit = 1 }
+    function done() { if (complete == "1" && hit) print at "\t" run }'
+}
+
+# Print the paths of run $1's file lines for step $2 whose outcome is $3, one
+# per line. An empty step names every step.
+_devbox_record_files() {
+  local run="$1" dir
+  (require_run_id "$run" "a record query") || return 2
+  dir="$(devbox_record_dir)" || return 1
+  [ -r "$dir/$run.record" ] || return 0
+  RECORD_STEP="$2" RECORD_OUTCOME="$3" awk -F'\t' '
+    $1 == "file" && (ENVIRON["RECORD_STEP"] == "" || $2 == ENVIRON["RECORD_STEP"]) && $5 == ENVIRON["RECORD_OUTCOME"] { print $4 }' \
+    "$dir/$run.record"
+}
+
+# The failed test files of step $2 in run $1. `devbox result --failed-files`
+# with no step passes an empty $2, for the failed files of every step.
+devbox_record_failed_files() { _devbox_record_files "$1" "$2" fail; }
+
+# The test files of step $2 in run $1 that were still running when it ended.
+devbox_record_open_files() { _devbox_record_files "$1" "$2" open; }
+
+# Print the path of the newest record whose branch is $1, else of the newest
+# record. Nothing when the directory holds no record.
+devbox_record_newest() {
+  local branch="$1" dir best
+  local -a files
+  dir="$(devbox_record_dir)" || return 1
+  [ -d "$dir" ] || return 0
+  files=("$dir"/*.record)
+  [ -e "${files[0]}" ] || return 0
+  best="$(RECORD_BRANCH="$branch" awk -F'\t' "$_DEVBOX_RECORD_AWK_HEAD"'
+    function begin() { }
+    function done() { print (branch == ENVIRON["RECORD_BRANCH"] ? 1 : 0) "\t" at "\t" file }' "${files[@]}" \
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2nr -k3,3r | head -n 1)" || return 1
+  [ -z "$best" ] || printf '%s\n' "${best#*$'\t'*$'\t'}"
+}
+
+# Print the record file $1 for a person: one line per step, `<name> <outcome>
+# <seconds>s code <code> <mode>`, then the verdict line of section 3. A failed
+# step names its failed test files by count. A partial record never prints
+# `green`, and an incomplete one says that it does not carry.
+devbox_record_summary() {
+  awk -F'\t' '
+    $1 == "run" { run = $2 }
+    $1 == "scope" { scope = $2 }
+    $1 == "complete" { complete = $2 }
+    $1 == "step" {
+      n++; name[n] = $2; outcome[$2] = $4
+      printf "%s %s %ss code %s %s\n", $2, $4, $5, $6, $7
+      if ($4 == "carried") carried++; else ran++
+    }
+    $1 == "file" && $5 == "fail" { failed_files[$2]++ }
+    END {
+      # A gate cancelled before any step ended has no step line either, and
+      # its record read "planned no step" for a gate that was running a step.
+      if (n == 0 && complete != "1") { printf "devbox: incomplete (run %s ended before any step did, so it does not carry)\n", run; exit }
+      if (n == 0) { printf "devbox: empty (run %s planned no step)\n", run; exit }
+      red = ""
+      for (i = 1; i <= n; i++) {
+        s = name[i]
+        if (outcome[s] != "fail") continue
+        part = s " failed"
+        if (failed_files[s] > 0) part = part ": " failed_files[s] " files"
+        red = red (red == "" ? "" : "; ") part
+      }
+      counts = n " steps: " (ran + 0) " ran, " (carried + 0) " carried"
+      if (complete != "1") printf "devbox: incomplete (run %s did not end every step, so it does not carry)\n", run
+      else if (red != "") printf "devbox: red (%s)\n", red
+      else if (scope == "partial") printf "devbox: partial pass (%s; only the named steps ran, so this is not a green gate)\n", counts
+      else printf "devbox: green (%s)\n", counts
+    }' "$1"
+}

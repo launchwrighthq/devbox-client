@@ -17,6 +17,11 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# Every case runs the gate of one unchanged tree again, and the client carries
+# a step from the last complete record of its key (client-owns-the-gate spec,
+# D5), so a second case would run nothing. DEVBOX_RERUN=full runs every step
+# each time, and tests/test-verify-steps.sh proves the carry.
+export DEVBOX_RERUN=full
 # shellcheck source=tests/gate-stub-hold.sh
 source ./gate-stub-hold.sh
 
@@ -383,11 +388,27 @@ assert_eq "0" "$(wc -l <"$CURL_LOG" | tr -d ' ')" "R6: no provider call was made
 assert_fail "R6: nothing was rented" contains "renting" "$out"
 write_env
 
-# ═══ D11: a preparation past the prep limit exits 12, and 78 under strict ═══
+# ═══ D11: a preparation past the prep limit queues once more ════════════════
+# The first release starts the run again; the second try, past the limit as
+# well, exits 12, and 78 under strict.
 FAKE_PREP=1 FAKE_SETUP_SECONDS=3 verify --target vps1
-assert_eq "12" "$rc" "D11: the grant released before go exits 12"
+assert_eq "12" "$rc" "D11: the grant released before go, twice, exits 12"
 assert_ok "D11: naming the pool's line" contains "released this run's grant before the gate started (released the grant: no go within 1s)" "$out"
+assert_eq "2" "$(grep -c "released this run's grant" <<<"$out")" "D11: the run was released twice, once per try"
+assert_ok "D11: the first release says the run queues once more" contains "this run queues once more" "$out"
+assert_ok "D11: the second says it was the second try" contains "on the second try too" "$out"
+assert_eq "2" "$(grep -c ' released prep$' "$HOLD_LOG")" "D11: the pool saw two runs, each released"
 assert_fail "D11: and no gate ran" contains "GATE RAN" "$out"
+reset_logs
+# Released once, then granted: the second try runs the gate and its code is
+# the gate's.
+printf '1\n' >"$TMP/prep-once"
+FAKE_PREP_ONCE="$TMP/prep-once" FAKE_SETUP_SECONDS=3 verify --target vps1
+assert_eq "0" "$rc" "D11: released once, the second try passes"
+assert_ok "D11: the second try ran the gate" contains "GATE RAN" "$out"
+assert_ok "D11: and said why it queued again" contains "this run queues once more" "$out"
+assert_eq "1" "$(grep -c ' go $' "$HOLD_LOG")" "D11: exactly one run got go"
+assert_eq "0" "$(find "$TMP/run" -path '*/runs/*' -type f 2>/dev/null | wc -l | tr -d ' ')" "D11: no run file outlives the retried run"
 reset_logs
 rc=0
 out="$(cd "$CO" && env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" DEVBOX_LOCK_WAIT=30 \

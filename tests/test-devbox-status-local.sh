@@ -236,10 +236,15 @@ rm -f "$RUNS"
 # tests/test-runpod.sh does for the dispatch.
 CLIENT="$TMP/client"
 mkdir -p "$CLIENT/client/libexec" "$CLIENT/lib"
-for f in devbox-verify devbox-run devbox-config devbox-transport devbox-targets devbox-askpass devbox-sync; do
+for f in devbox-verify devbox-run devbox-config devbox-transport devbox-targets devbox-askpass devbox-sync \
+  devbox-steps-file devbox-plan devbox-record devbox-cancel; do
   cp "$REPO/client/libexec/$f" "$CLIENT/client/libexec/"
 done
 cp "$REPO/lib/devbox-lib.sh" "$CLIENT/lib/"
+# The plan keys every step by the client version, and the step runner crosses
+# in the hooks, so the tree needs both.
+cp "$REPO/VERSION" "$CLIENT/"
+cp -R "$REPO/client/share" "$CLIENT/client/"
 cat >"$CLIENT/client/libexec/devbox-runpod" <<'BACKEND'
 for f in "$XDG_RUNTIME_DIR"/devbox/runs/*; do [ -e "$f" ] && cp "$f" "$SNAP/runpod"; done
 exit 0

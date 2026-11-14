@@ -1,0 +1,438 @@
+#!/bin/bash
+# devbox-steps: run the steps of one gate by their graph, in the workspace, or
+# on this machine for `devbox verify --local`.
+# docs/specs/2026-11-14-client-owns-the-gate-design.md section 6.3 holds the
+# design and section 6.7 the plan format and this program's output.
+#
+# Environment:
+#   DEVBOX_STEPS_PLAN    the plan file (section 6.7), required
+#   DEVBOX_STEPS_LOGS    the directory of the step logs, <name>.log, required
+#   DEVBOX_LEDGER        the ledger of the resumable-gates spec, section 3.3;
+#                        unset, no ledger line is written and no plug-in wired
+#   DEVBOX_RESUME        1 skips a step whose last ledger record is `pass`
+#   DEVBOX_LEDGER_TOOLS  the directory of vitest-ledger.mjs, ledger-core.mjs and
+#                        devbox_ledger.py; required when DEVBOX_LEDGER is set
+#                        and the plan holds a runner step
+#   DEVBOX_STEPS_STEP_LINES  0 writes no `step` line of this program's own. The
+#                        one step of a DEVBOX_VERIFY gate writes its own ledger
+#                        (resumable-gates spec, section 4.2), and a `verify`
+#                        step line around it would count as a unit of its own:
+#                        open at every stop, it was named as a hang at both
+#                        stops, and it hid the warning for a gate that wrote no
+#                        ledger at all.
+# The project directory is the current directory.
+#
+# Exit status: 0 when no step failed, 1 when one did, 2 for a refused plan or
+# environment before any step starts, or a ledger or a log that cannot be
+# written once steps run, 143 after SIGTERM and 130 after SIGINT.
+#
+# stdout: one line when a step starts, ends, carries or resumes, then a summary
+# table, the full log of each failed step after `== <name>: <log path>`, and
+# last one `devbox-steps: result <name> <pass|fail|resumed|carried> <seconds>
+# <code>` line per step, in plan order.
+set -euo pipefail
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
+  echo "devbox-steps: needs bash 4.3 or later for wait -n, and this is bash $BASH_VERSION" >&2
+  exit 2
+fi
+
+die() { echo "devbox-steps: $*" >&2; exit 2; }
+plan_die() { echo "devbox-steps: plan line $1: $2" >&2; exit 2; }
+
+[ -n "${DEVBOX_STEPS_PLAN-}" ] || die "DEVBOX_STEPS_PLAN names no plan file"
+[ -f "$DEVBOX_STEPS_PLAN" ] || die "the plan file $DEVBOX_STEPS_PLAN does not exist"
+[ -n "${DEVBOX_STEPS_LOGS-}" ] || die "DEVBOX_STEPS_LOGS names no log directory"
+mkdir -p "$DEVBOX_STEPS_LOGS" || die "cannot create the log directory $DEVBOX_STEPS_LOGS"
+LEDGER="${DEVBOX_LEDGER-}"
+RESUME="${DEVBOX_RESUME-0}"
+STEP_LINES="${DEVBOX_STEPS_STEP_LINES-1}"
+VITEST_DIR=node_modules/.devbox-ledger
+
+# ── the plan ─────────────────────────────────────────────────────────────────
+
+NAMES=()
+declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=()
+
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+  n=$((n + 1))
+  # read -a with a tab IFS folds two tabs into one, so an empty field would
+  # shift the next one into its place: the tab count is checked first.
+  tabs="${line//[!$'\t']/}"
+  fields=()
+  IFS=$'\t' read -r -a fields <<<"$line"
+  case "${fields[0]-}" in
+    step)
+      if [ "${#tabs}" -ne 6 ] || [ "${#fields[@]}" -ne 7 ]; then
+        plan_die "$n" "a step line has 7 non-empty fields separated by one tab"
+      fi
+      name="${fields[1]}"
+      [[ "$name" =~ ^[a-z0-9][a-z0-9:_-]*$ ]] || plan_die "$n" "the step name $(printf '%q' "$name") is not [a-z0-9][a-z0-9:_-]*"
+      [ -z "${MODE[$name]+x}" ] || plan_die "$n" "the step $name is planned twice"
+      case "${fields[2]}" in run | carry | narrow | related) ;; *) plan_die "$n" "the plan of $name is $(printf '%q' "${fields[2]}"), not run, carry, narrow or related" ;; esac
+      case "${fields[4]}" in vitest | pytest | -) ;; *) plan_die "$n" "the runner of $name is $(printf '%q' "${fields[4]}"), not vitest, pytest or -" ;; esac
+      [ "${fields[2]}" != narrow ] || [ "${fields[4]}" != - ] || plan_die "$n" "the narrow step $name names no runner"
+      [ "${fields[2]}" != related ] || [ "${fields[4]}" = vitest ] || plan_die "$n" "the related step $name is not a vitest step"
+      # The decode runs in this shell, so a command that is not base64 stops
+      # the plan here rather than running as an empty string. base64's own
+      # message names no plan line, and plan_die does.
+      cmd="$(printf '%s' "${fields[6]}" | base64 -d 2>/dev/null)" || plan_die "$n" "the command of $name is not base64"
+      [ -n "$cmd" ] || plan_die "$n" "the command of $name is empty"
+      if [ "${fields[2]}" = related ]; then
+        rest="${cmd#*vitest run}"
+        if [ "$rest" = "$cmd" ] || [ "${rest#*vitest run}" != "$rest" ]; then
+          plan_die "$n" "the related step $name must hold \`vitest run\` exactly once"
+        fi
+      fi
+      NAMES+=("$name")
+      MODE[$name]="${fields[2]}"
+      RUNNER[$name]="${fields[4]}"
+      AFTER[$name]=""
+      [ "${fields[5]}" = - ] || AFTER[$name]="${fields[5]//,/ }"
+      CMD[$name]="$cmd"
+      LINE[$name]="$n"
+      FILES[$name]=""
+      ;;
+    file)
+      if [ "${#tabs}" -ne 2 ] || [ "${#fields[@]}" -ne 3 ]; then
+        plan_die "$n" "a file line has 3 non-empty fields separated by one tab"
+      fi
+      name="${fields[1]}" path="${fields[2]}"
+      [ -n "${MODE[$name]+x}" ] || plan_die "$n" "a file line names $(printf '%q' "$name"), which no step line above it plans"
+      case "${MODE[$name]}" in narrow | related) ;; *) plan_die "$n" "a file line names $name, whose plan is ${MODE[$name]}, not narrow or related" ;; esac
+      # A runner reads a word that starts with - as one of its options, so the
+      # file would become a flag of the test run instead of its filter.
+      [ "${path#-}" = "$path" ] || plan_die "$n" "the file $(printf '%q' "$path") starts with -, which $name's runner would read as an option"
+      FILES[$name]+="$path"$'\n'
+      ;;
+    *) plan_die "$n" "a line starts with step or file, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
+  esac
+done <"$DEVBOX_STEPS_PLAN"
+[ "${#NAMES[@]}" -gt 0 ] || die "the plan $DEVBOX_STEPS_PLAN holds no step"
+
+for name in "${NAMES[@]}"; do
+  case "${MODE[$name]}" in
+    narrow | related)
+      # A narrow or a related step with no file runs the whole suite under a
+      # plan that says it ran a part, and `vitest related --run` with no file
+      # runs no test at all and passes.
+      [ -n "${FILES[$name]}" ] || plan_die "${LINE[$name]}" "the ${MODE[$name]} step $name has no file line"
+      ;;
+  esac
+  for dep in ${AFTER[$name]}; do
+    [ "$dep" != "$name" ] || plan_die "${LINE[$name]}" "the step $name runs after itself"
+    [ -n "${MODE[$dep]+x}" ] || plan_die "${LINE[$name]}" "the step $name runs after $(printf '%q' "$dep"), which the plan does not hold"
+  done
+done
+
+# A cycle in the after edges leaves steps that never start, and the loop below
+# would wait on nothing: the graph is walked once here, before anything runs.
+declare -A SEEN=()
+progress=1
+while [ "$progress" = 1 ]; do
+  progress=0
+  for name in "${NAMES[@]}"; do
+    [ -z "${SEEN[$name]+x}" ] || continue
+    ready=1
+    for dep in ${AFTER[$name]}; do [ -n "${SEEN[$dep]+x}" ] || ready=0; done
+    [ "$ready" = 0 ] || { SEEN[$name]=1; progress=1; }
+  done
+done
+for name in "${NAMES[@]}"; do
+  [ -n "${SEEN[$name]+x}" ] || plan_die "${LINE[$name]}" "the step $name is part of a cycle of after edges"
+done
+
+# ── the ledger ───────────────────────────────────────────────────────────────
+
+# One printf of the whole line, in append mode, so that the lines this program
+# and the plug-ins of parallel steps write interleave whole and never as
+# fragments of two records. devbox-ledger writes the same `step` lines.
+ledger_step() {
+  [ -n "$LEDGER" ] && [ "$STEP_LINES" != 0 ] || return 0
+  local line
+  printf -v line 'step\t%s\t%s' "$1" "$2"
+  [ "$#" -lt 3 ] || line+=$'\t'"$3"
+  printf '%s\n' "$line" >>"$LEDGER" || fatal "cannot append to the ledger $LEDGER"
+}
+
+# The LAST record of a step decides, as devbox-ledger and the plug-ins decide
+# for their units: a `start` after a `pass` means a later run began the step
+# and did not finish it.
+declare -A LEDGER_PASSED=()
+# With no step lines of this program's own, a `step` record in the ledger is
+# the gate's, and one it named `verify` must not skip the whole gate.
+if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ "$STEP_LINES" != 0 ] && [ -f "$LEDGER" ]; then
+  while IFS= read -r name; do
+    LEDGER_PASSED[$name]=1
+  done < <(awk -F '\t' '$1 == "step" { last[$2] = $3 } END { for (s in last) if (last[s] == "pass") print s }' "$LEDGER")
+fi
+
+if [ -n "$LEDGER" ]; then
+  # The shell's message names the path alone; die names the path and the cause.
+  { : >>"$LEDGER"; } 2>/dev/null || die "cannot append to the ledger $LEDGER"
+  need_vitest=0 need_pytest=0
+  for name in "${NAMES[@]}"; do
+    case "${MODE[$name]}" in carry) continue ;; esac
+    [ -z "${LEDGER_PASSED[$name]+x}" ] || continue
+    case "${RUNNER[$name]}" in vitest) need_vitest=1 ;; pytest) need_pytest=1 ;; esac
+  done
+  if [ "$need_vitest" = 1 ] || [ "$need_pytest" = 1 ]; then
+    [ -n "${DEVBOX_LEDGER_TOOLS-}" ] || die "DEVBOX_LEDGER is set and a runner step runs, but DEVBOX_LEDGER_TOOLS names no directory"
+  fi
+  if [ "$need_pytest" = 1 ]; then
+    [ -f "$DEVBOX_LEDGER_TOOLS/devbox_ledger.py" ] || die "DEVBOX_LEDGER_TOOLS holds no devbox_ledger.py, so a pytest step would write no file line"
+  fi
+  if [ "$need_vitest" = 1 ]; then
+    # vitest 3 refuses a reporter path outside the project folder, so the
+    # reporter is copied into it (resumable-gates spec, section 4.2). It imports
+    # ./ledger-core.mjs, so both files land side by side. The copy happens once,
+    # before any step, so two vitest steps never read a half-written file.
+    for f in vitest-ledger.mjs ledger-core.mjs; do
+      [ -f "$DEVBOX_LEDGER_TOOLS/$f" ] || die "DEVBOX_LEDGER_TOOLS holds no $f, so a vitest step would write no file line"
+    done
+    mkdir -p "$VITEST_DIR" || die "cannot create $PWD/$VITEST_DIR for the vitest reporter"
+    cp "$DEVBOX_LEDGER_TOOLS/vitest-ledger.mjs" "$DEVBOX_LEDGER_TOOLS/ledger-core.mjs" "$VITEST_DIR/" \
+      || die "cannot copy the vitest reporter into $PWD/$VITEST_DIR"
+  fi
+fi
+
+# ── the steps ────────────────────────────────────────────────────────────────
+
+STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devbox-steps.XXXXXX")" || die "mktemp -d failed"
+trap 'rm -rf "$STATE_DIR"' EXIT
+
+declare -A STATUS=() PID=() SECS=() CODE=() OUTCOME=()
+for name in "${NAMES[@]}"; do STATUS[$name]=pending; done
+
+log_of() { printf '%s/%s.log' "$DEVBOX_STEPS_LOGS" "$1"; }
+stamp() { printf '[%d s]' "$SECONDS"; }
+
+# The final command of one step, with the runner's plug-in and the file
+# filters appended. Every appended word goes through printf %q, because the
+# command runs under bash -c and a file name may hold a space or a quote.
+compose() {
+  local name="$1" cmd="${CMD[$1]}" f passed
+  local -a files=() excludes=()
+  [ -z "${FILES[$name]}" ] || mapfile -t files <<<"${FILES[$name]%$'\n'}"
+  [ "${MODE[$name]}" != related ] || cmd="${cmd/vitest run/vitest related --run}"
+  case "${RUNNER[$name]}" in
+    vitest)
+      if [ -n "$LEDGER" ]; then
+        cmd+=" --reporter=default --reporter=./$VITEST_DIR/vitest-ledger.mjs"
+        if [ "$RESUME" = 1 ]; then
+          # passedFiles() of the copied reporter is the exclusion helper of the
+          # resumable-gates spec, so the files left out here are the files the
+          # config form would leave out: the last record of each is `pass`.
+          passed="$(node --input-type=commonjs -e '
+            import(require("node:url").pathToFileURL(process.argv[1]).href)
+              .then((m) => { for (const f of m.passedFiles(process.cwd())) process.stdout.write(f + "\n"); })
+              .catch((err) => { console.error(err); process.exit(1); });
+          ' "$PWD/$VITEST_DIR/vitest-ledger.mjs")" || return 1
+          [ -z "$passed" ] || mapfile -t excludes <<<"$passed"
+          for f in "${excludes[@]}"; do cmd+=" --exclude $(printf '%q' "$f")"; done
+        fi
+      fi
+      ;;
+    pytest)
+      [ -z "$LEDGER" ] || cmd+=" -p devbox_ledger"
+      ;;
+  esac
+  for f in "${files[@]}"; do cmd+=" $(printf '%q' "$f")"; done
+  printf '%s\n' "$cmd"
+}
+
+# The body of one background job. Its result reaches the main loop through a
+# file written by rename, because `wait -n` before bash 5.1 does not say which
+# job ended.
+run_step() {
+  local name="$1" log started="$SECONDS" rc=0 cmd
+  log="$(log_of "$name")"
+  if cmd="$(compose "$name" 2>>"$log")"; then
+    printf 'devbox-steps: %s\n' "$cmd" >>"$log"
+    if [ "${RUNNER[$name]}" = pytest ] && [ -n "$LEDGER" ]; then
+      export PYTHONPATH="$DEVBOX_LEDGER_TOOLS${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    if [ "$name" = "$STREAM" ]; then
+      # pipefail is on, so the status is the command's unless tee itself fails.
+      bash -c "$cmd" </dev/null 2>&1 | tee -a "$log" || rc=$?
+    else
+      bash -c "$cmd" </dev/null >>"$log" 2>&1 || rc=$?
+    fi
+  else
+    rc=$?
+    printf 'devbox-steps: could not read the passed files of the ledger %s for --exclude, so %s did not run\n' "$LEDGER" "$name" >>"$log"
+  fi
+  printf '%s %s\n' "$rc" "$((SECONDS - started))" >"$STATE_DIR/$name.tmp"
+  mv -f "$STATE_DIR/$name.tmp" "$STATE_DIR/$name.done"
+}
+
+start_step() {
+  local name="$1"
+  : >"$(log_of "$name")" || fatal "cannot write the log $(log_of "$name")"
+  ledger_step "$name" start
+  # Before the fork, so a streamed step's first line never comes before its
+  # header.
+  echo "$(stamp) $name started"
+  [ "$name" != "$STREAM" ] || echo "== $name: $(log_of "$name")"
+  # Monitor mode for the fork alone gives the job its own process group, so a
+  # signal to this program reaches every process of a step through that group.
+  # Left on, it would print a job notice on stderr for every step that ends.
+  set -m
+  run_step "$name" &
+  PID[$name]=$!
+  set +m
+  STATUS[$name]=running
+}
+
+running_names() {
+  local name out=""
+  for name in "${NAMES[@]}"; do
+    [ "${STATUS[$name]}" != running ] || out+="${out:+ }$name"
+  done
+  printf '%s' "${out:-nothing}"
+}
+
+# Signal every running step's process group, give it 10 s to end, then kill
+# what remains.
+stop_running() {
+  local name alive i
+  for name in "${NAMES[@]}"; do
+    [ "${STATUS[$name]}" = running ] || continue
+    # The group may have ended between the scan and the signal.
+    kill -TERM -- "-${PID[$name]}" 2>/dev/null || true
+  done
+  for i in $(seq 1 20); do
+    alive=0
+    for name in "${NAMES[@]}"; do
+      [ "${STATUS[$name]}" = running ] || continue
+      # A group that is gone is the answer, not an error.
+      ! kill -0 -- "-${PID[$name]}" 2>/dev/null || alive=1
+    done
+    [ "$alive" = 1 ] || break
+    [ "$i" = 20 ] || sleep 0.5
+  done
+  for name in "${NAMES[@]}"; do
+    [ "${STATUS[$name]}" = running ] || continue
+    # The same race as above: a group that ended in the last half second.
+    kill -KILL -- "-${PID[$name]}" 2>/dev/null || true
+  done
+}
+
+# shellcheck disable=SC2317  # reached through the TERM and INT traps, never by name
+on_signal() {
+  local code="$1" sig="$2" running
+  trap - TERM INT
+  running="$(running_names)"
+  stop_running
+  echo "devbox-steps: stopped by SIG$sig; stopped the process groups of: $running" >&2
+  exit "$code"
+}
+trap 'on_signal 143 TERM' TERM
+trap 'on_signal 130 INT' INT
+
+fatal() {
+  echo "devbox-steps: $*" >&2
+  trap - TERM INT
+  stop_running
+  exit 2
+}
+
+# Carried and resumed steps end before the first fork, so a step after one of
+# them starts at once.
+for name in "${NAMES[@]}"; do
+  if [ "${MODE[$name]}" = carry ]; then
+    STATUS[$name]=ended OUTCOME[$name]=carried SECS[$name]=0 CODE[$name]=0
+    echo "$(stamp) $name carried"
+  elif [ -n "${LEDGER_PASSED[$name]+x}" ]; then
+    STATUS[$name]=ended OUTCOME[$name]=resumed SECS[$name]=0 CODE[$name]=0
+    echo "$(stamp) $name resumed: it passed in an earlier run of this gate"
+  fi
+done
+
+# A plan in which one step runs streams that step's output as it comes, after
+# its `== <name>: <log>` header, and the log is not printed again at the end.
+# Every DEVBOX_VERIFY gate is one step, and its output used to stream to the
+# terminal: behind the log file alone it printed nothing for its whole length,
+# and an agent that watches a silent terminal reads a hang. Two or more steps
+# that run in parallel keep their logs apart, because interleaved lines of two
+# test runs cannot be read.
+STREAM=""
+running=0
+for name in "${NAMES[@]}"; do
+  [ "${STATUS[$name]}" = pending ] || continue
+  running=$((running + 1))
+  STREAM="$name"
+done
+[ "$running" = 1 ] || STREAM=""
+
+finish_step() {
+  local name="$1" rc secs
+  read -r rc secs <"$STATE_DIR/$name.done"
+  CODE[$name]="$rc" SECS[$name]="$secs"
+  if [ "$rc" = 0 ]; then
+    OUTCOME[$name]=pass
+    ledger_step "$name" pass "$secs"
+    echo "$(stamp) $name passed ($secs s); running: $(running_names)"
+  else
+    OUTCOME[$name]=fail
+    ledger_step "$name" fail "$secs"
+    echo "$(stamp) $name failed ($secs s, code $rc); running: $(running_names)"
+  fi
+}
+
+while :; do
+  for name in "${NAMES[@]}"; do
+    [ "${STATUS[$name]}" = pending ] || continue
+    ready=1
+    for dep in ${AFTER[$name]}; do [ "${STATUS[$dep]}" = ended ] || ready=0; done
+    [ "$ready" = 0 ] || start_step "$name"
+  done
+  [ "$(running_names)" != nothing ] || break
+  # The status is read from each step's result file below; wait -n only blocks
+  # until one job ends, and returns 127 when that job was already reaped.
+  wait -n || true
+  # Every step that ended is marked first, so the progress line of each names
+  # only the steps still running.
+  ended=()
+  for name in "${NAMES[@]}"; do
+    [ "${STATUS[$name]}" = running ] || continue
+    # A job that is gone is the answer of kill -0, not an error.
+    if [ ! -f "$STATE_DIR/$name.done" ] && ! kill -0 "${PID[$name]}" 2>/dev/null; then
+      # The job died before it wrote its result, so a signal from outside this
+      # program took it. Its exit status, read as data, is the only code left.
+      # The file is read again because the job may write it and exit between
+      # the first test and kill -0.
+      [ -f "$STATE_DIR/$name.done" ] || {
+        rc=0
+        wait "${PID[$name]}" || rc=$?
+        printf '%s 0\n' "$rc" >"$STATE_DIR/$name.done"
+      }
+    fi
+    [ -f "$STATE_DIR/$name.done" ] || continue
+    STATUS[$name]=ended
+    ended+=("$name")
+  done
+  for name in "${ended[@]}"; do finish_step "$name"; done
+done
+
+# ── the summary ──────────────────────────────────────────────────────────────
+
+width=4
+for name in "${NAMES[@]}"; do [ "${#name}" -le "$width" ] || width="${#name}"; done
+failed=()
+echo "devbox-steps: summary"
+for name in "${NAMES[@]}"; do
+  printf '  %-*s  %-7s  %5s s  code %s\n' "$width" "$name" "${OUTCOME[$name]}" "${SECS[$name]}" "${CODE[$name]}"
+  [ "${OUTCOME[$name]}" != fail ] || failed+=("$name")
+done
+for name in "${failed[@]}"; do
+  [ "$name" != "$STREAM" ] || continue
+  echo "== $name: $(log_of "$name")"
+  cat "$(log_of "$name")"
+done
+for name in "${NAMES[@]}"; do
+  echo "devbox-steps: result $name ${OUTCOME[$name]} ${SECS[$name]} ${CODE[$name]}"
+done
+[ "${#failed[@]}" -eq 0 ] || exit 1
+exit 0

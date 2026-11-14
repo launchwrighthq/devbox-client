@@ -290,7 +290,7 @@ const src = (name) => path.join(web, 'src', name);
 
 process.env.DEVBOX_LEDGER = path.join(tmp, 'v5.ledger');
 const r5 = new Reporter();
-r5.onInit({ version: '5.1.0', config: { root: web } });
+r5.onInit({ version: '5.0.0', config: { root: web } });
 const m = (file, state, project = '') => ({ moduleId: src(file), project: { name: project }, state: () => state });
 r5.onTestModuleStart(m('a.test.ts', 'pending'));
 r5.onTaskUpdate([['any-id', { state: 'run' }]]);
@@ -308,7 +308,7 @@ const fa = file('fa', 'a.test.ts'); const fb = file('fb', 'b.test.ts'); const fc
 const t1 = { id: 't1', type: 'test', file: fa };
 const idMap = new Map([[fa.id, fa], [fb.id, fb], [fc.id, fc], [t1.id, t1]]);
 const r2 = new Reporter();
-r2.onInit({ version: '2.1.9', config: { root: web }, state: { idMap } });
+r2.onInit({ version: '2.0.0', config: { root: web }, state: { idMap } });
 r2.onTaskUpdate([['fa', { state: 'run' }], ['t1', { state: 'run' }]]);
 r2.onTaskUpdate([['t1', { state: 'pass' }], ['fa', { state: 'pass' }]]);
 r2.onTaskUpdate([['fb', { state: 'fail' }]]);
@@ -317,7 +317,7 @@ r2.onTaskUpdate([['fa', { state: 'pass' }]]);
 
 delete process.env.DEVBOX_LEDGER;
 const r0 = new Reporter();
-r0.onInit({ version: '5.1.0', config: { root: web } });
+r0.onInit({ version: '5.0.0', config: { root: web } });
 r0.onTestModuleStart(m('a.test.ts', 'pending'));
 r0.onTestModuleEnd(m('a.test.ts', 'passed'));
 r0.onTaskUpdate([['fa', { state: 'pass' }]]);

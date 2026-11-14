@@ -1,0 +1,300 @@
+#!/bin/bash
+# One gate per checkout (client-owns-the-gate spec, D7 and section 6.5): the
+# checkout's gate marker, the signal to an older gate and the `cancel` verb to
+# its target. Sourced by devbox-verify after lib/devbox-lib.sh,
+# devbox-transport and devbox-targets, which it calls into.
+# shellcheck shell=bash
+#
+# Two incidents shaped it, both MEASURED in a consumer's own wrapper. That
+# wrapper reported every SIGTERM as a cancel by a newer gate, so a time limit
+# that sent TERM read as a cancel by another session, and an agent reported a
+# cancel that never happened. Its cancel of the
+# older gate printed that it could not name the checkout's workspace on every
+# run, and cancelled nothing. So here a TERM is a cancel only when the marker
+# names a newer gate that is alive, and the host half is a gate verb that names
+# the slug, the machine and the run id.
+#
+# The marker is <private dir>/gates/<lane-1 slug>.gate, one line:
+#
+#   <pid> <pid identity> <run-id or -> <target or ->
+#
+# written by rename, so a reader never sees half a line. The private dir is
+# devbox-transport's, mode 0700, because the lane-1 slug carries the worktree's
+# name. The identity is devbox_pid_identity's: a pid alone names whatever
+# process holds that number now, and a TERM to a recycled pid stops a stranger.
+#
+# `devbox run` writes no marker and never calls devbox_cancel_older: lanes exist
+# so that runs of one worktree can run at once (D7). A process that wrote no
+# marker always reads its TERM as "stopped by SIGTERM", so a `devbox run` beside
+# a gate of its worktree never claims that gate's cancel.
+#
+# Run as a program, it is `devbox cancel`: devbox-verify loads the config, the
+# .devbox.env and the lane-1 slug the way a gate does, and calls
+# devbox_cancel_command. A second loader of those files for one subcommand would
+# be a copy that drifts, as three parses of the version answer once did.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  exec bash "$(dirname "$(readlink -f "$0")")/devbox-verify" --cancel "$@"
+fi
+
+DEVBOX_CANCEL_REASON="cancelled by a newer gate of this checkout"
+# The program name on every line, `devbox verify` unless devbox_cancel_command
+# runs.
+DEVBOX_CANCEL_WHO="devbox verify"
+# Seconds the older gate gets to end after its TERM. Its trap sends the cancel
+# verb to its own target and writes its record, which takes one ssh round trip.
+_DEVBOX_CANCEL_GRACE=30
+# Set by devbox_cancel_on_term: the pid of the newer gate that cancelled this
+# one, or empty.
+DEVBOX_CANCEL_NEWER_PID=""
+# Set by devbox_cancel_older: 1 when it signalled a live older gate or the
+# target stopped one.
+DEVBOX_CANCEL_FOUND=0
+# 1 once this process wrote its own marker. A TERM to a process that never
+# wrote one is never a cancel by a newer gate, whatever the marker names.
+_DEVBOX_CANCEL_MARKED=0
+
+# Each word that goes into the marker or comes out of it, by the library's
+# guards. They exit, so each runs in a subshell, whose refusal is the answer.
+_devbox_cancel_slug_ok() { ( require_safe_name "lane-1 slug" "${1-}" "the gate marker" ); }
+_devbox_cancel_run_ok() { [ "${1-}" = - ] || ( require_run_id "${1-}" "the gate marker" ); }
+# A target name is lowercase letters and digits, the rule devbox-config holds
+# DEVBOX_TARGETS to.
+_devbox_cancel_target_ok() { [ "${1-}" = - ] || [[ "${1-}" =~ ^[a-z0-9]+$ ]]; }
+
+# True when pid $1 runs and still carries identity $2.
+_devbox_cancel_alive() {
+  local pid="${1-}" ident="${2-}" now
+  is_uint "$pid" && [ -n "$ident" ] && [ "$ident" != - ] || return 1
+  # A gone pid is the answer "not alive", and devbox_pid_identity's return
+  # status says so. Its read once printed bash's "No such file or directory" on
+  # every test of an ended gate; devbox-transport now silences that read.
+  now="$(devbox_pid_identity "$pid")" || return 1
+  [ "$now" = "$ident" ]
+}
+
+# devbox_gate_marker_path <lane-1 slug>: print the marker's path, creating
+# <private dir>/gates at mode 0700. Returns 1 with a line on stderr when the
+# slug or the directory is refused.
+devbox_gate_marker_path() {
+  local slug="${1-}" priv
+  _devbox_cancel_slug_ok "$slug" || return 1
+  priv="$(devbox_gate_private_dir)" || return 1
+  [ -d "$priv/gates" ] || mkdir -m 0700 "$priv/gates" 2>/dev/null || [ -d "$priv/gates" ] || {
+    echo "$DEVBOX_CANCEL_WHO: cannot create $priv/gates for the gate marker" >&2
+    return 1
+  }
+  printf '%s/gates/%s.gate' "$priv" "$slug"
+}
+
+# devbox_gate_marker_write <lane-1 slug> <run-id or -> [<target or ->]: name
+# this process as the checkout's running gate, by rename. Call it again with
+# the target once the grant names one, so a newer gate can reach the older
+# gate's host after the older client is gone.
+devbox_gate_marker_write() {
+  local slug="${1-}" run="${2:--}" target="${3:--}" path ident tmp
+  _devbox_cancel_run_ok "$run" || return 1
+  _devbox_cancel_target_ok "$target" || {
+    echo "$DEVBOX_CANCEL_WHO: refusing target '$target' for the gate marker: a target name is lowercase letters and digits" >&2
+    return 1
+  }
+  path="$(devbox_gate_marker_path "$slug")" || return 1
+  # An identity that cannot be read is written as `-`, which no reader takes
+  # for a live gate: a newer gate then never signals this pid, and the target's
+  # cancel verb still reaches its gate.
+  ident="$(devbox_pid_identity "$$")" || ident="-"
+  tmp="$path.$$.tmp"
+  if printf '%s %s %s %s\n' "$$" "$ident" "$run" "$target" >"$tmp" && mv -f "$tmp" "$path"; then
+    _DEVBOX_CANCEL_MARKED=1
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "$DEVBOX_CANCEL_WHO: cannot write the gate marker $path, so a newer gate of this checkout cannot cancel this one" >&2
+  return 1
+}
+
+# devbox_gate_marker_remove <lane-1 slug>: remove the marker when it still
+# names this process. A newer gate that renamed its own marker in keeps it.
+# The read and the remove are two steps, so a newer gate that writes between
+# them loses its marker, and a third gate then cannot find the second.
+devbox_gate_marker_remove() {
+  local path pid
+  path="$(devbox_gate_marker_path "${1-}")" || return 1
+  [ -f "$path" ] || return 0
+  read -r pid _ <"$path" || return 0
+  [ "$pid" = "$$" ] || return 0
+  rm -f "$path"
+}
+
+# _devbox_cancel_send <target> <slug> <machine-id> <run-id> <older|own>: the
+# `cancel` verb on one named target, through devbox-transport. It moves the
+# transport to that target, so a caller that sends another verb afterwards
+# calls devbox_target_use for its own target first. One line on stderr for
+# every answer but "no such gate", which is the normal answer once the older
+# gate's own trap has cancelled its run.
+#
+# Returns 0 when the host stopped a gate, 1 when none ran, 2 when the host has
+# no cancel verb, 3 for any other failure. No answer stops the caller.
+_devbox_cancel_send() {
+  local target="$1" slug="$2" mid="$3" run="$4" whose="$5" what out rc=0
+  what="the older gate"
+  [ "$whose" = older ] || what="this gate"
+  # In this shell, never in $(...): it sets the GATE_* globals every call below
+  # reads. A subshell's copy was lost, and the master open then asked
+  # ssh-keyscan for the key of an empty address. Its
+  # own refusal names an empty host for a target the .devbox.env no longer
+  # lists, the one way a target the marker names fails here (devbox_env_load
+  # refuses a malformed address before this runs), so the line below replaces it.
+  if ! devbox_target_use "$target" >/dev/null 2>&1; then
+    echo "$DEVBOX_CANCEL_WHO: could not cancel $what $run on $target: $target is not a target in ${DEVBOX_ENV:-.devbox.env}" >&2
+    return 3
+  fi
+  # A call in a TERM trap must end, so each ssh gets a limit when this laptop
+  # has `timeout`, as the probe's do. A host that accepts TCP and then stalls
+  # in authentication otherwise holds the exit of the gate it would cancel.
+  local GATE_TIME_LIMIT="$GATE_TIME_LIMIT"
+  if command -v timeout >/dev/null 2>&1; then GATE_TIME_LIMIT=20; fi
+  # devbox_gate_open opens the master with its stderr in a file. A master that
+  # devbox_gate's ControlMaster=auto started inside the $(...) below would hold
+  # that pipe open, and the substitution would wait for ControlPersist.
+  if ! devbox_gate_open; then
+    echo "$DEVBOX_CANCEL_WHO: could not cancel $what $run on $target: $GATE_OPEN_ERROR" >&2
+    return 3
+  fi
+  out="$(devbox_gate cancel "$slug" "$mid" "$run" 2>&1 </dev/null)" || rc=$?
+  case "$rc" in
+    0) echo "$DEVBOX_CANCEL_WHO: cancelled $what $run on $target" >&2; return 0 ;;
+    1) return 1 ;;
+  esac
+  # An older host's devbox-gate refuses a verb it does not know with exit 2 and
+  # this text (section 8). The newer gate runs on another lane meanwhile.
+  case "$out" in
+    *"unknown verb 'cancel'"*)
+      if [ "$whose" = older ]; then
+        echo "$DEVBOX_CANCEL_WHO: $target has no cancel verb; the older gate there runs to its end" >&2
+      else
+        echo "$DEVBOX_CANCEL_WHO: $target has no cancel verb; this gate there ends when its ssh session drops" >&2
+      fi
+      return 2 ;;
+  esac
+  out="${out%%$'\n'*}"
+  echo "$DEVBOX_CANCEL_WHO: could not cancel $what $run on $target: ${out:-ssh exited $rc}" >&2
+  return 3
+}
+
+# devbox_cancel_older <lane-1 slug> <machine-id> <run-id or ->: section 6.5's
+# cancel_older_gate. Writes this process's marker FIRST, so the older gate's
+# trap reads a newer live pid, then TERMs the older client when it still runs,
+# waits up to _DEVBOX_CANCEL_GRACE seconds for it to end, and sends the cancel
+# verb for the older run id to the older target, because the older client may
+# be gone while its gate is not.
+#
+# Needs devbox_env_load to have run, so devbox_target_use can name the older
+# target; a rented Hetzner target also needs the TARGET_KNOWN_HOSTS and
+# TARGET_SECRET entries devbox-hetzner sets. Returns 1 only when the marker
+# cannot be written; every failure to cancel is one line and return 0.
+devbox_cancel_older() {
+  local slug="${1-}" mid="${2-}" run="${3:--}" path n
+  local old_pid="" old_ident="" old_run="" old_target=""
+  DEVBOX_CANCEL_FOUND=0
+  path="$(devbox_gate_marker_path "$slug")" || return 1
+  if [ -f "$path" ]; then
+    # A marker written without a final newline makes read return 1 after it
+    # filled every field; an empty or torn one leaves old_pid empty, which the
+    # test below reads as no older gate.
+    read -r old_pid old_ident old_run old_target <"$path" || true
+  fi
+  devbox_gate_marker_write "$slug" "$run" || return 1
+  if [ -z "$old_pid" ] || [ "$old_pid" = "$$" ]; then return 0; fi
+  if _devbox_cancel_alive "$old_pid" "$old_ident"; then
+    DEVBOX_CANCEL_FOUND=1
+    echo "$DEVBOX_CANCEL_WHO: cancelling the older gate of this checkout (pid $old_pid)" >&2
+    # The older gate may end between the identity test and this signal, and
+    # the wait below then finds it gone, which is the outcome the TERM asked for.
+    kill -TERM "$old_pid" 2>/dev/null || true
+    n=0
+    while _devbox_cancel_alive "$old_pid" "$old_ident"; do
+      if [ "$n" -ge "$((_DEVBOX_CANCEL_GRACE * 5))" ]; then
+        echo "$DEVBOX_CANCEL_WHO: the older gate (pid $old_pid) still runs ${_DEVBOX_CANCEL_GRACE}s after its SIGTERM; this gate starts anyway" >&2
+        break
+      fi
+      sleep 0.2
+      n=$((n + 1))
+    done
+  fi
+  # A marker word of another shape sends no verb. The guard's refusal line is
+  # dropped because it would name "the gate marker" to a user who wrote none:
+  # only a gate of this user writes that file, in a 0700 directory.
+  if [ -n "$old_target" ] && [ "$old_target" != - ] && _devbox_cancel_target_ok "$old_target" \
+     && [ -n "$old_run" ] && [ "$old_run" != - ] && _devbox_cancel_run_ok "$old_run" 2>/dev/null; then
+    if _devbox_cancel_send "$old_target" "$slug" "$mid" "$old_run" older; then DEVBOX_CANCEL_FOUND=1; fi
+  fi
+  return 0
+}
+
+# devbox_cancel_on_term <lane-1 slug>: the decision of section 6.5's TERM trap.
+# Prints one line on stderr and returns the exit code: 14 with
+# `cancelled by a newer gate of this checkout (pid N)` when this process wrote
+# its marker and the marker now names another live gate, else 143 with
+# `stopped by SIGTERM`. Sets DEVBOX_CANCEL_NEWER_PID for the 14.
+devbox_cancel_on_term() {
+  local path pid="" ident=""
+  DEVBOX_CANCEL_NEWER_PID=""
+  if [ "$_DEVBOX_CANCEL_MARKED" = 1 ] && path="$(devbox_gate_marker_path "${1-}" 2>/dev/null)" \
+     && [ -f "$path" ] && read -r pid ident _ <"$path" \
+     && [ "$pid" != "$$" ] && _devbox_cancel_alive "$pid" "$ident"; then
+    # shellcheck disable=SC2034  # read by the scripts that source this file, never here
+    DEVBOX_CANCEL_NEWER_PID="$pid"
+    echo "$DEVBOX_CANCEL_WHO: $DEVBOX_CANCEL_REASON (pid $pid)" >&2
+    return 14
+  fi
+  echo "$DEVBOX_CANCEL_WHO: stopped by SIGTERM" >&2
+  return 143
+}
+
+# devbox_cancel_own_run <target or -> <lane-1 slug> <machine-id> <run-id>: the
+# cancel verb for this gate's own run on its own target, from the TERM trap,
+# once the gate holds a grant there. The pool also stops a gate whose ssh
+# session ends, and this makes the stop happen now rather than when the session
+# drops. A target of `-` or empty sends nothing. Always returns 0.
+devbox_cancel_own_run() {
+  local target="${1-}"
+  if [ -z "$target" ] || [ "$target" = - ]; then return 0; fi
+  _devbox_cancel_target_ok "$target" || return 0
+  # The gate is ending either way: a stop the host refuses or cannot be told
+  # still ends when this session drops. _devbox_cancel_send printed why, or
+  # found no grant of this run to stop.
+  _devbox_cancel_send "$target" "${2-}" "${3-}" "${4-}" own || true
+  return 0
+}
+
+# devbox_cancel_reason_is_newer <pool stderr file>: true when the pool's stop
+# line carries the cancel reason exactly. devbox-pool prints
+# `devbox-pool: the watchdog stopped this gate: <reason>` and exits 79 for every
+# stop through `devbox-pool stop`, so the reason is what tells a cancel (exit
+# 14) from a watchdog stop (exit 10).
+devbox_cancel_reason_is_newer() {
+  [ -r "${1-}" ] || return 1
+  grep -qxF "devbox-pool: the watchdog stopped this gate: $DEVBOX_CANCEL_REASON" "$1"
+}
+
+# devbox_cancel_command <lane-1 slug> <machine-id>: `devbox cancel`. Cancels
+# this checkout's running gate, here and on its target, by the path a newer gate
+# takes: its own marker first (run id `-`, so a later gate sends no verb for
+# it), then the TERM and the verb, then its marker goes. The cancelled gate
+# reads a live pid that is not its own and exits 14.
+#
+# Needs what devbox_cancel_older needs. Returns 0 when it stopped a gate, 1 when
+# no gate of this checkout ran, with one line.
+devbox_cancel_command() {
+  local DEVBOX_CANCEL_WHO="devbox cancel" path
+  path="$(devbox_gate_marker_path "${1-}")" || return 1
+  if [ ! -f "$path" ]; then
+    echo "devbox cancel: no gate of this checkout is running" >&2
+    return 1
+  fi
+  devbox_cancel_older "${1-}" "${2-}" - || return 1
+  devbox_gate_marker_remove "${1-}"
+  if [ "$DEVBOX_CANCEL_FOUND" = 1 ]; then return 0; fi
+  echo "devbox cancel: no gate of this checkout is running" >&2
+  return 1
+}

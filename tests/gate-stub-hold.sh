@@ -32,8 +32,9 @@
 #                run of one `devbox verify`. The header's lines are kept in
 #                _HOLD_ENV for _hold_gate.
 #   _hold_gate   the gate of a resumable-gates run, after _hold_run: the gate's
-#                stdin (the hooks and the ledger script) runs as gate-root's
-#                verify entry runs it, with the workspace's /home/dev/.devbox
+#                stdin (the hooks, the step runner and the ledger script) runs
+#                as gate-root's verify entry runs it, with the workspace's
+#                /home/dev/.devbox, of the ledger and of the step runner both,
 #                at $FAKE_WS/<host>/<slug>, and the header's lines exported.
 #                While $FAKE_STOP_FILE holds a number above 0, the run takes one
 #                from it, tells the gate FAKE_STOPPING=1, and after the gate
@@ -134,9 +135,16 @@ _hold_run() {
   echo "==> granted ${FAKE_GRANTED:-$_want} tokens after ${_wait:-0}s" >&2
   printf 'devbox-pool: held %s %s\n' "${FAKE_GRANTED:-$_want}" "$_want" >&2
   _hold_log held "${FAKE_GRANTED:-$_want}"
-  if IFS= read -r -t "${FAKE_PREP:-60}" _cmd; then _rc=0; else _rc=$?; fi
+  # FAKE_PREP_ONCE names a file that holds the prep limit of the next run
+  # alone: the run that reads it removes it, and every later run waits 60s.
+  local _prep="${FAKE_PREP:-60}"
+  if [ -n "${FAKE_PREP_ONCE-}" ] && [ -f "$FAKE_PREP_ONCE" ]; then
+    read -r _prep <"$FAKE_PREP_ONCE"
+    rm -f "$FAKE_PREP_ONCE"
+  fi
+  if IFS= read -r -t "$_prep" _cmd; then _rc=0; else _rc=$?; fi
   if [ "$_rc" -gt 128 ]; then
-    echo "devbox-pool: released the grant: no go within ${FAKE_PREP:-60}s" >&2
+    echo "devbox-pool: released the grant: no go within ${_prep}s" >&2
     _hold_log released prep
     exit 80
   fi
@@ -172,7 +180,8 @@ _hold_gate() {
   # A gate that ends before it reads its stdin, as a docker exec that fails does.
   [ -z "${FAKE_SKIP_STDIN-}" ] || exit "$FAKE_SKIP_STDIN"
   for _e in ${_HOLD_ENV[@]+"${_HOLD_ENV[@]}"}; do export "${_e?}"; done
-  sed "s#^_devbox_ledger_home=/home/dev/.devbox\$#_devbox_ledger_home=$_ws#" \
+  sed -e "s#^_devbox_ledger_home=/home/dev/.devbox\$#_devbox_ledger_home=$_ws#" \
+    -e "s#^_devbox_steps_home=/home/dev/.devbox\$#_devbox_steps_home=$_ws#" \
     | GATE_HOST="$GATE_HOST" FAKE_STOPPING="$_stop" bash -c "$_entry" || _rc=$?
   if [ "$_stop" = 1 ]; then
     _hold_log stopped "$_slug"

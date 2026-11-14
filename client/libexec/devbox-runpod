@@ -155,7 +155,10 @@ runpod_ssh() {
   # OpenSSH joins its command arguments with spaces. Quote that whole command once for
   # the activity wrapper, including scripts whose first word is a variable assignment.
   printf -v command '%q' "$*"
-  ssh -F "$RP_STATE/ssh_config" devbox-runpod "bash /opt/devbox/runpod-runtime activity bash -c $command"
+  # RUNPOD_SSH_EXEC=1 makes ssh replace the shell of a background call, so its
+  # $! is ssh itself. A TERM to the subshell of a function call never reached
+  # ssh, and a cancelled pod gate went on running.
+  ${RUNPOD_SSH_EXEC:+exec} ssh -F "$RP_STATE/ssh_config" devbox-runpod "bash /opt/devbox/runpod-runtime activity bash -c $command"
 }
 
 # The project's DEVBOX_REQUIRES, checked on the pod as dev, the user the gate runs as. A
@@ -170,7 +173,7 @@ runpod_requires() {
   [ "${#REQUIRES[@]}" -gt 0 ] || return 0
   echo "==> pod requirements: ${REQUIRES[*]}"
   printf -v quoted ' %q' "${REQUIRES[@]}"
-  out="$("${SSH[@]}" "runuser -u dev -- bash /opt/devbox/client/libexec/devbox-requires-local$quoted" 2>&1)" || rc=$?
+  out="$("${SSH[@]}" "runuser -u dev -- bash /opt/devbox/client/libexec/devbox-requires-local$quoted" 2>&1 </dev/null)" || rc=$?
   [ "$rc" -ne 0 ] || return 0
   printf '%s\n' "$out" >&2
   # 1 is an unmet token and 2 a token the check refuses, as check-requires answers on a
@@ -200,7 +203,10 @@ runpod_execute() {
   # shellcheck disable=SC2034
   SYNC_WORKSPACE="$SYNC_DEST"
   printf -v RSYNC_SSH 'ssh -F %q' "$RP_STATE/ssh_config"
-  "${SSH[@]}" "mkdir -p $SYNC_DEST /opt/devbox/lib /opt/devbox/client/libexec /workspace/results"
+  # The command reads no stdin, and without </dev/null ssh forwarded the
+  # caller's own stdin to the pod. A test whose stdin was an open pipe hung on
+  # it until its time limit, every time.
+  "${SSH[@]}" "mkdir -p $SYNC_DEST /opt/devbox/lib /opt/devbox/client/libexec /workspace/results" </dev/null
   # shellcheck source=/dev/null
   source "$RP_CLIENT/devbox-sync"
   # The two remote steps devbox-sync asks its caller for. A pod is a rented
@@ -273,8 +279,39 @@ REMOTE
   # A pod has no pool and no queue: the gate starts at once.
   devbox_runfile_phase gate
   echo "==> gate ($tokens tokens); log: $logdir/output.log"
+  # A verify gate's output passes through devbox-verify's display, which keeps the
+  # step runner's result lines out of the terminal; output.log keeps every byte,
+  # and the record reads those lines from it. A run's output is its command's own.
+  local display=(tee "$logdir/output.log") reports=1
+  [ "${STEPS_ACTIVE:-0}" != 1 ] || display=(steps_display "$logdir/output.log")
   # stdin carries the command and forwarded values; no secret becomes an ssh argv.
-  "${SSH[@]}" 'runuser -u dev -- bash -se' < "$RP_STATE/run.sh" 2>&1 | tee "$logdir/output.log" || status=$?
+  if [ "${STEPS_ACTIVE:-0}" = 1 ]; then
+    # A verify gate runs as a background job, as on this laptop. Bash runs a
+    # trap only after a foreground command ends, so a newer gate's cancel of a
+    # foreground pod gate waited for the whole gate, and the gate's real pass or
+    # fail was then reported as cancelled, with no record. The output reaches
+    # the display through a descriptor and runpod_ssh execs, so $! is ssh's own pid.
+    local ofd fpid n=0
+    # devbox-verify's TERM and INT traps read both in the sourcing shell.
+    # shellcheck disable=SC2034
+    STEPS_TARGET=runpod
+    # shellcheck disable=SC2034
+    STEPS_RAW="$logdir/output.log"
+    exec {ofd}> >("${display[@]}")
+    fpid=$!
+    RUNPOD_SSH_EXEC=1 "${SSH[@]}" 'runuser -u dev -- bash -se' < "$RP_STATE/run.sh" >&"$ofd" 2>&1 &
+    STEPS_JOB_PID=$!
+    exec {ofd}>&-
+    trap steps_on_int INT
+    wait "$STEPS_JOB_PID" || status=$?
+    STEPS_JOB_PID=""
+    trap 'exit 130' INT
+    # The display must have written its last line before the record reads the
+    # log. Bounded, because a child of ssh that outlived it may hold the pipe.
+    while kill -0 "$fpid" 2>/dev/null && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+  else
+    "${SSH[@]}" 'runuser -u dev -- bash -se' < "$RP_STATE/run.sh" 2>&1 | "${display[@]}" || status=$?
+  fi
   # From here the status is the gate's, and devbox-verify's strict map passes it through.
   # devbox_exit_code in the sourcing shell reads it.
   # shellcheck disable=SC2034
@@ -284,8 +321,16 @@ REMOTE
   # the result from the gate's output, which is already in output.log.
   rsync -a "${SYNC_RSYNC_ARGS[@]}" -e "$RSYNC_SSH" "devbox-runpod:$remote_results/" "$logdir/" || {
     echo 'devbox runpod: could not download reports' >&2
-    [ "$status" -ne 0 ] || [ "$STRICT" = 1 ] || status=1
+    reports=0
   }
+  # The gate's code is its first failed step's, and every gate writes its record
+  # (client-owns-the-gate spec, sections 6.1 and 7). A pod keeps no ledger, so
+  # the record holds no file line.
+  if [ "${STEPS_ACTIVE:-0}" = 1 ]; then
+    steps_gate_finish "$logdir/output.log" "$status"
+    status="$STEPS_GATE_CODE"
+  fi
+  [ "$reports" = 1 ] || [ "$status" -ne 0 ] || [ "$STRICT" = 1 ] || status=1
   printf '%s\n' "$status" > "$logdir/exit-code"
   return "$status"
 }
@@ -295,8 +340,9 @@ runpod_finish() {
   trap - EXIT INT TERM
   rm -f "$RP_STATE/run.sh"
   # This trap replaces devbox-verify's, so it removes the run file of
-  # `devbox status` itself.
+  # `devbox status` itself, and the checkout's gate marker and the plan's files.
   devbox_runfile_remove
+  ! declare -F steps_exit >/dev/null || steps_exit
   if [ "$RP_CLEANUP" = 1 ]; then
     runpod_down || { echo 'devbox runpod: cleanup unconfirmed; retry runpod down' >&2; [ "$status" -ne 0 ] || status=1; }
   fi
@@ -368,7 +414,13 @@ runpod_main() {
   RP_CLEANUP=0
   trap runpod_finish EXIT
   trap 'exit 130' INT
-  trap 'exit 143' TERM
+  # A verify gate keeps devbox-verify's TERM trap, which tells a newer gate's
+  # cancel (exit 14) from any other SIGTERM (exit 143), as on a deployed target.
+  if [ "${STEPS_ACTIVE:-0}" = 1 ]; then
+    trap steps_on_term TERM
+  else
+    trap 'exit 143' TERM
+  fi
   if [ -f "$RP_STATE/pod.json" ] && [ "$(jq -r '.terminated // false' "$RP_STATE/pod.json")" = false ]; then
     id=$(jq -r '.id // empty' "$RP_STATE/pod.json")
     if [ -z "$id" ]; then

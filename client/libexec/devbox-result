@@ -1,0 +1,88 @@
+#!/bin/bash
+# `devbox result`: print this checkout's newest gate record
+# (docs/specs/2026-11-14-client-owns-the-gate-design.md, sections 3 and 7).
+#
+# Every landing script grepped the gate output for a verdict line, or decoded a
+# record line of its own, each with its own parser. The record is the
+# client's now, and this is the one reader a script calls:
+#
+#   devbox result                         one line per step, then the verdict
+#   devbox result --failed-files [<step>] the failed test files, one per line
+#   devbox result --log <step>            the saved log section of one step
+#
+# Exit 0, 1 when there is no record (or no log of that step), 2 for a usage
+# error or a directory outside a git checkout.
+set -euo pipefail
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox result: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-record
+source "$_here/devbox-record"
+# shellcheck disable=SC2034  # read by require_run_id in lib/devbox-lib.sh, a source shellcheck does not follow
+DEVBOX_GUARD_WHO="devbox result"
+
+usage() {
+  echo "usage: devbox result [--failed-files [<step>] | --log <step>]" >&2
+  exit 2
+}
+
+mode=summary step=""
+case "${1-}" in
+  "") [ "$#" -eq 0 ] || usage ;;
+  --failed-files) [ "$#" -le 2 ] || usage; mode=failed step="${2-}" ;;
+  --log) [ "$#" -eq 2 ] || usage; mode=log step="$2" ;;
+  *) usage ;;
+esac
+# A step name of section 4.2. Anything else names no step of any record.
+if [ -n "$step" ] && ! [[ "$step" =~ ^[a-z0-9][a-z0-9:_-]*$ ]]; then
+  echo "devbox result: '$step' is not a step name" >&2
+  usage
+fi
+
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "devbox result: $PWD is not inside a git checkout" >&2; exit 2; }
+# The record directory lies under the git common dir, which every worktree of
+# the repository shares, so another worktree's gate may be the newest record.
+# A landing script asks about the branch it lands, so the newest record of
+# this branch answers first, and the newest of any branch only when this
+# branch has none. A detached HEAD has no branch: symbolic-ref exits 1 and the
+# record says `-` (section 7).
+branch="$(git symbolic-ref --short -q HEAD)" || branch=-
+record="$(devbox_record_newest "$branch")"
+if [ -z "$record" ]; then
+  echo "devbox result: no record in $(devbox_record_dir); devbox verify writes one after each gate" >&2
+  exit 1
+fi
+run="$(awk -F'\t' '$1 == "run" { print $2; exit }' "$record")"
+
+case "$mode" in
+  summary)
+    devbox_record_summary "$record"
+    ;;
+  failed)
+    devbox_record_failed_files "$run" "$step"
+    ;;
+  log)
+    log="${record%.record}.log"
+    [ -r "$log" ] || { echo "devbox result: run $run saved no log at $log" >&2; exit 1; }
+    # A step's section starts at its `== <step>: ` header and ends at the next
+    # header or at the runner's result lines. The runner prints the log of a
+    # failed step only (section 6.3).
+    section="$(RESULT_STEP="$step" awk '
+      index($0, "== " ENVIRON["RESULT_STEP"] ": ") == 1 { on = 1; print; next }
+      on && (/^== / || /^devbox-steps: result /) { exit }
+      on { print }' "$log")"
+    [ -n "$section" ] || {
+      echo "devbox result: the log of run $run holds no section for step $step; the gate prints the log of a failed step only" >&2
+      exit 1
+    }
+    printf '%s\n' "$section"
+    ;;
+esac
