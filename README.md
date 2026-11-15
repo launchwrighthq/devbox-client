@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.4.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.4.1"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.4.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.4.1"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.4.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.4.1"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,11 +53,24 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.4.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.4.1 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
 `client/bin/devbox` from `~/.local/bin` also works.
+
+A worktree keeps the client it installed until its dependencies are installed again. So
+`devbox verify` and `devbox run` read the version the checkout pins: the
+`@launchwrighthq/devbox-client` entry of the root `package.json` (`#vX.Y.Z`, a
+`refs/tags/vX.Y.Z` URL or a plain `X.Y.Z`), or else the `devbox-client` requirement of
+`pyproject.toml` (`@vX.Y.Z` or `==X.Y.Z`). When the running client is older, they print one
+line before the target choice and go on:
+
+```
+==> devbox: this worktree runs devbox-client 3.0.0, and the checkout pins 3.3.1; install the dependencies again
+```
+
+A pin they cannot read prints nothing. The line never stops a run.
 
 A CI runner does not need the client. Put it in a dependency group that CI does not install.
 Without a `.devbox.env`, `devbox verify` runs the gate locally, and CI never has that file.
@@ -202,9 +215,10 @@ code is the code of the first failed step in plan order.
 **What a step reads.** A step without `inputs=` learns its inputs from `strace -f`. The runner
 traces it when it has no valid trace, when its line, `.devbox/config.env` or the client version
 changed since its trace, and on `--full`, and runs it untraced in between, because the trace
-made a type check and a lint run several times as long. The key then covers the files the trace read,
-every synced file under each directory it listed, and the lock files when it read under
-`node_modules/` or `.venv/`. With no usable trace, the key covers every synced file. A host
+made a type check and a lint run several times as long. The key then covers the content of the
+files the trace read, the names of the entries directly in each directory it listed, and the
+lock files when it read under `node_modules/` or `.venv/`, so an edit to a file the step only
+listed carries it. With no usable trace, the key covers every synced file. A host
 without `strace` runs the step untraced, and `devbox verify --plan` says `no trace: <reason>`.
 
 **Learned selection.** A runner step is traced on every run, inside the runner: the vitest
@@ -219,11 +233,15 @@ pytest step `-n <n>` when pytest-xdist loads. `<n>` is the grant (`DEVBOX_TOKENS
 cores of `nproc` on a laptop) divided by the runner steps running at that moment, capped by the
 workspace memory less 4 GiB divided by `DEVBOX_WORKER_MEMORY`, and by the step's file count. A
 command that sets `--maxWorkers`, `--pool-options`, `-n` or `--numprocesses` keeps its value.
-The client never passes `--exclude`: a resumed or selected step gets the files it must run.
+At most as many runner steps as the grant has tokens run at once; a step without a runner never
+waits. The client never passes `--exclude`: a resumed or selected step gets the files it must
+run, each under its `dir=` and a test file of its runner.
 
-Every gate writes a record under `<git common dir>/devbox/records/`, and `devbox result` prints
-the newest; `--failed-steps`, `--failed-files` and `--json` give a landing tool what it needs,
-and `devbox probe <rev>` runs the failed test files at another revision. A new `devbox verify`
+Every gate writes a record under `<git common dir>/devbox/records/`. It gives each test file to
+the step whose plan names it, else to the step whose `dir=` is the closest folder above it, a
+step without `dir=` counting as the checkout root. `devbox result` prints the newest;
+`--failed-steps`, `--failed-files` and `--json` give a landing tool what it needs, and
+`devbox probe <rev>` runs the failed test files at another revision. A new `devbox verify`
 cancels the older gate of the same worktree, which exits 14; `devbox cancel` does the same by
 hand. A gate stopped by any other SIGTERM exits 143. With `DEVBOX_SETUP_INPUTS`, the workspace
 skips the setup when the setup text and those files did not change since the last setup that
@@ -307,6 +325,7 @@ from an earlier shell never stands in for a missing line.
 | `DEVBOX_MAX_QUEUE_WAIT` | the longest queue wait in seconds; unset or `0` is no ceiling |
 | `DEVBOX_QUEUE_FULL_ACTION` | `fail`, the default, exits 8; `local` runs the gate here when this machine satisfies `DEVBOX_REQUIRES` |
 | `DEVBOX_AFFINITY_GRACE` | how long, in seconds, a run waits on the target that ran this worktree last before it joins the others; default `60`, `0` turns it off |
+| `DEVBOX_REJOIN_SECONDS` | how often, in seconds, a run with no grant probes again each target it skipped as unreachable or unhealthy; default `30`, `0` turns it off |
 | `RUNPOD_KEY` | the RunPod account API key; read from this file only |
 | `DEVBOX_RUNPOD_CPUS` | vCPUs for a new pod; default `16` |
 | `DEVBOX_RUNPOD_IDLE_SECONDS` | idle time before the pod terminates itself; default `7200`, at most `28800` |
@@ -346,6 +365,7 @@ DEVBOX_RENT=
 DEVBOX_MAX_QUEUE_WAIT=600
 DEVBOX_QUEUE_FULL_ACTION=fail
 DEVBOX_AFFINITY_GRACE=60
+DEVBOX_REJOIN_SECONDS=30
 ```
 
 The operator of the hosts gives each developer the addresses, the pins and the gate password.
@@ -385,6 +405,14 @@ target, under that grant. The client takes the first rule that matches:
 `DEVBOX_MAX_QUEUE_WAIT` counts from the first place in a queue, the grace included. When it runs
 out with no grant, rules 4 to 6 apply. A run that gets no free lane on any eligible target
 within `DEVBOX_LOCK_WAIT` (3600 seconds, from the environment) exits 4.
+
+While no place in a queue has a grant, the run probes again, every `DEVBOX_REJOIN_SECONDS`,
+each target it skipped as unreachable or unhealthy, and joins one that is now eligible. It
+prints `==> devbox: <target> answered again, so this run joins it too`. The first grant still
+wins, and `DEVBOX_MAX_QUEUE_WAIT` still counts from the first place in a queue. Nothing is
+probed during the affinity grace, and `--target` probes no other target. A target skipped for
+its gate password, its host key, its protocol, its image or a `never` verdict is not probed
+again.
 
 A target is healthy when its watchdog record says `ok` and is at most 90 seconds old. A
 handshake mismatch, or an image that does not satisfy `DEVBOX_REQUIRES`, skips one target. On

@@ -100,6 +100,24 @@ rc=0
 (printf 'DEVBOX_AFFINITY_GRACE=30\n' >"$TMP/c.env"; devbox_config_parse "$TMP/c.env") >/dev/null 2>&1 || rc=$?
 assert_eq "2" "$rc" "and is no key of the project's config"
 
+# ── DEVBOX_REJOIN_SECONDS is a .devbox.env key, a whole number ───────────────
+for good in 0 30 600; do
+  printf 'DEVBOX_REJOIN_SECONDS=%s\n' "$good" >"$TMP/dev.env"
+  assert_eq "$good" "$(devbox_env_load "$TMP/dev.env" && printf '%s' "$DEVBOX_REJOIN_SECONDS")" \
+    "DEVBOX_REJOIN_SECONDS=$good is read from .devbox.env"
+done
+for bad in -1 1.5 30s ""; do
+  printf 'DEVBOX_REJOIN_SECONDS=%s\n' "$bad" >"$TMP/dev.env"
+  rc=0
+  err="$(devbox_env_load "$TMP/dev.env" 2>&1)" || rc=$?
+  assert_eq "2" "$rc" "DEVBOX_REJOIN_SECONDS='$bad' is refused with exit 2"
+  assert_ok "naming the key, the value and the file" \
+    contains "$TMP/dev.env: DEVBOX_REJOIN_SECONDS is '$bad'. Write a whole number of seconds" "$err"
+done
+rc=0
+(printf 'DEVBOX_REJOIN_SECONDS=30\n' >"$TMP/c.env"; devbox_config_parse "$TMP/c.env") >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "DEVBOX_REJOIN_SECONDS is no key of the project's config"
+
 # The hooks run in a fresh bash, the way the workspace runs them.
 mkdir -p "$TMP/co/.devbox"
 cat >"$TMP/co/.devbox/config.env" <<'CONFIG'

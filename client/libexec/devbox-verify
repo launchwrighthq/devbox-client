@@ -630,12 +630,19 @@ steps_tree_unchanged() {
 # last state, `open` for a `start` with no end, and its seconds, `-` when open.
 # The ledger names a file's runner and not its step, so a file goes to the
 # steps of its runner that ran, and of several, to those whose `file` or
-# `test` lines in the plan name it, else to those whose inputs hold it. A file
-# of no running step's runner goes to the one step that ran, the DEVBOX_VERIFY
-# gate that writes its own ledger.
+# `test` lines in the plan name it, else to those whose dir= is the longest
+# prefix of its path, a step with no dir= being the shortest, and of those, to
+# the ones whose inputs= holds it when any does. A file under no candidate's
+# folder goes to none. A file of no running step's runner goes to the one step
+# that ran, the DEVBOX_VERIFY gate that writes its own ledger.
+#
+# The last fallback once gave a file to every candidate whose inputs= was
+# empty: in a monorepo of one vitest step per module, with dir= and no
+# inputs=, one test file was recorded under every step, and `devbox result
+# --failed-files <step>` listed the failed files of every module.
 steps_file_lines() {
-  local runner path state secs step
-  local -a ran=() cands=() matched=()
+  local runner path state secs step d best
+  local -a ran=() cands=() matched=() narrowed=()
   [ -n "$STEPS_LEDGER" ] && [ -r "$STEPS_LEDGER" ] || return 0
   for step in "${PLAN_STEPS[@]}"; do
     [ "${PLAN_ACTION[$step]}" = carry ] || ran+=("$step")
@@ -659,16 +666,29 @@ steps_file_lines() {
         fi
       done
       if [ "${#matched[@]}" -eq 0 ]; then
+        best=-1
         for step in "${cands[@]}"; do
-          if [ -z "${STEP_INPUTS[$step]-}" ] \
-            || [ -n "$(printf '%064d  %s\n' 0 "$path" | _devbox_plan_match /dev/stdin "${STEP_INPUTS[$step]}")" ]; then
+          d="${STEP_DIR[$step]-}"
+          [ -z "$d" ] || [ "${path#"$d"}" != "$path" ] || continue
+          if [ "${#d}" -gt "$best" ]; then
+            best="${#d}" matched=("$step")
+          elif [ "${#d}" -eq "$best" ]; then
             matched+=("$step")
           fi
         done
+        if [ "${#matched[@]}" -gt 1 ]; then
+          narrowed=()
+          for step in "${matched[@]}"; do
+            [ -n "${STEP_INPUTS[$step]-}" ] || continue
+            [ -n "$(printf '%064d  %s\n' 0 "$path" | _devbox_plan_match /dev/stdin "${STEP_INPUTS[$step]}")" ] || continue
+            narrowed+=("$step")
+          done
+          [ "${#narrowed[@]}" -eq 0 ] || matched=("${narrowed[@]}")
+        fi
       fi
-      [ "${#matched[@]}" -eq 0 ] || cands=("${matched[@]}")
+      cands=(${matched[@]+"${matched[@]}"})
     fi
-    for step in "${cands[@]}"; do
+    for step in ${cands[@]+"${cands[@]}"}; do
       printf 'file\t%s\t%s\t%s\t%s\t%s\n' "$step" "$runner" "$path" "$state" "$secs"
     done
   done < <(awk -F'\t' '
@@ -984,6 +1004,53 @@ if [ "$HETZNER_ACTION" = down ] || [ "$HETZNER_ACTION" = status ]; then
   devbox_die "$hetzner_rc"
 fi
 
+# ── a client older than the checkout's pin ──────────────────────────────────
+#
+# MEASURED: many worktrees ran a client several releases older than the one
+# their project pinned, out of their own node_modules. A worktree keeps the client
+# it installed until its dependencies are installed again, and nothing told
+# the developer or the agent that it was old. One line names the gap, and the
+# run goes on: a client of the same major speaks the same protocol.
+#
+# The pin is the @launchwrighthq/devbox-client entry of the root package.json,
+# or else the devbox-client requirement of pyproject.toml, read with sed: a
+# laptop may have no JSON or TOML reader. A tag (#vX.Y.Z, @vX.Y.Z), a
+# refs/tags/vX.Y.Z URL, ==X.Y.Z or a plain X.Y.Z is read. Any other pin, such
+# as a branch, prints nothing.
+client_pin() {
+  local value="" re='([0-9]+)\.([0-9]+)\.([0-9]+)' tag='[#@]v' url='/refs/tags/v' eq='==[[:space:]]*'
+  if [ -f package.json ]; then
+    value="$(sed -n 's/.*"@launchwrighthq\/devbox-client"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json)"
+  fi
+  if [ -z "$value" ] && [ -f pyproject.toml ]; then
+    value="$(sed -n 's/.*"\(devbox-client[[:space:]]*[@=][^"]*\)".*/\1/p' pyproject.toml)"
+  fi
+  value="${value%%$'\n'*}"
+  if [[ "$value" =~ ^$re$ ]] || [[ "$value" =~ $tag$re$ ]] || [[ "$value" =~ $url$re ]] || [[ "$value" =~ $eq$re$ ]]; then
+    printf '%s.%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  fi
+}
+# 0 when the version $1 is lower than $2, both X.Y.Z. 10# reads 08 as eight,
+# where bash arithmetic would refuse it as an octal number.
+version_lower() {
+  local i x y
+  local -a a=() b=()
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    x=$((10#${a[i]})); y=$((10#${b[i]}))
+    [ "$x" -eq "$y" ] || { [ "$x" -lt "$y" ]; return; }
+  done
+  return 1
+}
+# A client with no VERSION file beside it names no version, and says nothing.
+client_running="$(cat -- "$_here/../../VERSION" 2>/dev/null)" || client_running=""
+client_pinned="$(client_pin)"
+if [[ "$client_running" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ -n "$client_pinned" ] \
+   && version_lower "$client_running" "$client_pinned"; then
+  echo "==> devbox: this worktree runs devbox-client $client_running, and the checkout pins $client_pinned; install the dependencies again"
+fi
+
 require_safe_name "DEVBOX_PROJECT" "${DEVBOX_PROJECT:-}" "$DEVBOX_CONFIG"
 # DEVBOX_WANT_TOKENS and DEVBOX_MIN_TOKENS come from that same committed file,
 # and the last ssh in this script sends both to the `run` verb, which hands them
@@ -1076,6 +1143,10 @@ esac
 # like the ceiling.
 AFFINITY_GRACE="${DEVBOX_AFFINITY_GRACE:-60}"
 require_uint "DEVBOX_AFFINITY_GRACE" "$AFFINITY_GRACE" "$DEVBOX_ENV"
+# The interval of the probe a waiting run sends each target it skipped for a
+# reason that can pass (docs/specs/2026-11-15-rejoin-skipped-targets-design.md).
+# devbox_env_load refused a value that is not a whole number. 0 turns it off.
+REJOIN_SECONDS="${DEVBOX_REJOIN_SECONDS:-30}"
 # The lane wait on each target. It lands in the `lock` verb, a word the host
 # checks again, and in bash arithmetic below, a context that evaluates
 # whatever text it is given. An operator exporting it by hand is one typo away
@@ -1532,6 +1603,7 @@ join_wait() {
         continue
       fi
     fi
+    rejoin_tick
     targets="$(join_live +)"
     [ -n "$targets" ] || return 2
     phase=lock
@@ -1548,6 +1620,156 @@ join_wait() {
     fi
     sleep 0.2
   done
+}
+
+# ── the targets a waiting run skipped ────────────────────────────────────────
+#
+# Selection runs once, and a run used to wait on the targets it joined for as
+# long as that took. MEASURED: a run queued for minutes on one host whose
+# cores were mostly busy, while other hosts of its list stood nearly idle with
+# no queue. A target is skipped for reasons that last
+# seconds: a probe that missed its connect or answer limit on a loaded host, a
+# health record a few seconds past its age limit, or the unreachable cache,
+# which skips a target for every run that starts within
+# DEVBOX_UNREACHABLE_SECONDS of one failed probe.
+#
+# So while no join holds a grant, and once the affinity grace is over, each
+# target skipped for such a reason is probed again every REJOIN_SECONDS, with
+# the probe of the selection and without the cache. A target the answer makes
+# eligible is joined like any other, and the first grant still wins. The
+# ceiling counts from the first join, so a late join never extends the wait.
+#
+# Two classes are probed again:
+#   unreachable  no answer, a verb past its limit or a dropped connection: the
+#                network and a loaded sshd both recover within a run
+#   unhealthy    a stale, degraded, down or unreadable health record: the
+#                watchdog writes it every 30 seconds, and a full disk or swap
+#                past its limit can clear
+# Every other class is final for this run, and its target is never probed
+# again. A refused password or a host key off its pin (auth) is a repair for a
+# person. Another protocol, or a probe line that a host of this protocol wrote
+# and this client cannot read (handshake, client), is a deploy, because the
+# same library writes the same line again. An image that lacks a
+# DEVBOX_REQUIRES token (requires) is a deploy, and a pool that can never hold
+# DEVBOX_MIN_TOKENS (never) is a config change. None of those changes while a
+# run waits, and a second ask would cost an ssh for the same answer.
+#
+# The probe runs in the background. One pass may take the open limit and two
+# answer limits per target, and the wait loop must read a grant within 0.2
+# seconds of the host's line. A grant, the ceiling or the exit ends a probe
+# that is still running, with every process under it.
+REJOIN_PENDING=()
+REJOIN_PID=""
+REJOIN_NEXT=0
+REJOIN_DIR=""
+
+# The skipped targets of SELECTION that a later probe may find eligible. None
+# for a forced target or the rented Hetzner server, which a run joins alone.
+rejoin_arm() {
+  local kind name class _text
+  REJOIN_PENDING=()
+  REJOIN_NEXT=$((SECONDS + REJOIN_SECONDS))
+  if [ "$REJOIN_SECONDS" -eq 0 ] || [ -n "$FORCE_TARGET" ] || [ "${SELECT_TARGETS[*]}" = hetzner ]; then
+    return 0
+  fi
+  while read -r kind name class _text; do
+    [ "$kind" = skip ] || continue
+    case "$class" in unreachable|unhealthy) REJOIN_PENDING+=("$name") ;; esac
+  done <<<"$SELECTION"
+}
+
+# One step of the wait loop: read a pass that ended, or start the next one when
+# it is due. Nothing runs during the affinity grace.
+rejoin_tick() {
+  local rc=0 err
+  [ "${#REJOIN_PENDING[@]}" -gt 0 ] || return 0
+  [ "${#GRACE_REST[@]}" -eq 0 ] || return 0
+  if [ -n "$REJOIN_PID" ]; then
+    ! kill -0 "$REJOIN_PID" 2>/dev/null || return 0
+    wait "$REJOIN_PID" || rc=$?
+    REJOIN_PID=""
+    if [ "$rc" -ne 0 ]; then
+      # devbox_targets_probe fails only on its own limits, which the probe of
+      # the selection already passed. The line names the failure, and the next
+      # pass asks again. grep finds no line in an empty file, and the line then
+      # goes without one, so its status 1 is no failure.
+      err="$(grep -m1 . "$REJOIN_DIR/err" || true)"
+      echo "==> devbox: the probe of ${REJOIN_PENDING[*]} while waiting failed with status $rc${err:+ ($err)}"
+      return 0
+    fi
+    rejoin_read
+    return 0
+  fi
+  [ "$SECONDS" -ge "$REJOIN_NEXT" ] || return 0
+  REJOIN_NEXT=$((SECONDS + REJOIN_SECONDS))
+  if [ -z "$REJOIN_DIR" ]; then
+    REJOIN_DIR="$PROBE_DIR/rejoin"
+    mkdir -m 700 "$REJOIN_DIR"
+  fi
+  rejoin_probe "${REJOIN_PENDING[@]}" >"$REJOIN_DIR/facts" 2>"$REJOIN_DIR/err" </dev/null &
+  REJOIN_PID=$!
+}
+
+# The background job of one pass. It closes every fd this shell opened for a
+# join first: a write end held here would keep that join's stdin from its end,
+# as join_job says, and its lane would stay locked until this pass ended.
+# shellcheck disable=SC2317  # started in the background by rejoin_tick
+rejoin_probe() {
+  local f
+  for f in ${JOIN_FDS[@]+"${JOIN_FDS[@]}"}; do exec {f}>&-; done
+  devbox_targets_probe "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$REJOIN_DIR" 0 "$@"
+}
+
+# devbox_select over the targets of one pass, as a list of its own: no
+# affinity, no grace, no rental. Only its skip and join lines are read.
+rejoin_select() {
+  # shellcheck disable=SC2034  # read by devbox_select, which these locals shadow the globals for
+  local -a SELECT_TARGETS=("$@") SELECT_RENT=()
+  # shellcheck disable=SC2034  # read by devbox_select, as above
+  local SELECT_AFFINITY="" SELECT_GRACE=0 SELECT_ACTION=fail
+  devbox_select
+}
+
+# Act on one pass: join each target that is eligible now, keep each that is
+# still out for a reason that can pass, and name each that turned final. A
+# target that is still out is not named again: a line every REJOIN_SECONDS for
+# the length of a wait says nothing its skip line at the selection did not.
+rejoin_read() {
+  local facts selection kind name rest class text
+  local -a still=() late=()
+  facts="$(sed '/^$/d' "$REJOIN_DIR/facts")"
+  newkey_lines "$facts"
+  selection="$(printf '%s\n' "$facts" | rejoin_select "${REJOIN_PENDING[@]}")"
+  while read -r kind name rest; do
+    case "$kind" in
+      join) late+=("$name"); JOIN_FACT[$name]="$rest" ;;
+      skip)
+        read -r class text <<<"$rest"
+        case "$class" in
+          unreachable|unhealthy) still+=("$name") ;;
+          *) echo "==> devbox: $name $text" ;;
+        esac ;;
+    esac
+  done <<<"$selection"
+  REJOIN_PENDING=(${still[@]+"${still[@]}"})
+  # Joined after the loop, so no join job holds the here-string as its stdin.
+  for name in ${late[@]+"${late[@]}"}; do
+    echo "==> devbox: $name answered again, so this run joins it too"
+    join_start_target "$name"
+  done
+}
+
+# End a pass that is still running, and every process under it. A process of
+# the tree may end between the list and the kill, and that end is the one asked
+# for, so its "no such process" is dropped. The status is a killed pass's, and
+# no answer is read from it.
+rejoin_stop() {
+  local -a pids=()
+  [ -n "$REJOIN_PID" ] || return 0
+  mapfile -t pids < <(devbox_job_tree "$REJOIN_PID")
+  kill "${pids[@]}" 2>/dev/null || true
+  wait "$REJOIN_PID" 2>/dev/null || true
+  REJOIN_PID=""
 }
 
 # ── choose the target ────────────────────────────────────────────────────────
@@ -1571,6 +1793,8 @@ PROBE_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed; refusing to
 # shellcheck disable=SC2317  # reached through the EXIT trap below, never by name
 cleanup_probe() {
   join_release_all
+  # Before the masters close: a pass still running would open one more.
+  rejoin_stop
   devbox_targets_close_all
   rm -rf "$PROBE_DIR"
   if declare -F hetzner_cleanup >/dev/null; then hetzner_cleanup || true; fi
@@ -1602,14 +1826,7 @@ choose_target() {
   if [ "${#SELECT_TARGETS[@]}" -gt 0 ]; then
     FACTS="$(devbox_targets_probe "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$PROBE_DIR" "$use_cache" "${SELECT_TARGETS[@]}")" || devbox_die 2
   fi
-  # The first contact records a host key, and only the one its pin names
-  # (devbox_gate_pin), so the line says which key a later run will hold the
-  # host to.
-  while read -r f_name f_kind f_key; do
-    [ "$f_kind" = newkey ] || continue
-    devbox_target_use "$f_name"
-    echo "==> recorded the pinned host key of $f_name ($TARGET_ADDR): $f_key"
-  done <<<"$FACTS"
+  newkey_lines "$FACTS"
   SELECTION="$(printf '%s\n' "$FACTS" | sed '/^$/d' | devbox_select)"
   DECISION="${SELECTION##*$'\n'}"
   read -r d_kind d_name d_rule _ <<<"$DECISION"
@@ -1638,6 +1855,16 @@ skip_lines() {
   done <<<"$SELECTION"
 }
 target_addr() { local var="DEVBOX_TARGET_${1^^}"; printf '%s' "${!var-}"; }
+# The first contact records a host key, and only the one its pin names
+# (devbox_gate_pin), so the line says which key a later run will hold the
+# host to. $1 the facts of a probe: the selection's, or a pass while waiting.
+newkey_lines() {
+  local f_name f_kind f_key
+  while read -r f_name f_kind f_key; do
+    [ "$f_kind" = newkey ] || continue
+    echo "==> recorded the pinned host key of $f_name ($(target_addr "$f_name")): $f_key"
+  done <<<"$1"
+}
 # How the server half of one target is brought up to this client. A rented
 # Hetzner server is a snapshot, so its repair is a new snapshot and a new server.
 repair_hint() {
@@ -2314,6 +2541,7 @@ run_joins() {
   local rc=0
   JOIN_CEILING="$1"
   join_wait "$1" || rc=$?
+  rejoin_stop
   case "$rc" in
     0) return 0 ;;
     1) return 1 ;;
@@ -2390,6 +2618,7 @@ decide() {
         GRACE_TARGET="$d_name"
       fi
       JOIN_MAXWAIT="$QUEUE_WAIT"
+      rejoin_arm
       join_targets "${names[@]}"
       run_joins "$QUEUE_WAIT" || queue_ceiling ;;
     rent)

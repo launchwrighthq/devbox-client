@@ -83,6 +83,66 @@ assert_eq "$(cat "$TMP/t1")" "$(cat "$TMP/tr/test.trace")" "and a step that sent
 steps_display "$TMP/raw.u2" <"$TMP/raw.untraced" >"$TMP/shown"
 assert_ok "the untraced line stays on the terminal" grep -qx 'devbox-steps: untraced lint strace: not found' "$TMP/shown"
 
+# ── the record's file lines: each ledger file goes to its own step ───────────
+#
+# The ledger names a file's runner and not its step. The last fallback once
+# gave a file to every step of its runner whose inputs= was empty: in a
+# monorepo of one vitest step per module, with dir= and no inputs=, one test
+# file was recorded under every step, and `devbox result --failed-files
+# <step>` listed the failed files of every module.
+
+# steps_file_lines matches inputs= with _devbox_plan_match.
+# shellcheck source=client/libexec/devbox-plan
+source "$REPO/client/libexec/devbox-plan"
+eval "$(sed -n '/^steps_file_lines() {/,/^}/p' "$REPO/client/libexec/devbox-verify")"
+STEPS_DIR="$TMP/attr"
+mkdir -p "$STEPS_DIR"
+STEPS_LEDGER="$STEPS_DIR/ledger"
+# attr_steps <name>:<runner>:<dir>:<inputs>:<action>...: the steps of a plan.
+attr_steps() {
+  local spec name runner dir inputs action
+  declare -ga PLAN_STEPS=()
+  declare -gA PLAN_ACTION=() STEP_RUNNER=() STEP_DIR=() STEP_INPUTS=()
+  for spec in "$@"; do
+    IFS=: read -r name runner dir inputs action <<<"$spec"
+    PLAN_STEPS+=("$name")
+    PLAN_ACTION[$name]="${action:-run}" STEP_RUNNER[$name]="$runner" STEP_DIR[$name]="$dir" STEP_INPUTS[$name]="$inputs"
+  done
+}
+printf '%s\n' $'test\tmod-a\tmods/a/ts/x.test.ts' $'test\tmod-a\tmods/a/ts/deep/p.test.ts' >"$STEPS_DIR/plan"
+printf '%s\n' $'file\tvitest\tmods/a/ts/x.test.ts\tstart' $'file\tvitest\tmods/a/ts/x.test.ts\tpass\t3' \
+  $'file\tvitest\tmods/a/ts/deep/p.test.ts\tpass\t1' $'file\tvitest\tmods/a/ts/deep/z.test.ts\tfail\t2' \
+  $'file\tvitest\tmods/b/ts/y.test.ts\tfail\t4' $'file\tvitest\tother/w.test.ts\tpass\t1' \
+  $'file\tpytest\tmods/a/py/test_q.py\tpass\t5' $'file\tvitest\tmods/c/ts/c.test.ts\tpass\t1' >"$STEPS_LEDGER"
+attr_steps mod-a:vitest:mods/a/ts/ mod-a-deep:vitest:mods/a/ts/deep/ mod-b:vitest:mods/b/ts/ \
+  mod-b2:vitest:mods/b/ts/ mod-c:vitest:mods/c/ts/::carry root:vitest py:pytest:mods/a/py/ lint::
+assert_eq "file	mod-a	vitest	mods/a/ts/x.test.ts	pass	3
+file	mod-a	vitest	mods/a/ts/deep/p.test.ts	pass	1
+file	mod-a-deep	vitest	mods/a/ts/deep/z.test.ts	fail	2
+file	mod-b	vitest	mods/b/ts/y.test.ts	fail	4
+file	mod-b2	vitest	mods/b/ts/y.test.ts	fail	4
+file	root	vitest	other/w.test.ts	pass	1
+file	py	pytest	mods/a/py/test_q.py	pass	5
+file	root	vitest	mods/c/ts/c.test.ts	pass	1" "$(steps_file_lines)" \
+  "a file goes to the step whose plan names it, else to the longest dir= over its path, both of a tie, else to a step with no dir="
+attr_steps mod-a:vitest:mods/a/ts/ mod-b:vitest:mods/b/ts/
+assert_eq "file	mod-a	vitest	mods/a/ts/x.test.ts	pass	3
+file	mod-a	vitest	mods/a/ts/deep/p.test.ts	pass	1
+file	mod-a	vitest	mods/a/ts/deep/z.test.ts	fail	2
+file	mod-b	vitest	mods/b/ts/y.test.ts	fail	4" "$(steps_file_lines)" \
+  "a file under no step's folder goes to none, never to every step of its runner"
+: >"$STEPS_DIR/plan"
+printf '%s\n' $'file\tvitest\tapps/api/t.test.ts\tfail\t2' $'file\tvitest\ttools/u.test.ts\tpass\t1' >"$STEPS_LEDGER"
+attr_steps api:vitest::apps/api/ web:vitest::apps/web/
+assert_eq "file	api	vitest	apps/api/t.test.ts	fail	2
+file	api	vitest	tools/u.test.ts	pass	1
+file	web	vitest	tools/u.test.ts	pass	1" "$(steps_file_lines)" \
+  "of steps with no dir=, the one whose inputs= holds the file wins, and with none, each keeps it"
+attr_steps verify::
+assert_eq "file	verify	vitest	apps/api/t.test.ts	fail	2
+file	verify	vitest	tools/u.test.ts	pass	1" "$(steps_file_lines)" \
+  "the one step of a DEVBOX_VERIFY gate keeps every file of its own ledger"
+
 # ── end to end on this laptop, with the stub runner ──────────────────────────
 
 DBX="$TMP/dbx"

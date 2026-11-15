@@ -377,7 +377,7 @@ DEVBOX_ENV_KEYS=" DEVBOX_TARGETS DEVBOX_GATE_PASSWORD DEVBOX_RENT RUNPOD_KEY HCL
 DEVBOX_MAX_QUEUE_WAIT DEVBOX_QUEUE_FULL_ACTION DEVBOX_RUNPOD_IMAGE DEVBOX_RUNPOD_CPUS \
 DEVBOX_RUNPOD_IDLE_SECONDS DEVBOX_RUNPOD_MAX_HOURLY DEVBOX_RUNPOD_REGIONS \
 DEVBOX_HETZNER_SERVER_TYPE DEVBOX_HETZNER_LOCATION DEVBOX_HETZNER_IDLE_SECONDS \
-DEVBOX_AFFINITY_GRACE "
+DEVBOX_AFFINITY_GRACE DEVBOX_REJOIN_SECONDS "
 DEVBOX_ENV_TARGET_RE='^DEVBOX_TARGET_[A-Z0-9]+(_HOSTKEY)?$'
 
 # A host key pin: the SHA256 fingerprint of an ed25519 host key, exactly as
@@ -463,6 +463,13 @@ devbox_env_load() {
     kept="$kept$key "
     case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) DEVBOX_KV_SEEN="$DEVBOX_KV_SEEN$key " ;; esac
   done
+  # The interval of the probe a waiting run sends the targets it skipped. It
+  # lands in bash arithmetic in devbox-verify, a context that evaluates any text
+  # it is given, so it is refused here, by name and file, before a target is asked.
+  if [ -n "${DEVBOX_REJOIN_SECONDS+x}" ] && ! is_uint "$DEVBOX_REJOIN_SECONDS"; then
+    echo "devbox: $file: DEVBOX_REJOIN_SECONDS is '$DEVBOX_REJOIN_SECONDS'. Write a whole number of seconds, or 0 to turn the probe while waiting off." >&2
+    return 2
+  fi
   if [ -n "${DEVBOX_TARGETS:-}" ]; then
     IFS=, read -r -a names <<<"$DEVBOX_TARGETS"
     for name in "${names[@]}"; do

@@ -318,6 +318,9 @@ assert_eq "lint=carry" "$(actions)" "an unchanged tree carries"
 edit docs/x.md
 plan changed
 assert_eq "lint=carry" "$(actions)" "an edit to a third file carries it"
+edit data/one.json
+plan changed
+assert_eq "lint=carry" "$(actions)" "an edit to a file it only listed carries it: a listing reads names, not content"
 edit src/b.py
 plan changed
 assert_eq "lint=run" "$(actions)" "an edit to a file it read runs it"
@@ -328,8 +331,19 @@ plan changed
 assert_eq "lint=carry" "$(actions)" "its untraced pass carries"
 mkdir -p data/sub && printf '{}\n' >data/sub/deep.json
 plan changed
-assert_eq "lint=run" "$(actions)" "a new file anywhere under a listed directory runs it"
+assert_eq "lint=run" "$(actions)" "a new folder in a listed directory runs it"
 assert_eq 0 "$(traced lint)" "still untraced"
+gate
+printf '{}\n' >data/sub/more.json
+plan changed
+assert_eq "lint=carry" "$(actions)" "a new file in a folder it never listed carries: a listing names its own entries alone"
+rm data/sub/more.json data/one.json
+plan changed
+assert_eq "lint=run" "$(actions)" "a file removed from a listed directory runs it"
+assert_ok "and the reason counts the listing as one changed input" contains "inputs changed: 1 files" "$(reason_of lint)"
+gate
+printf 'data/one.json v1\n' >data/one.json
+plan changed
 gate
 STEP_SOURCE[lint]="lint -- run lint --fix"
 plan changed
@@ -393,6 +407,68 @@ add_step test runner=pytest dir=tests/
 plan changed
 assert_eq "tests/" "$(awk -F'\t' '$1 == "step" { print $8 }' "$P")" "the folder reaches the plan"
 assert_eq 3 "$(grep -c $'^test\t' "$P")" "and the test lines are the files under it"
+
+echo "-- D4: a step that listed the checkout root still carries"
+# A type check that listed ./ keyed every synced file by content, so it never
+# carried.
+new_repo root
+add_step typecheck
+plan changed
+trace typecheck "read - src/a.py" "list - ." "list - src"
+gate
+edit README.md
+plan changed
+assert_eq "typecheck=carry" "$(actions)" "an edit to a root file it only listed carries it"
+edit src/b.py
+plan changed
+assert_eq "typecheck=carry" "$(actions)" "and so does an edit to a file of a listed folder it never read"
+printf 'x\n' >NOTES.md
+plan changed
+assert_eq "typecheck=run" "$(actions)" "a new file in the root runs it"
+gate
+printf 'x\n' >src/c.py
+plan changed
+assert_eq "typecheck=run" "$(actions)" "and so does a new file in a listed folder"
+gate
+
+echo "-- a runner step plans only the test files of its own folder and runner"
+# A record once gave one failed test file to every step of its runner, so a
+# step narrowed or selected the failed files of other folders, and the runner
+# refused the plan of a dir= step.
+new_repo own
+add_step web runner=vitest narrow=failed dir=web/
+add_step api runner=vitest narrow=failed dir=api/
+plan changed
+trace web "read web/src/w.test.ts web/src/w.ts" "read web/src/v.test.ts web/src/v.test.ts"
+trace api "read api/src/a.test.ts api/src/a.ts"
+gate
+edit web/src/w.ts
+plan changed
+assert_eq "web=select api=carry" "$(actions)" "a web edit selects in web"
+trace web "read web/src/w.test.ts web/src/w.ts"
+gate web=fail:1 file=web:vitest:web/src/w.test.ts:fail file=web:vitest:api/src/a.test.ts:fail \
+  file=web:vitest:web/src/w.ts:fail
+plan changed
+assert_eq "web=select api=carry" "$(actions)" "a step with failed files of other folders in its record selects"
+assert_eq "web/src/w.test.ts" "$(files_of web)" "its own failed file alone: neither another folder's test file nor a file the name rule rejects"
+assert_eq "failed" "$(freason_of web web/src/w.test.ts)" "as failed"
+assert_fail "and no test line of web leaves its folder" grep -q $'^test\tweb\tapi/' "$P"
+rm "$(devbox_map_dir)/web.map"
+plan changed
+assert_eq "web=narrow api=carry" "$(actions)" "with no map, the step narrows"
+assert_eq "web/src/w.test.ts" "$(files_of web)" "to its own failed file alone"
+trace web "read web/src/w.test.ts web/src/w.ts" "read web/src/v.test.ts web/src/v.test.ts"
+gate web=fail:1 file=web:vitest:api/src/a.test.ts:fail
+plan changed
+assert_eq "web=run api=carry" "$(actions)" "a step whose failed files all lie outside its folder runs in full"
+trace web "read web/src/w.test.ts web/src/w.ts" "read web/src/v.test.ts web/src/v.test.ts" \
+  "read api/src/a.test.ts api/src/a.ts"
+gate
+edit api/src/a.ts
+plan changed
+assert_eq "web=carry api=select" "$(actions)" "a test file of web's map outside web/ is never selected in web"
+assert_eq "no test read a changed file" "$(reason_of web)" "so web carries with the reason of D3"
+assert_eq "api/src/a.test.ts" "$(files_of api)" "and api runs it"
 
 echo "-- D10: the shards of a runner step"
 new_repo shard

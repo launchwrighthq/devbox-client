@@ -83,6 +83,22 @@ devbox_targets_close_all() {
   done
 }
 
+# Every job, then every process under it, so the TERM reaches the ssh and the
+# timeout a job runs and not only the subshell above them. Without pgrep only
+# the jobs themselves are listed, and their ssh ends when the master closes.
+# devbox status ends its watch jobs with it, and devbox verify its probe while
+# it waits: two copies of this walk would let one of them miss a level.
+# shellcheck disable=SC2317  # reached from the callers' EXIT traps, never by name here
+devbox_job_tree() {
+  local p
+  local -a kids=()
+  for p in "$@"; do
+    printf '%s\n' "$p"
+    mapfile -t kids < <(pgrep -P "$p" 2>/dev/null || true)
+    [ "${#kids[@]}" -eq 0 ] || devbox_job_tree "${kids[@]}"
+  done
+}
+
 # ── affinity ─────────────────────────────────────────────────────────────────
 #
 # Each target keeps its own copy of each worktree's workspace: the synced

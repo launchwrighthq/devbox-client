@@ -124,7 +124,9 @@ devbox_map_state() {
 
 # Print the learned inputs of step $1, one per line in byte order: the paths
 # and directories (with their `/`) its own process read, every test file's
-# reads, and the test files. Exits 1 with no usable trace: no map, a map that
+# reads, and the test files. A directory stands for the names of its own
+# entries, never for the content of the files under it: the key of devbox-plan
+# hashes its listing. Exits 1 with no usable trace: no map, a map that
 # cannot be read, no step line, or a partial trace of the step or of any test
 # file. A partial trace missed what a child process read, so the step's key
 # covers every synced file, and any change reaches the selection, which runs

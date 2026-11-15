@@ -70,14 +70,19 @@ assert_fail() {
 #              in FAKE_UNREACHABLE (space separated) answers as one that timed
 #              out, so a test can make one target of several unreachable. A
 #              host named in FAKE_STALL_OPEN accepts the connection and then
-#              never finishes it, as an overloaded sshd does.
+#              never finishes it, as an overloaded sshd does. A host named in
+#              FAKE_REFUSE refuses the gate password. A host with a file in the
+#              directory FAKE_UNREACHABLE_ONCE times out once, and the file
+#              goes, so the next open answers. FAKE_OPEN_LOG, when set, gets
+#              `<time> <host>` for each open, the time from EPOCHREALTIME.
 #   probe      since protocol 6 the client asks every target one `probe` before
 #              it chooses. A stub that answers `version` and `queue-estimate`
 #              answers `probe` too: the prelude asks the stub itself for those
 #              two, and builds the line with the library's own
 #              devbox_probe_line, the code gate-root runs. The health is
 #              FAKE_HEALTH, `<epoch> ok` by default. $FAKE_PROBE_DIR/<host>.probe,
-#              when it exists, is answered verbatim instead.
+#              when it exists, is answered verbatim instead, and
+#              $FAKE_PROBE_DIR/<host>.once is answered verbatim once, then goes.
 #   stall      a host named in FAKE_STALL never answers the verb named in
 #              FAKE_STALL_VERB (default `probe`), as a path that dropped
 #              mid-call does.
@@ -154,8 +159,16 @@ case " $* " in
   *" -O exit "*) exit 0 ;;
   *" -f -N "*)
     for _a in "$@"; do case "$_a" in devbox-gate@*) GATE_HOST="${_a#devbox-gate@}" ;; esac; done
+    [ -z "${FAKE_OPEN_LOG-}" ] || printf '%s %s\n' "${EPOCHREALTIME/,/.}" "$GATE_HOST" >>"$FAKE_OPEN_LOG"
     case " ${FAKE_UNREACHABLE-} " in *" $GATE_HOST "*)
       printf 'ssh: connect to host %s port 22: Connection timed out\n' "$GATE_HOST" >&2; exit 255 ;;
+    esac
+    if [ -n "${FAKE_UNREACHABLE_ONCE-}" ] && [ -e "$FAKE_UNREACHABLE_ONCE/$GATE_HOST" ]; then
+      rm -f "$FAKE_UNREACHABLE_ONCE/$GATE_HOST"
+      printf 'ssh: connect to host %s port 22: Connection timed out\n' "$GATE_HOST" >&2; exit 255
+    fi
+    case " ${FAKE_REFUSE-} " in *" $GATE_HOST "*)
+      printf 'devbox-gate@%s: Permission denied (keyboard-interactive,password).\n' "$GATE_HOST" >&2; exit 255 ;;
     esac
     case " ${FAKE_STALL_OPEN-} " in *" $GATE_HOST "*) exec sleep 60 ;; esac
     [ -z "${FAKE_OPEN_ERR-}" ] || printf '%s\n' "$FAKE_OPEN_ERR" >&2; exit "${FAKE_OPEN_RC:-0}" ;;
@@ -170,6 +183,9 @@ case " ${FAKE_DROP-} " in *" $GATE_HOST "*)
 esac
 case "$GATE_CMD" in
   "probe "*)
+    if [ -n "${FAKE_PROBE_DIR-}" ] && [ -f "$FAKE_PROBE_DIR/$GATE_HOST.once" ]; then
+      cat "$FAKE_PROBE_DIR/$GATE_HOST.once"; rm -f "$FAKE_PROBE_DIR/$GATE_HOST.once"; exit 0
+    fi
     if [ -n "${FAKE_PROBE_DIR-}" ] && [ -f "$FAKE_PROBE_DIR/$GATE_HOST.probe" ]; then
       cat "$FAKE_PROBE_DIR/$GATE_HOST.probe"; exit 0
     fi

@@ -11,8 +11,9 @@
 # failed step whose log never reaches the client, a ledger `pass` for a step
 # that did not finish, a runner whose plug-in, worker option or files reach the
 # test runner as the wrong words, a dir= step whose files keep the folder's
-# prefix, a resume that passes --exclude, and a stopped gate that leaves its
-# test processes running in the workspace.
+# prefix, a resume that passes --exclude, more runner steps at once than the
+# grant has tokens, and a stopped gate that leaves its test processes running
+# in the workspace.
 #
 # vitest and pytest are stubs on PATH that record their argv one word per line,
 # so no test runner is installed. node is required to import the copied
@@ -434,6 +435,50 @@ for own in '-n 3' '-n3' '-nauto' '--numprocesses=3' '--numprocesses 3'; do
   read -r -a own_words <<<"$own"
   assert_eq "$(printf '%s\n' "${own_words[@]}")" "$(argv_call 1)" "a pytest command with $own keeps its own workers and gets no second -n"
 done
+
+# ── row D5: no more runner steps at once than the grant has tokens ───────────
+#
+# Each runner step gets at least one worker, so every runner step of a
+# monorepo started at once ran several times as many test processes as the
+# grant had tokens, and the host's load failed most of them on timeouts. Four
+# runner steps on a 2-token grant run two at a time; a step without a runner
+# that is ready with them starts at once.
+
+CAP_EV="$TMP/cap-events"
+q_cap="$(printf '%q' "$CAP_EV")"
+: >"$CAP_EV"
+{
+  for s in r1 r2 r3 r4; do
+    plan_step "$s" run vitest - "echo $s:start >>$q_cap; sleep 0.4; echo $s:end >>$q_cap; npx vitest run"
+  done
+  plan_step build run - - "echo build:start >>$q_cap; echo build:end >>$q_cap"
+} >"$TMP/cap.plan"
+: >"$ARGV_LOG"
+run_steps cap "$TMP/cap.plan" DEVBOX_TOKENS=2
+assert_eq "0" "$RC" "four runner steps on a 2-token grant all run and pass: $ERR"
+assert_eq "10" "$(wc -l <"$CAP_EV" | tr -d ' ')" "each of the 5 steps started and ended once"
+peak="$(awk -F: '$1 != "build" { n += ($2 == "start") ? 1 : -1; if (n > m) m = n } END { print m + 0 }' "$CAP_EV")"
+assert_eq "2" "$peak" "at most 2 runner steps ran at once, one per token"
+first_end="$(grep -n ':end$' "$CAP_EV" | grep -v build | head -1 | cut -d: -f1)"
+assert_ok "the step without a runner started before any runner step ended: the cap does not hold it" \
+  test "$(line_of "$CAP_EV" build:start)" -lt "$first_end"
+assert_eq "4" "$(grep -c -- '^--maxWorkers=1$' "$ARGV_LOG")" "each runner step got 2 tokens / 2 running = 1 worker"
+assert_eq "1" "$(grep -c 'runner steps wait: at most 2 run at once' <<<"$OUT")" "one line says that runner steps wait for the grant"
+assert_eq "5" "$(grep -c '^devbox-steps: result .* pass ' <<<"$OUT")" "and every step has its result line"
+
+# On a 1-token grant a held step starts only after the running one ended, the
+# ready steps in plan order, and r3 still waits for r1 by its after= edge.
+: >"$CAP_EV"
+{
+  plan_step r1 run vitest - "echo r1:start >>$q_cap; echo r1:end >>$q_cap; npx vitest run"
+  plan_step r2 run vitest - "echo r2:start >>$q_cap; echo r2:end >>$q_cap; npx vitest run"
+  plan_step r3 run vitest r1 "echo r3:start >>$q_cap; echo r3:end >>$q_cap; npx vitest run"
+  plan_step r4 run vitest - "echo r4:start >>$q_cap; echo r4:end >>$q_cap; npx vitest run"
+} >"$TMP/cap-after.plan"
+run_steps cap-after "$TMP/cap-after.plan" DEVBOX_TOKENS=1
+assert_eq "0" "$RC" "a 1-token grant runs four runner steps one at a time: $ERR"
+assert_eq "r1:start r1:end r2:start r2:end r3:start r3:end r4:start r4:end" "$(tr '\n' ' ' <"$CAP_EV" | sed 's/ $//')" \
+  "in plan order, each after the one before ended, r3 after r1"
 
 # ── row D6: a step may run in a subfolder ────────────────────────────────────
 

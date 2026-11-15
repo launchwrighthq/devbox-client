@@ -123,26 +123,48 @@ _devbox_plan_match() {
 }
 
 # Print, for the learned inputs on stdin (paths, and directories ending in
-# `/`), the manifest $1's line of each path it holds, and of every file under
-# each directory, `./` for the root. A step is traced only now and then
-# (D4), so a listed directory covers its whole tree: a new file, or a new
-# import inside it, changes the key between traces. A path the sync does not
-# send, such as a tool's own ignored cache, never enters a key (section 5.3).
+# `/`), the manifest $1's line of each path it holds, then one line per
+# directory, `./` for the root: `list<TAB><dir><TAB><entries>`, its own synced
+# entries, files and folders, by name, in byte order and joined by `/`, which
+# no name holds. A listing reads names and no content. Every synced file under
+# each listed directory, with its content, once entered the key: a lint and a
+# format check that listed docs/ ran again on a one-line Markdown edit, and a
+# type check that listed the checkout root could never carry. A tool that
+# walks a tree lists each folder of it, and each is its own line, so a file
+# added anywhere it walked still changes the key between traces (D4). A path
+# the sync does not send, such as a tool's own ignored cache, never enters a
+# key (section 5.3).
 _devbox_plan_learned_lines() {
-  awk "$_DEVBOX_PLAN_AWK_PATH"'
-    FNR == NR { if ($0 ~ /\/$/) wdir[$0] = 1; else want[$0] = 1; next }
-    {
-      p = path_of($0)
-      if (p in want || "./" in wdir) { print; next }
-      k = split(p, c, "/"); d = ""
-      for (i = 1; i < k; i++) { d = d c[i] "/"; if (d in wdir) { print; next } }
-    }' - "$1"
+  local learned
+  learned="$(cat)" || return 1
+  (
+    set -o pipefail
+    awk "$_DEVBOX_PLAN_AWK_PATH"'
+      FNR == NR { if ($0 != "" && $0 !~ /\/$/) want[$0] = 1; next }
+      path_of($0) in want' <(printf '%s\n' "$learned") "$1" || exit 1
+    # A listed directory comes from a trace, which refuses a path that holds
+    # a tab, so the first tab of a pair ends its directory.
+    awk "$_DEVBOX_PLAN_AWK_PATH"'
+      FNR == NR { if ($0 ~ /\/$/) wdir[$0] = 1; next }
+      {
+        k = split(path_of($0), c, "/"); d = "./"
+        for (i = 1; i <= k; i++) {
+          if (d in wdir) print d "\t" c[i] (i < k ? "/" : "")
+          d = (d == "./" ? "" : d) c[i] "/"
+        }
+      }' <(printf '%s\n' "$learned") "$1" | LC_ALL=C sort -u | awk '
+      { t = index($0, "\t"); d = substr($0, 1, t - 1); e = substr($0, t + 1) }
+      d != last { if (last != "") print "list\t" last "\t" all; last = d; all = e; next }
+      { all = all "/" e }
+      END { if (last != "") print "list\t" last "\t" all }'
+  )
 }
 
 # The manifest lines of step $2's inputs in the manifest $1. With `inputs=`,
 # its patterns. Else its learned inputs, when the map holds a usable trace,
-# and for a runner step every test file of its runner under its folder, so a
-# new test file changes the key. Else every synced file.
+# with the `list` line of each directory it listed, and for a runner step
+# every test file of its runner under its folder, so a new test file changes
+# the key. Else every synced file.
 _devbox_plan_inputs_of() {
   if [ -n "${STEP_INPUTS[$2]-}" ]; then
     _devbox_plan_match "$1" "${STEP_INPUTS[$2]}"
@@ -186,11 +208,18 @@ _devbox_plan_setup_key() {
 
 # Compare the manifest lines on stdin of file descriptor $1 (the earlier run)
 # with those of $2 (this run). Prints `changed <path>` for a path that is new
-# or whose line differs, and `deleted <path>` for a path that is gone.
+# or whose line differs, and `deleted <path>` for a path that is gone. The
+# `list` line of a directory (_devbox_plan_learned_lines) counts as its path,
+# `<dir>/`, which no file's path can be.
 _devbox_plan_diff() {
   awk "$_DEVBOX_PLAN_AWK_PATH"'
-    FILENAME == ARGV[1] { old[path_of($0)] = $0; next }
-    { p = path_of($0); seen[p] = 1; if (!(p in old) || old[p] != $0) print "changed " p }
+    function key_of(l,   p) {
+      if (substr(l, 1, 5) != "list\t") return path_of(l)
+      p = substr(l, 6)
+      return substr(p, 1, index(p, "\t") - 1)
+    }
+    FILENAME == ARGV[1] { old[key_of($0)] = $0; next }
+    { p = key_of($0); seen[p] = 1; if (!(p in old) || old[p] != $0) print "changed " p }
     END { for (p in old) if (!(p in seen)) print "deleted " p }' "$1" "$2"
 }
 
@@ -320,16 +349,50 @@ _devbox_plan_mapfiles() {
   fi
 }
 
+# Print, of the paths on stdin, in their order, those the runner of step $1
+# may be given: under its dir= when it has one, and a test file by its
+# runner's name rule (_devbox_plan_test_paths) or one its own map holds, which
+# a full run of that runner ran. The test lines, the failed files of a record
+# and the selection of a runner step pass here, so a narrowed, selected,
+# resumed or sharded list holds no other file. The ledger names a file's runner
+# and not its step, and a record once gave a failed test file to every step of
+# its runner, in a monorepo of one vitest step per module: a narrowed step
+# without dir= handed vitest the test files of other modules, and the runner
+# refused the whole plan of a step with dir=.
+_devbox_plan_own_tests() {
+  local step="$1" paths rule
+  paths="$(cat)" || return 1
+  [ -n "$paths" ] || return 0
+  _devbox_plan_mapfiles "$step"
+  rule="$(set -o pipefail; printf '%s\n' "$paths" | awk '$0 != "" { printf "%064d  %s\n", 0, $0 }' \
+    | _devbox_plan_test_paths /dev/stdin "${STEP_RUNNER[$step]}" "${STEP_DIR[$step]-}")" || return 1
+  PLAN_DIR="${STEP_DIR[$step]-}" awk '
+    BEGIN { d = ENVIRON["PLAN_DIR"] }
+    phase == "rule" { if ($0 != "") ok[$0] = 1; next }
+    phase == "map" { if ($0 != "" && substr($0, 1, length(d)) == d) ok[$0] = 1; next }
+    $0 != "" && ($0 in ok)' \
+    phase=rule <(printf '%s\n' "$rule") phase=map <(printf '%s\n' "${_plan_mapfiles[$step]}") \
+    phase=in <(printf '%s\n' "$paths")
+}
+
+# Print the failed test files of step $2 in the record of run $1 that its
+# runner may be given (_devbox_plan_own_tests), gone files included.
+_devbox_plan_failed_files() {
+  local failed
+  failed="$(devbox_record_failed_files "$1" "$2")" || return 1
+  printf '%s\n' "$failed" | _devbox_plan_own_tests "$2"
+}
+
 # Set _plan_tests and _plan_new for the runner step $1 over the manifest $2.
 # _plan_tests, for its `test` lines: the test files of its map that still
-# exist, and every test file of its runner under its folder by the name rule
-# that no other step of that runner holds in its map. _plan_new: the files of
-# that rule in no step's map that this step claims. A file that existed at
-# this step's last full trace and did not run then belongs to another step or
-# to no step. A new one goes to the step of its runner whose known test files
-# share the deepest folder with it, to each on a tie, so a new test of one app
-# never reaches another app's runner, where vitest stops on "No test files
-# found".
+# exist under its folder, and every test file of its runner under its folder
+# by the name rule that no other step of that runner holds in its map.
+# _plan_new: the files of that rule in no step's map that this step claims. A
+# file that existed at this step's last full trace and did not run then
+# belongs to another step or to no step. A new one goes to the step of its
+# runner whose known test files share the deepest folder with it, to each on a
+# tie, so a new test of one app never reaches another app's runner, where
+# vitest stops on "No test files found".
 _devbox_plan_test_sets() {
   local step="$1" manifest="$2" s runner="${STEP_RUNNER[$1]}" others="" srun rdir lastman=/dev/null out
   for s in "${STEP_NAMES[@]}"; do
@@ -369,7 +432,7 @@ _devbox_plan_test_sets() {
     }' phase=names <(_devbox_plan_test_paths "$manifest" "$runner" "${STEP_DIR[$step]-}") \
       phase=own <(printf '%s\n' "${_plan_mapfiles[$step]}") phase=other <(printf '%s' "$others") \
       phase=cur "$manifest" phase=old "$lastman")" || return 1
-  _plan_tests="$(awk -F'\t' '$1 == "test" { print $2 }' <<<"$out" | LC_ALL=C sort -u)"
+  _plan_tests="$(awk -F'\t' '$1 == "test" { print $2 }' <<<"$out" | LC_ALL=C sort -u | _devbox_plan_own_tests "$step")" || return 1
   _plan_new="$(awk -F'\t' '$1 == "new" { print $2 }' <<<"$out")"
 }
 
@@ -427,7 +490,7 @@ _devbox_plan_narrow() {
   [ -n "$last" ] || return 1
   read -r run outcome code <<<"$last"
   [ "$outcome" = fail ] && [ "$code" = 1 ] || return 1
-  failed="$(devbox_record_failed_files "$run" "$step")" || return 1
+  failed="$(_devbox_plan_failed_files "$run" "$step")" || return 1
   [ -n "$failed" ] || return 1
   [ -z "$(devbox_record_open_files "$run" "$step")" ] || return 1
   dir="$(devbox_record_dir)" || return 1
@@ -467,7 +530,7 @@ _devbox_plan_narrow() {
 # carries the step with the reason `no test read a changed file` (D3), and 1
 # not to select, with _plan_why set to why.
 _devbox_plan_select() {
-  local step="$1" manifest="$2" state last run outcome code failed="" sel rc=0 f r paths
+  local step="$1" manifest="$2" state last run outcome code failed="" sel rc=0 f r paths keep
   local -A reason=()
   state="$(devbox_map_state "$step")"
   case "$state" in
@@ -481,7 +544,7 @@ _devbox_plan_select() {
     read -r run outcome code <<<"$last"
     if [ "$outcome" = fail ]; then
       [ "$code" = 1 ] || return 1
-      failed="$(devbox_record_failed_files "$run" "$step")" || return 2
+      failed="$(_devbox_plan_failed_files "$run" "$step")" || return 2
       [ -n "$failed" ] || return 1
       [ -z "$(devbox_record_open_files "$run" "$step")" ] || return 1
     fi
@@ -508,14 +571,19 @@ _devbox_plan_select() {
   while IFS= read -r f; do
     [ -z "$f" ] || [ -n "${reason[$f]+x}" ] || reason[$f]=new
   done <<<"$_plan_new"
+  # The map holds what the runner ran on a full run, and a vitest config can
+  # include a test file from outside the step's dir=, which no file argument
+  # of that runner can name.
+  keep="$(printf '%s\n' "${!reason[@]}" | _devbox_plan_own_tests "$step")" || return 2
   _plan_files=""
-  for f in "${!reason[@]}"; do
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
     if [ -n "${_plan_shard+x}" ]; then
       case $'\n'"$_plan_shard"$'\n' in *$'\n'"$f"$'\n'*) ;; *) continue ;; esac
     fi
     _plan_freason[$f]="${reason[$f]}"
     _plan_files+="$f"$'\n'
-  done
+  done <<<"$keep"
   if [ -z "$_plan_files" ]; then
     _plan_reason="no test read a changed file"
     return 10

@@ -27,7 +27,8 @@
 #                        stops, and it hid the warning for a gate that wrote no
 #                        ledger at all.
 #   DEVBOX_TOKENS        the grant; unset on a laptop and in CI, where the
-#                        cores of nproc stand for it
+#                        cores of nproc stand for it; also the most runner
+#                        steps that run at once
 #   DEVBOX_WORKER_MEMORY the memory one test worker needs, 1536M by default
 #   DEVBOX_CGROUP_ROOT   the cgroup v2 directory of this workspace, whose
 #                        memory.max caps the workers; /sys/fs/cgroup by default
@@ -37,7 +38,8 @@
 # environment before any step starts, or a ledger or a log that cannot be
 # written once steps run, 143 after SIGTERM and 130 after SIGINT.
 #
-# stdout: one line when a step starts, ends, carries or resumes, one
+# stdout: one line when a step starts, ends, carries or resumes, one line the
+# first time the grant holds runner steps back, one
 # `devbox-steps: untraced <name> <reason>` line for a step whose trace cannot
 # run, then a summary table, the full log of each failed step after
 # `== <name>: <log path>`, the `devbox-steps: trace <name> <seq> <chunk>` lines
@@ -855,12 +857,23 @@ finish_step() {
   fi
 }
 
+# At most TOKENS runner steps run at once, one per token of the grant: each
+# gets at least one worker, so more runner steps than tokens are more test
+# processes than the grant. MEASURED: every runner step of a monorepo started
+# together and ran several times as many test processes as the grant had
+# tokens, and the host's load failed most of them on timeouts. A step without
+# a runner is not held: it runs no worker pool. A held step starts in a later
+# pass, after a runner step ends, so whenever a step is held the loop below
+# waits on a running one.
+HELD_SAID=0
 while :; do
   # The steps that start in one pass share the grant with the runner steps
   # already running, so two suites that start together get half each, not
   # all of it for the first and half for the second.
   starting=()
+  ready_names=()
   runners=0
+  held=0
   for name in "${NAMES[@]}"; do
     if [ "${STATUS[$name]}" = running ]; then
       [ "${RUNNER[$name]}" = - ] || runners=$((runners + 1))
@@ -869,10 +882,23 @@ while :; do
     [ "${STATUS[$name]}" = pending ] || continue
     ready=1
     for dep in ${AFTER[$name]}; do [ "${STATUS[$dep]}" = ended ] || ready=0; done
-    [ "$ready" = 0 ] || starting+=("$name")
+    [ "$ready" = 0 ] || ready_names+=("$name")
   done
-  for name in "${starting[@]}"; do [ "${RUNNER[$name]}" = - ] || runners=$((runners + 1)); done
-  for name in "${starting[@]}"; do start_step "$name" "$runners"; done
+  for name in ${ready_names[@]+"${ready_names[@]}"}; do
+    if [ "${RUNNER[$name]}" != - ]; then
+      if [ "$runners" -ge "$TOKENS" ]; then
+        held=$((held + 1))
+        continue
+      fi
+      runners=$((runners + 1))
+    fi
+    starting+=("$name")
+  done
+  for name in ${starting[@]+"${starting[@]}"}; do start_step "$name" "$runners"; done
+  if [ "$held" -gt 0 ] && [ "$HELD_SAID" = 0 ]; then
+    HELD_SAID=1
+    echo "$(stamp) $held runner steps wait: at most $TOKENS run at once, one per token of the grant"
+  fi
   [ "$(running_names)" != nothing ] || break
   # The status is read from each step's result file below; wait -n only blocks
   # until one job ends, and returns 127 when that job was already reaped.

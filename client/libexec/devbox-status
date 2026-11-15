@@ -1644,20 +1644,6 @@ watch_draw() {
   printf '%s' "$buf"
 }
 
-# Every job, then every process under it, so the TERM reaches the ssh and the
-# timeout a job runs and not only the subshell above them. Without pgrep only
-# the jobs themselves are listed, and their ssh ends when the master closes.
-# shellcheck disable=SC2317  # reached from watch_exit, which the EXIT trap calls, never by name
-watch_job_tree() {
-  local p
-  local -a kids=()
-  for p in "$@"; do
-    printf '%s\n' "$p"
-    mapfile -t kids < <(pgrep -P "$p" 2>/dev/null || true)
-    [ "${#kids[@]}" -eq 0 ] || watch_job_tree "${kids[@]}"
-  done
-}
-
 # The terminal first: a trap that does not restore it leaves the developer's
 # shell with no cursor and on the alternate screen. Then the
 # jobs, then every master, then the private dir. Each step may fail without
@@ -1666,7 +1652,7 @@ watch_job_tree() {
 watch_exit() {
   local -a pids=()
   printf '%s%s' "$T_CNORM" "$T_RMCUP" || true
-  mapfile -t pids < <(watch_job_tree ${JOB_PID[@]+"${JOB_PID[@]}"})
+  mapfile -t pids < <(devbox_job_tree ${JOB_PID[@]+"${JOB_PID[@]}"})
   disown -a 2>/dev/null || true
   [ "${#pids[@]}" -eq 0 ] || kill "${pids[@]}" 2>/dev/null || true
   devbox_targets_close_all || true
