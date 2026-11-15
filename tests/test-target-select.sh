@@ -309,6 +309,73 @@ assert_fail "an unknown health word does not parse" devbox_probe_parse "$PROTO $
 devbox_probe_parse "$PROTO $FP degraded 5 now 0 0/20 0/4 0 disk "$'\e]0;owned\a\e[2J'"93%"
 assert_eq "disk ]0;owned[2J93%" "$PROBE_REASON" "a reason carrying ESC and BEL is parsed with every non-printable character removed"
 
+# ── no job limit and the admission record, read by every 3.x client ─────────
+#
+# A pool that admits on pressure applies no job limit, writes `-` for it, and
+# the probe verb sends the admission record as a second line. Neither may
+# change what a 3.x client reads, or the protocol moves. The parse below is
+# the code of devbox_probe_parse as every release from 3.0.0 to 3.4.1 ships
+# it, without its comments and under another name, and probe_cut_3x is the cut devbox_probe_one and
+# devbox-doctor apply to the verb's answer in those releases. Frozen here, so a
+# later change to the live parser cannot make this proof pass by itself.
+# shellcheck disable=SC2034  # every PROBE_ variable is read by the assertions
+probe_parse_3x() {
+  local line="${1-}"
+  line="${line%%$'\n'*}"
+  line="${line//[^[:print:]]/}"
+  PROBE_PROTOCOL=""; PROBE_LIB=""; PROBE_HEALTH=""; PROBE_HEALTH_AGE=""; PROBE_VERDICT=""
+  PROBE_SECS=""; PROBE_TOKENS=""; PROBE_JOBS=""; PROBE_QUEUED=""; PROBE_REASON=""
+  read -r PROBE_PROTOCOL PROBE_LIB PROBE_HEALTH PROBE_HEALTH_AGE PROBE_VERDICT PROBE_SECS \
+    PROBE_TOKENS PROBE_JOBS PROBE_QUEUED PROBE_REASON <<<"$line" || true
+  [ "$PROBE_PROTOCOL" != - ] || PROBE_PROTOCOL=""
+  [ "$PROBE_LIB" != - ] || PROBE_LIB=""
+  case "$PROBE_HEALTH" in ok|degraded|down|missing|invalid) ;; *) return 1 ;; esac
+  [[ "$PROBE_HEALTH_AGE" =~ ^(-1|[0-9]+)$ ]] || return 1
+  case "$PROBE_VERDICT" in now|wait|never|unknown) ;; *) return 1 ;; esac
+  [[ "$PROBE_SECS" =~ ^([0-9]+|-)$ ]] || return 1
+  [[ "$PROBE_TOKENS" =~ ^([0-9]+/[0-9]+|-)$ ]] || return 1
+  [[ "$PROBE_JOBS" =~ ^([0-9]+/[0-9]+|-)$ ]] || return 1
+  [[ "$PROBE_QUEUED" =~ ^([0-9]+|-)$ ]] || return 1
+  if [ "$PROBE_VERDICT" = wait ] && [ "$PROBE_SECS" = - ]; then return 1; fi
+  return 0
+}
+probe_cut_3x() { local line="$1"; printf '%s' "${line%%$'\n'*}"; }
+
+line="$(devbox_probe_line "$PROTO $FP" $'now 0 3 8/16 1/- 0\nadmission pressure 1 61.20 25 0.00 5 0.00 10 0 fits' "1000 ok" 1005)"
+assert_eq "$PROTO $FP ok 5 now 0 8/16 - 0" "$line" \
+  "a pool with no job limit gives the probe line a jobs field of -, the word every 3.x parse takes there"
+answer="$line"$'\n'"admission pressure 1 61.20 25 0.00 5 0.00 10 0 fits"
+assert_ok "a 3.x client parses the two-line answer" probe_parse_3x "$(probe_cut_3x "$answer")"
+assert_eq "ok|5|now|0|8/16|-|0|" \
+  "$PROBE_HEALTH|$PROBE_HEALTH_AGE|$PROBE_VERDICT|$PROBE_SECS|$PROBE_TOKENS|$PROBE_JOBS|$PROBE_QUEUED|$PROBE_REASON" \
+  "  and reads the probe line it always read, with no reason taken from the record"
+assert_ok "and so does the 3.x parse handed the whole answer, as devbox-doctor hands it" probe_parse_3x "$answer"
+assert_eq "|now|-" "$PROBE_REASON|$PROBE_VERDICT|$PROBE_JOBS" "  with the record left out of every field"
+assert_eq "$PROTO $FP ok 5 wait 30 8/16 1/6 0" \
+  "$(devbox_probe_line "$PROTO $FP" $'wait 30 3 8/16 1/6 0\nadmission tokens 1 - - - - - - - -' "1000 ok" 1005)" \
+  "a pool on tokens keeps its job limit in the probe line"
+
+# The record itself: built on the host, read on the laptop, one shape list.
+assert_eq "admission pressure 2 18.40 25 0.00 5 1.20 10 12 fits" \
+  "$(devbox_admission_line pressure 2 18.40 25 0.00 5 1.20 10 12 fits)" "the record carries ten words"
+assert_eq "admission tokens 3 - - - - - - - -" "$(devbox_admission_line tokens 3 "" "" "" "" "" "" "" "")" \
+  "an empty word is -"
+assert_fail "a word out of its shape is refused, never sent" devbox_admission_line pressure 2 'x;y' 25 0.00 5 0.00 10 0 fits
+assert_fail "and so is a word count that does not fit" devbox_admission_line pressure 2
+devbox_admission_parse "admission pressure 2 18.40 25 6.00 5 1.20 10 12 short"
+assert_eq "pressure|2|18.40|25|6.00|5|1.20|10|12|short" \
+  "$ADMISSION_RULE|$ADMISSION_JOBS|$ADMISSION_CPU_IDLE|$ADMISSION_CPU_IDLE_MIN|$ADMISSION_MEMORY|$ADMISSION_MEMORY_MAX|$ADMISSION_IO|$ADMISSION_IO_MAX|$ADMISSION_SETTLE_LEFT|$ADMISSION_HEADROOM" \
+  "the parser reads every field back"
+assert_fail "a probe line is not a record" devbox_admission_parse "$PROTO $FP ok 5 now 0 8/16 - 0"
+assert_eq "" "$ADMISSION_RULE" "  and a refused line leaves every field empty"
+assert_fail "a record with a word missing is refused" devbox_admission_parse "admission pressure 2 18.40 25 0.00 5 0.00 10 0"
+assert_fail "a record with a control byte is refused" devbox_admission_parse "admission pressure 2 18.40 25 0.00 5 0.00 10 0 fits"$'\e[2J'
+
+# The status reply's host record takes `-` for the job limit in the parse every
+# 3.x client ships, which this suite's runner-status cases pin.
+devbox_status_parse "$(printf '%s\n' "$PROTO $FP 1000" "$(devbox_status_line host ok 5 8 16 1 - 0 3.5 16 33554432 67108864 0 0)" end)"
+assert_eq "1|-" "$STATUS_JOBS|$STATUS_MAX_JOBS" "a host record with no job limit parses, with the limit read as -"
+
 # ── the unreachable cache ────────────────────────────────────────────────────
 mkdir -p "$TMP/priv"
 devbox_unreachable_set "$TMP/priv" lan1 lan1.invalid 1000
@@ -414,6 +481,44 @@ assert_ok "the busy last target, over the grace, is joined at once with its wait
 assert_fail "with no head start" contains "alone, where" "$out"
 assert_ok "and the gate runs on the free one" contains "GATE RAN ON lan-fixture" "$out"
 assert_eq "lan1" "$(last_target)" "which is now this worktree's last target"
+rm -f "$TMP/probes/cloud-fixture.probe"
+
+# A host that admits on pressure sends its admission record, and the queue line
+# names the rule and what it judged in place of the token figures. A line once
+# read `25/16 tokens, 3/4 jobs, 0 waiting: this ask fits now` for such a host.
+{
+  devbox_probe_line "$PROTO $FP" "wait 2 3 25/16 3/- 0" "$(date +%s) ok" "$(date +%s)"
+  echo "admission pressure 3 18.40 25 0.00 5 11.00 10 12 short"
+} >"$TMP/probes/cloud-fixture.probe"
+rm -f "$CO/.git/devbox/last-target"
+FAKE_GRANT="cloud-fixture:never" verify
+assert_ok "a pressure host's line names the rule, the jobs, the idle share and each reading that holds the ask" \
+  contains "==> devbox: queuing on cloud1: admits on pressure, 3 jobs running, cpu idle 18.40% (at least 25%), io pressure 11.00% (limit 10%), the newest grant settles in 12s, too little free memory for the headroom, 0 waiting: about 2s of queuing" "$out"
+assert_fail "  and no token figure" contains "25/16 tokens" "$out"
+{
+  devbox_probe_line "$PROTO $FP" "now 0 3 8/16 1/- 0" "$(date +%s) ok" "$(date +%s)"
+  echo "admission pressure 1 61.20 25 0.00 5 0.00 10 0 fits"
+} >"$TMP/probes/cloud-fixture.probe"
+rm -f "$CO/.git/devbox/last-target"
+FAKE_GRANT="cloud-fixture:never" verify
+assert_ok "a pressure host that admits says the host admits this ask now" \
+  contains "==> devbox: queuing on cloud1: admits on pressure, 1 job running, cpu idle 61.20% (at least 25%), 0 waiting: the host admits this ask now" "$out"
+{
+  devbox_probe_line "$PROTO $FP" "now 0 0 0/16 0/- 0" "$(date +%s) ok" "$(date +%s)"
+  echo "admission pressure 0 - 25 0.00 5 0.00 10 0 fits"
+} >"$TMP/probes/cloud-fixture.probe"
+rm -f "$CO/.git/devbox/last-target"
+FAKE_GRANT="cloud-fixture:never" verify
+assert_ok "an empty pressure host says no job runs" \
+  contains "==> devbox: queuing on cloud1: admits on pressure, no job running, 0 waiting: the host admits this ask now" "$out"
+{
+  devbox_probe_line "$PROTO $FP" "wait 30 3 8/16 1/6 0" "$(date +%s) ok" "$(date +%s)"
+  echo "admission tokens 1 - - - - - - - -"
+} >"$TMP/probes/cloud-fixture.probe"
+rm -f "$CO/.git/devbox/last-target"
+FAKE_GRANT="cloud-fixture:never" verify
+assert_ok "a tokens host keeps the token line" \
+  contains "==> devbox: queuing on cloud1: 8/16 tokens, 1/6 jobs, 0 waiting: about 30s of queuing" "$out"
 rm -f "$TMP/probes/cloud-fixture.probe"
 
 # Example 3 end to end: lan1 does not answer, so the run says so and goes on.

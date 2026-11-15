@@ -816,9 +816,13 @@ devbox_probe_line() {
   proto="${proto//[!A-Za-z0-9._:+-]/_}"
   fp="${fp//[!A-Za-z0-9._:+-]/_}"
   estimate="${estimate%%$'\n'*}"
-  if [[ "$estimate" =~ ^(now|wait|never|unknown)\ ([0-9]+|-)\ [0-9]+\ ([0-9]+/[0-9]+)\ ([0-9]+/[0-9]+)\ ([0-9]+)$ ]]; then
+  # A pool that admits on pressure applies no job limit and writes `-` for it.
+  # The probe line's jobs field takes `<n>/<n>` or `-` in every 3.x parse, so
+  # such a pool's field is `-`, and the admission record carries the count.
+  if [[ "$estimate" =~ ^(now|wait|never|unknown)\ ([0-9]+|-)\ [0-9]+\ ([0-9]+/[0-9]+)\ ([0-9]+)/([0-9]+|-)\ ([0-9]+)$ ]]; then
     verdict="${BASH_REMATCH[1]}"; secs="${BASH_REMATCH[2]}"
-    tokens="${BASH_REMATCH[3]}"; jobs="${BASH_REMATCH[4]}"; queued="${BASH_REMATCH[5]}"
+    tokens="${BASH_REMATCH[3]}"; jobs="${BASH_REMATCH[4]}/${BASH_REMATCH[5]}"; queued="${BASH_REMATCH[6]}"
+    [ "${BASH_REMATCH[5]}" != - ] || jobs=-
   else
     verdict=unknown; secs=-; tokens=-; jobs=-; queued=-
   fi
@@ -893,6 +897,79 @@ devbox_probe_parse() {
   return 0
 }
 
+# ── the admission record ─────────────────────────────────────────────────────
+#
+# The probe line carries the token figures of the pool, and under
+# DEVBOX_ADMISSION=pressure those decide nothing. A client printed
+# `25/16 tokens, 3/4 jobs, 0 waiting: this ask fits now` for a host that admits
+# on its idle cores, and the reader could not see what the host judged. So the
+# `probe` verb answers a SECOND line, the rule the pool runs and the readings
+# it judged by:
+#
+#   admission <rule> <jobs> <cpu-idle> <cpu-idle-min> <memory-some>
+#     <memory-max> <io-full> <io-max> <settle-left> <headroom>
+#
+# on one line. <rule> is pressure or tokens. <cpu-idle>, <memory-some> and
+# <io-full> are percentages as the kernel prints avg10 (`18.40`), beside their
+# limits in whole percent. <settle-left> is the seconds until the newest grant
+# is DEVBOX_ADMIT_SETTLE old. <headroom> is `fits` or `short`, the memory rule.
+# A field the pool did not read is `-`: the idle share is read only while a job
+# runs, and under tokens every field after <jobs> is `-`.
+#
+# A second line keeps the protocol. devbox_probe_parse and devbox_probe_one in
+# devbox-targets, in every 3.x client, cut the probe answer at its first
+# newline, so an older client reads the probe line it always read.
+# tests/test-target-select.sh runs that frozen parse on a two-line answer.
+
+# The shape of each word after `admission`, in order.
+_devbox_admission_shapes() {
+  local p='[0-9]{1,3}\.[0-9]{2}|-' n='[0-9]{1,9}'
+  printf '%s\n' 'pressure|tokens' "$n" "$p" "$n|-" "$p" "$n|-" "$p" "$n|-" "$n|-" 'fits|short|-'
+}
+
+# Print the admission record from its ten words. An empty word is `-`. A word
+# that does not have its field's shape prints nothing and returns 1: the pool
+# wrote it, so a bad word is this program's own bug, and gate-root then sends
+# the probe line alone.
+devbox_admission_line() {
+  local -a shapes=() words=()
+  local i w
+  mapfile -t shapes < <(_devbox_admission_shapes)
+  [ "$#" -eq "${#shapes[@]}" ] || return 1
+  for ((i = 0; i < ${#shapes[@]}; i++)); do
+    w="${1:--}"; shift
+    [[ "$w" =~ ^(${shapes[i]})$ ]] || return 1
+    words+=("$w")
+  done
+  printf 'admission %s\n' "${words[*]}"
+}
+
+# Read one admission record into ADMISSION_RULE, ADMISSION_JOBS,
+# ADMISSION_CPU_IDLE, ADMISSION_CPU_IDLE_MIN, ADMISSION_MEMORY,
+# ADMISSION_MEMORY_MAX, ADMISSION_IO, ADMISSION_IO_MAX, ADMISSION_SETTLE_LEFT
+# and ADMISSION_HEADROOM. Returns 1, with every variable empty, when the line
+# is not one: a host older than the record sends none, and the client then
+# prints the token figures it always printed.
+# shellcheck disable=SC2034  # every ADMISSION_ variable is read by the caller
+devbox_admission_parse() {
+  local line="${1-}" word
+  local -a words=()
+  ADMISSION_RULE=""; ADMISSION_JOBS=""; ADMISSION_CPU_IDLE=""; ADMISSION_CPU_IDLE_MIN=""
+  ADMISSION_MEMORY=""; ADMISSION_MEMORY_MAX=""; ADMISSION_IO=""; ADMISSION_IO_MAX=""
+  ADMISSION_SETTLE_LEFT=""; ADMISSION_HEADROOM=""
+  line="${line%%$'\n'*}"
+  read -r word _ <<<"$line" || true
+  [ "$word" = admission ] || return 1
+  read -r -a words <<<"${line#admission}"
+  # The builder's check is the one copy of the shapes, and a read word is
+  # never empty, so the builder takes the words as they came.
+  devbox_admission_line "${words[@]}" >/dev/null || return 1
+  ADMISSION_RULE="${words[0]}"; ADMISSION_JOBS="${words[1]}"; ADMISSION_CPU_IDLE="${words[2]}"
+  ADMISSION_CPU_IDLE_MIN="${words[3]}"; ADMISSION_MEMORY="${words[4]}"; ADMISSION_MEMORY_MAX="${words[5]}"
+  ADMISSION_IO="${words[6]}"; ADMISSION_IO_MAX="${words[7]}"; ADMISSION_SETTLE_LEFT="${words[8]}"
+  ADMISSION_HEADROOM="${words[9]}"
+}
+
 # ── the status reply ─────────────────────────────────────────────────────────
 #
 # The answer of the `status` verb, one record per line:
@@ -925,6 +1002,12 @@ devbox_probe_parse() {
 # its old `load` label, and a newer client against a 3.0.0 host shows the load
 # average under the `cpu` label until that host is redeployed. STATUS_LOAD1
 # keeps its name for the same reason the word kept its place.
+#
+# <max-jobs> is `-` from a pool that admits on pressure. DEVBOX_MAX_JOBS once
+# capped such a pool too, and in a live test it refused the same tickets the
+# idle-core rule refused, a second fixed limit beside the measured ones. So the
+# pressure rule applies no job limit, and the field says so with the `-` every
+# 3.x parse already accepts there.
 #
 # The host writes it with devbox_status_line and the laptop reads it with
 # devbox_status_parse, and both take every field's shape from

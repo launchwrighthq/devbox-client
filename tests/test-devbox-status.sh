@@ -480,6 +480,17 @@ for case in "8.0 ####.... 8.0/16 " "12.0 ######.. 12.0/16" "15.7 ######## 15.7/1
     grep -qE "^cloud1    ok        tokens \.{8} 0/20     cpu ${bar//./\\.} ${shown//./\\.} +mem " <<<"$out"
 done
 assert_fail "and no target line names load" grep -q ' load ' <<<"$out"
+# A pool that admits on pressure applies no job limit and sends `-` for it. The
+# jobs cell then shows the count alone, never `3/-`, and the token bar is the
+# worker hints over the cores, which may pass the core count.
+{
+  printf '%s %s %s\n' "$PROTO" "$FP" "$E"
+  printf 'host ok 5 25 16 3 - 0 12.0 16 %s %s 0 0\n' "$((30 * GIB))" "$((32 * GIB))"
+  printf 'end\n'
+} >"$TMP/replies/cloud1.invalid.status"
+run_status
+assert_ok "a pool with no job limit shows its running jobs alone" \
+  grep -qE '^cloud1    ok        tokens #{8} 25/16    cpu ######\.\. 12\.0/16  mem .* jobs 3  no swap$' <<<"$out"
 STATUS_ARGS=()
 reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
 
@@ -515,6 +526,24 @@ if script --version 2>/dev/null | grep -q util-linux; then
                 grep -qE "cpu ${ESC}\[33m[^ ]+ ${shown//./\\.}${ESC}\[0m" <<<"$tty_out" ;;
       red)    assert_ok "busy $word of 16 cores on a terminal: cpu $shown in red" \
                 grep -qE "cpu ${ESC}\[31m[^ ]+ ${shown//./\\.}${ESC}\[0m" <<<"$tty_out" ;;
+    esac
+  done
+  # A full token bar queues the next gate on a pool with a job limit, and is
+  # yellow. A pool with none admits on pressure, where the bar is worker hints
+  # that may pass the core count and queue nothing, so it stays plain.
+  for case in "3 yellow" "- plain"; do
+    read -r max band <<<"$case"
+    {
+      printf '%s %s %s\n' "$PROTO" "$FP" "$E"
+      printf 'host ok 5 25 16 3 %s 0 8.0 16 %s %s 0 0\n' "$max" "$((30 * GIB))" "$((32 * GIB))"
+      printf 'end\n'
+    } >"$TMP/replies/cloud1.invalid.status"
+    tty_out="$(on_tty TERM=xterm)"
+    case "$band" in
+      yellow) assert_ok "a full token bar with a job limit of 3 is yellow" \
+                grep -qE "tokens ${ESC}\[33m[^ ]+ 25/16${ESC}\[0m" <<<"$tty_out" ;;
+      plain)  assert_ok "and with no job limit it is plain" \
+                grep -qE "tokens [^${ESC}]+ 25/16 " <<<"$tty_out" ;;
     esac
   done
   reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"

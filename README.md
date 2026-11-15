@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.4.1"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.5.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.4.1"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.5.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.4.1"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.5.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.4.1 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v3.5.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -402,6 +402,18 @@ target, under that grant. The client takes the first rule that matches:
 ==> devbox: granted 12 tokens on cloud3 lane 1 after 2s (also queued on cloud2)
 ```
 
+A target fits now when its host says `now`, and the client does no token arithmetic of its own.
+The lines above are from hosts that admit on tokens. A host that admits on pressure, the
+default since 3.4.0, decides on its idle cores, its memory and I/O pressure, a settle time
+after each grant and its free memory, with no job limit, and its token figures decide nothing.
+Its line names the rule, the running jobs and the idle CPU share against its limit, then each
+other reading that holds the next run:
+
+```
+==> devbox: queuing on cloud2: admits on pressure, 3 jobs running, cpu idle 18.40% (at least 25%), 0 waiting: about 2s of queuing
+==> devbox: queuing on cloud3: admits on pressure, 1 job running, cpu idle 61.20% (at least 25%), 0 waiting: the host admits this ask now
+```
+
 `DEVBOX_MAX_QUEUE_WAIT` counts from the first place in a queue, the grace included. When it runs
 out with no grant, rules 4 to 6 apply. A run that gets no free lane on any eligible target
 within `DEVBOX_LOCK_WAIT` (3600 seconds, from the environment) exits 4.
@@ -571,7 +583,9 @@ not its pin.
 
 `devbox status` asks every target one `status` verb, in parallel. It prints one line per
 target in `DEVBOX_TARGETS` order: health, then a bar each for reserved tokens, busy cores
-against the core count and memory in use, then jobs, and swap while the host uses it. Then one table
+against the core count and memory in use, then jobs, and swap while the host uses it. On a host
+that admits on pressure the jobs show as a count alone, because no job limit applies there, and
+the token bar is the running worker hints over the cores, never yellow when full. Then one table
 lists every gate that runs, then the queue in line order, then the runs this laptop started
 that no target holds yet (probe, rent, lock, sync, setup), then the lost ones. `lock` is the
 wait for a free lane. A run that waits in several queues is one row, and its target cell names

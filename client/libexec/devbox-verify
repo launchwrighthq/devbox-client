@@ -517,6 +517,22 @@ steps_display() {
   [ "$rc" -le 1 ] || return "$rc"
 }
 
+# Copy a run's stderr to the file $1 byte for byte, and pass it on to stderr
+# without the pool's DEVBOX_CANCEL_POOL_LEGACY_LINE. MEASURED: a client that a
+# SIGTERM stopped cancelled its own gate, and after its own `stopped by
+# SIGTERM` its terminal read that the watchdog stopped the gate and that a
+# newer gate cancelled it. Neither had happened. The file keeps the line,
+# because devbox_cancel_reason_is_newer reads it from a host that prints no
+# other. -a, because grep stops printing input it takes for binary, and the
+# rest of a gate's stderr would be lost. A line reaches the terminal once it
+# ends, as on stdout, where steps_display filters in the same way.
+# shellcheck disable=SC2317  # started in a process substitution
+gate_err_display() {
+  local rc=0
+  tee -- "$1" | grep -a --line-buffered -vxF -e "$DEVBOX_CANCEL_POOL_LEGACY_LINE" >&2 || rc=$?
+  [ "$rc" -le 1 ] || return "$rc"
+}
+
 # Fill STEPS_RESULT[<step>] with `<outcome> <seconds> <code>` from the result
 # lines the runner printed last in the file $1. Only the trailing block counts:
 # a streamed step's own output may hold a line that looks like one. The trace
@@ -1416,7 +1432,7 @@ join_job() {
   esac
   printf '%s\n' "$slug" >"$d/lane.tmp" && mv -f "$d/lane.tmp" "$d/lane"
   [ ! -e "$d/abort" ] || exit 0
-  exec {efd}> >(tee "$d/run.err" >&2)
+  exec {efd}> >(gate_err_display "$d/run.err")
   tpid=$!
   # A gate's stdout carries the runner's result lines, which the record reads
   # from run.out and the reader never sees. A run's stdout is its command's
@@ -1739,6 +1755,7 @@ rejoin_read() {
   local -a still=() late=()
   facts="$(sed '/^$/d' "$REJOIN_DIR/facts")"
   newkey_lines "$facts"
+  admission_facts "$facts"
   selection="$(printf '%s\n' "$facts" | rejoin_select "${REJOIN_PENDING[@]}")"
   while read -r kind name rest; do
     case "$kind" in
@@ -1863,6 +1880,18 @@ newkey_lines() {
   while read -r f_name f_kind f_key; do
     [ "$f_kind" = newkey ] || continue
     echo "==> recorded the pinned host key of $f_name ($(target_addr "$f_name")): $f_key"
+  done <<<"$1"
+}
+# The admission record of each target that answered a probe, into
+# JOIN_ADMISSION, for the line join_start_target prints. A target that answered
+# with no record, a host older than it, loses the one an earlier probe gave.
+admission_facts() {
+  local f_name f_kind f_rest
+  while read -r f_name f_kind f_rest; do
+    case "$f_kind" in
+      probe) unset 'JOIN_ADMISSION[$f_name]' ;;
+      admission) JOIN_ADMISSION[$f_name]="$f_rest" ;;
+    esac
   done <<<"$1"
 }
 # How the server half of one target is brought up to this client. A rented
@@ -2453,20 +2482,30 @@ refuse_prep_limit() {
 # exists: a cleanup armed 117 lines after the fifo once left one more fifo
 # directory in the temp directory on every abort in between, a refused rsync,
 # a docker exec that failed, a Ctrl-C.
-declare -A JOIN_FACT=()
+declare -A JOIN_FACT=() JOIN_ADMISSION=()
 JOIN_MAXWAIT=0
 # Join one target, with the line that says why and what its probe answered.
 join_start_target() {
-  local name="$1" why="" verdict secs tokens jobs queued state
+  local name="$1" why="" verdict secs tokens jobs queued state pool fits="this ask fits now"
   [ -z "$FORCE_TARGET" ] || why=" (--target $FORCE_TARGET)"
   [ "$name" != hetzner ] || why=" (the rented Hetzner server of this checkout)"
   [ -n "$why" ] || [ "$name" != "$SELECT_AFFINITY" ] || why=" (the last run of this worktree was here)"
   read -r verdict secs tokens jobs queued <<<"${JOIN_FACT[$name]-}"
   # The pool's state is printed as it was answered, so the reader sees the
   # numbers the join rested on.
+  pool="$tokens tokens, $jobs jobs, $queued waiting"
+  # Under pressure the token figures decide nothing. A line once read
+  # `25/16 tokens, 3/4 jobs, 0 waiting: this ask fits now` for a host that
+  # admits on its idle cores, and the reader could not see what it judged. So
+  # the line names the rule and its readings, and `now` is the host's verdict.
+  if [ -n "${JOIN_ADMISSION[$name]-}" ] && devbox_admission_parse "admission ${JOIN_ADMISSION[$name]}" \
+     && [ "$ADMISSION_RULE" = pressure ]; then
+    pool="admits on pressure, $(admission_text), $queued waiting"
+    fits="the host admits this ask now"
+  fi
   case "$verdict" in
-    now) state="$tokens tokens, $jobs jobs, $queued waiting: this ask fits now" ;;
-    wait) state="$tokens tokens, $jobs jobs, $queued waiting: about ${secs}s of queuing" ;;
+    now) state="$pool: $fits" ;;
+    wait) state="$pool: about ${secs}s of queuing" ;;
     # unknown: the pool would not put a number on the wait. The ceiling still
     # holds, and the only thing lost is the chance to skip a target.
     *) if [ "$JOIN_MAXWAIT" -gt 0 ]; then
@@ -2476,6 +2515,34 @@ join_start_target() {
        fi ;;
   esac
   join_start "$name" "$JOIN_MAXWAIT" "$why: $state"
+}
+
+# What a pressure host judged, from the ADMISSION_ variables of one record: the
+# running jobs and the idle share against its limit, then each other reading
+# only when it holds the next job. With no job running the host admits at once
+# and reads no idle share.
+admission_text() {
+  local t s=s
+  if [ "$ADMISSION_JOBS" = 0 ]; then
+    printf 'no job running'
+    return 0
+  fi
+  [ "$ADMISSION_JOBS" != 1 ] || s=""
+  t="$ADMISSION_JOBS job$s running, cpu idle "
+  if [ "$ADMISSION_CPU_IDLE" = - ]; then t+="not read"; else t+="$ADMISSION_CPU_IDLE%"; fi
+  t+=" (at least $ADMISSION_CPU_IDLE_MIN%)"
+  if [ "$ADMISSION_MEMORY" != - ] && [ "$ADMISSION_MEMORY_MAX" != - ] \
+     && [ "${ADMISSION_MEMORY%.*}" -ge "$ADMISSION_MEMORY_MAX" ]; then
+    t+=", memory pressure $ADMISSION_MEMORY% (limit $ADMISSION_MEMORY_MAX%)"
+  fi
+  if [ "$ADMISSION_IO" != - ] && [ "$ADMISSION_IO_MAX" != - ] \
+     && [ "${ADMISSION_IO%.*}" -ge "$ADMISSION_IO_MAX" ]; then
+    t+=", io pressure $ADMISSION_IO% (limit $ADMISSION_IO_MAX%)"
+  fi
+  [ "$ADMISSION_SETTLE_LEFT" = - ] || [ "$ADMISSION_SETTLE_LEFT" -eq 0 ] \
+    || t+=", the newest grant settles in ${ADMISSION_SETTLE_LEFT}s"
+  [ "$ADMISSION_HEADROOM" != short ] || t+=", too little free memory for the headroom"
+  printf '%s' "$t"
 }
 
 # Join every target named, after the affinity grace when GRACE_TARGET is set.
@@ -2611,6 +2678,7 @@ decide() {
         names+=("$name")
         JOIN_FACT[$name]="$rest"
       done <<<"$SELECTION"
+      admission_facts "$FACTS"
       # Rule 1 is the affinity target within the grace. It gets a head start
       # only when there is another target to join after it.
       GRACE_TARGET=""
@@ -2913,8 +2981,8 @@ held_or_die
 #
 # The gate's stderr is copied to GATE_ERR as it streams, because the watchdog's
 # reason reaches this laptop as one line of it, and exit 10 names that reason.
-# tee passes every byte on at once, so a gate's progress output streams as
-# before.
+# tee writes every byte to GATE_ERR at once, and gate_err_display passes each
+# line on as it ends, so a gate's progress output streams as before.
 #
 # The stdin is written into the fifo this shell holds read-write, so a host
 # that ends early can never answer the write with SIGPIPE. A mock ssh that
@@ -2948,10 +3016,11 @@ refuse_prep_limit "$status" "$GATE_ERR" "$TARGET"
 # ── was it cancelled? ────────────────────────────────────────────────────────
 #
 # The pool stops a gate through one path, `devbox-pool stop`, for the watchdog
-# and for the `cancel` verb alike, and exits 79 with its line either way. The
-# reason tells them apart: a newer gate of this checkout, or `devbox cancel`,
-# stopped this one, and that is exit 14, never 10. A consumer's wrapper read
-# every stop as one kind, so an agent reported a cancel that never happened.
+# and for the `cancel` verb alike, and exits 79 either way. Its line tells them
+# apart (devbox_cancel_reason_is_newer): a newer gate of this checkout, or
+# `devbox cancel`, stopped this one, and that is exit 14, never 10. A
+# consumer's wrapper read every stop as one kind, so an agent reported a cancel
+# that never happened.
 if [ "$status" -eq 79 ] && [ "$STEPS_ACTIVE" = 1 ] && devbox_cancel_reason_is_newer "$GATE_ERR"; then
   echo "devbox verify: $DEVBOX_CANCEL_REASON: the pool on $TARGET stopped this gate" >&2
   steps_record_finish "$STEPS_RAW" 0 0

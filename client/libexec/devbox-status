@@ -487,11 +487,15 @@ render_host() {
   esac
   paint_to "$hcol" "$hw"
   printf -v line '%-*s%s%*s' "$COL" "$name" "$PAINTED" $((10 - ${#hw})) ''
-  # A full pool queues the next gate, whatever the load.
+  # A full pool queues the next gate, whatever the load. A pool that admits on
+  # pressure sends `-` for its job limit, and there the bar is the worker hints
+  # over the cores: a full one queues nothing, so it is never yellow.
+  local pressure=0
+  [ "$STATUS_MAX_JOBS" != - ] || ! isnum "$STATUS_JOBS" || pressure=1
   col=""
   if isnum "$STATUS_HELD" && isnum "$STATUS_TOTAL" && [ "$STATUS_TOTAL" -gt 0 ]; then
     n="$(cells "$STATUS_HELD" "$STATUS_TOTAL")"
-    [ "$STATUS_HELD" -lt "$STATUS_TOTAL" ] || col=yellow
+    [ "$STATUS_HELD" -lt "$STATUS_TOTAL" ] || [ "$pressure" = 1 ] || col=yellow
   else
     n=0
   fi
@@ -528,7 +532,11 @@ render_host() {
   # The jobs limit queues a gate even with tokens free.
   col=""
   if isnum "$STATUS_JOBS" && isnum "$STATUS_MAX_JOBS" && [ "$STATUS_JOBS" -ge "$STATUS_MAX_JOBS" ]; then col=yellow; fi
-  paint_to "$col" "$STATUS_JOBS/$STATUS_MAX_JOBS"
+  if [ "$pressure" = 1 ]; then
+    paint_to "" "$STATUS_JOBS"
+  else
+    paint_to "$col" "$STATUS_JOBS/$STATUS_MAX_JOBS"
+  fi
   jobs="jobs $PAINTED"
   line+="$tok  $cpu  $mem  $jobs"
   # Swap in use, after the bars. A host with no swap paid a memory peak with a

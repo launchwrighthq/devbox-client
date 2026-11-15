@@ -51,9 +51,17 @@ mkfifo "$FAKE_SLEEP_FIFO"
 A_LAN1=192.0.2.10
 
 # FAKE_CANCEL_OLD names hosts whose devbox-gate predates the cancel verb.
-# FAKE_CANCEL_STOP makes the pool stop the gate with the cancel reason, as the
-# verb of a newer gate does once this client can no longer answer its TERM.
+# FAKE_CANCEL_STOP makes the pool stop the gate as the cancel verb of a newer
+# gate does once this client can no longer answer its TERM: `old` prints the
+# line of a host that predates the cancel line, `new` the two lines of a host
+# that prints it. FAKE_OWN_CANCEL (`old` or `new`) holds the run after `go`
+# until the cancel verb arrives, as a gate holds its grant, then prints those
+# lines and exits 79, and the cancel verb answers that it stopped the run.
 { gate_stub_head; gate_stub_hold; cat <<'STUB'
+_pool_cancel_lines() {
+  [ "$1" = old ] || echo "devbox-pool: the cancel verb stopped this gate: cancelled from this checkout" >&2
+  echo "devbox-pool: the watchdog stopped this gate: cancelled by a newer gate of this checkout" >&2
+}
 case "$GATE_CMD" in
   version) printf '%s\n' "$FAKE_VERSION" ;;
   "queue-estimate "*) printf 'now 0 3 0/20 0/4 0\n' ;;
@@ -69,7 +77,14 @@ case "$GATE_CMD" in
     _hold_run
     if [ -n "${FAKE_CANCEL_STOP-}" ]; then
       while IFS= read -r _; do :; done
-      echo "devbox-pool: the watchdog stopped this gate: cancelled by a newer gate of this checkout" >&2
+      _pool_cancel_lines "$FAKE_CANCEL_STOP"
+      exit 79
+    fi
+    if [ -n "${FAKE_OWN_CANCEL-}" ]; then
+      while IFS= read -r _; do :; done
+      while [ ! -e "$FAKE_CANCEL_SENT" ]; do sleep 0.1; done
+      _pool_cancel_lines "$FAKE_OWN_CANCEL"
+      : >"$FAKE_POOL_PRINTED"
       exit 79
     fi
     _hold_gate ;;
@@ -80,6 +95,11 @@ case "$GATE_CMD" in
       echo "devbox-gate: unknown verb 'cancel'. This account runs devbox gate verbs only: a client older than protocol 3 sends raw commands, so update the devbox client" >&2
       exit 2 ;;
     esac
+    if [ -n "${FAKE_OWN_CANCEL-}" ]; then
+      : >"$FAKE_CANCEL_SENT"
+      echo "gate-root: cancelled run ${GATE_CMD##* }: TERM sent to its pool process 4301"
+      exit 0
+    fi
     echo "gate-root: no running gate of this run belongs to this machine"
     exit 1 ;;
 esac
@@ -267,15 +287,55 @@ assert_ok "R4: the verb was asked for the older run" grep -qE " $A_LAN1 cancel $
 assert_ok "R4: and the gate ran its steps" grep -qx lint "$STEP_LOG"
 
 # ═══ a pool stop with the cancel reason exits 14, never 10 ═══════════════════
-reset
-FAKE_CANCEL_STOP=1 verify --target lan1 --full
-assert_eq "14" "$rc" "a pool exit 79 with the cancel reason exits 14"
-assert_ok "naming the cancel" contains "devbox verify: cancelled by a newer gate of this checkout: the pool on lan1 stopped this gate" "$out"
-assert_fail "and not the watchdog" contains "the watchdog on lan1 stopped this gate" "$out"
+#
+# From a host of either kind. The pool's older line names the watchdog and a
+# newer gate whoever sent the verb, so it never reaches the terminal.
+for host in old new; do
+  reset
+  FAKE_CANCEL_STOP=$host verify --target lan1 --full
+  assert_eq "14" "$rc" "a pool exit 79 with the cancel line of the $host host exits 14"
+  assert_ok "  naming the cancel" contains "devbox verify: cancelled by a newer gate of this checkout: the pool on lan1 stopped this gate" "$out"
+  assert_fail "  and never the watchdog" contains "watchdog" "$out"
+done
 rc=0
-out="$(cd "$CO" && "${ENVV[@]}" DEVBOX_STRICT=1 FAKE_CANCEL_STOP=1 bash "$REPO/client/libexec/devbox-verify" --target lan1 --full 2>&1)" || rc=$?
+out="$(cd "$CO" && "${ENVV[@]}" DEVBOX_STRICT=1 FAKE_CANCEL_STOP=new bash "$REPO/client/libexec/devbox-verify" --target lan1 --full 2>&1)" || rc=$?
 assert_eq "79" "$rc" "under DEVBOX_STRICT=1 a cancel is 79"
 assert_ok "with ::devbox-infra::cancelled" contains "::devbox-infra::cancelled" "$out"
+
+# ═══ a gate's own cancel on its SIGTERM is never a watchdog stop ═════════════
+#
+# MEASURED: a client that a SIGTERM stopped sent the cancel verb for its own
+# gate, and its terminal then read, after its own `stopped by SIGTERM`, that
+# the watchdog stopped the gate and that a newer gate cancelled it. The pool's
+# answer to that verb reaches the terminal after the client exits, through the
+# join's copy of the run's stderr, so each case waits until the fake pool has
+# printed it.
+export FAKE_CANCEL_SENT="$TMP/cancel.sent" FAKE_POOL_PRINTED="$TMP/pool.printed"
+for host in old new; do
+  reset
+  rm -f "$FAKE_CANCEL_SENT" "$FAKE_POOL_PRINTED" "$TMP/own.rc"
+  (cd "$CO" && "${ENVV[@]}" FAKE_OWN_CANCEL=$host bash "$REPO/client/libexec/devbox-verify" --target lan1 --full \
+    >"$TMP/own.out" 2>&1; echo "$?" >"$TMP/own.rc") &
+  LIVE+=("$!")
+  for ((i = 0; i < 150; i++)); do grep -q ' go $' "$HOLD_LOG" && break; sleep 0.1; done
+  assert_ok "own cancel, $host host: the gate got go" grep -q ' go $' "$HOLD_LOG"
+  kill -TERM "$(awk '{ print $1 }' "$MARKER")"
+  own_rc="$(wait_code own)"
+  for ((i = 0; i < 100; i++)); do [ -e "$FAKE_POOL_PRINTED" ] && break; sleep 0.1; done
+  # The fake pool writes that file after its lines, and the join passes them
+  # on within this wait.
+  sleep 0.5
+  own_out="$(cat "$TMP/own.out")"
+  assert_eq "143" "$own_rc" "own cancel, $host host: a TERM from outside still exits 143"
+  assert_ok "  the client cancelled its own gate" contains "devbox verify: cancelled this gate $RUN_PREFIX." "$own_out"
+  assert_ok "  and says it was stopped by SIGTERM" contains "devbox verify: stopped by SIGTERM" "$own_out"
+  assert_fail "  and the terminal never says the watchdog stopped it" contains "watchdog" "$own_out"
+  assert_fail "  or that a newer gate cancelled it" contains "newer gate" "$own_out"
+  if [ "$host" = new ]; then
+    assert_ok "  the pool's own line names the cancel verb" \
+      contains "devbox-pool: the cancel verb stopped this gate: cancelled from this checkout" "$own_out"
+  fi
+done
 
 # ═══ D9: a planned gate whose grant was released once queues once more ══════
 reset

@@ -37,6 +37,15 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 fi
 
 DEVBOX_CANCEL_REASON="cancelled by a newer gate of this checkout"
+# The two lines devbox-pool prints when the cancel verb stopped a gate, both
+# with exit 79. A host that predates the first prints the second alone, and a
+# newer host prints both, the second for clients that read only it. The second
+# names the watchdog and a newer gate whoever sent the verb: MEASURED, a
+# client that a SIGTERM stopped cancelled its own gate, and its terminal ended
+# with that line after its own `stopped by SIGTERM`. So devbox-verify keeps it
+# off the terminal, and the client's own line says what happened.
+DEVBOX_CANCEL_POOL_LINE="devbox-pool: the cancel verb stopped this gate: "
+DEVBOX_CANCEL_POOL_LEGACY_LINE="devbox-pool: the watchdog stopped this gate: $DEVBOX_CANCEL_REASON"
 # The program name on every line, `devbox verify` unless devbox_cancel_command
 # runs.
 DEVBOX_CANCEL_WHO="devbox verify"
@@ -267,14 +276,15 @@ devbox_cancel_own_run() {
   return 0
 }
 
-# devbox_cancel_reason_is_newer <pool stderr file>: true when the pool's stop
-# line carries the cancel reason exactly. devbox-pool prints
-# `devbox-pool: the watchdog stopped this gate: <reason>` and exits 79 for every
-# stop through `devbox-pool stop`, so the reason is what tells a cancel (exit
-# 14) from a watchdog stop (exit 10).
+# devbox_cancel_reason_is_newer <pool stderr file>: true when the pool says the
+# cancel verb stopped the gate, by either of the lines above. devbox-pool exits
+# 79 for every stop through `devbox-pool stop`, so the line is what tells a
+# cancel (exit 14) from a watchdog stop (exit 10). Only another client of this
+# checkout sends the verb while this one reads the pool's answer: this gate's
+# own TERM trap sends it and exits.
 devbox_cancel_reason_is_newer() {
   [ -r "${1-}" ] || return 1
-  grep -qxF "devbox-pool: the watchdog stopped this gate: $DEVBOX_CANCEL_REASON" "$1"
+  grep -q "^$DEVBOX_CANCEL_POOL_LINE" "$1" || grep -qxF "$DEVBOX_CANCEL_POOL_LEGACY_LINE" "$1"
 }
 
 # devbox_cancel_command <lane-1 slug> <machine-id>: `devbox cancel`. Cancels

@@ -221,7 +221,7 @@ devbox_probe_limits_ok() {
 
 devbox_probe_one() (
   set +e
-  local want="$1" min="$2" out="$3" use_cache="$4" name="$5" now="$6" age rc line req_rc
+  local want="$1" min="$2" out="$3" use_cache="$4" name="$5" now="$6" age rc line req_rc adm
   # shellcheck disable=SC2034  # read by devbox_gate_target in devbox-transport, which the caller sourced
   GATE_CONNECT_TIMEOUT="$DEVBOX_PROBE_CONNECT_TIMEOUT"
   # shellcheck disable=SC2034  # read by _gate_limit in devbox-transport; this subshell's value only
@@ -257,8 +257,16 @@ devbox_probe_one() (
     devbox_probe_lost "$name" probe "$now"
     exit 0
   fi
+  # The admission record, the second line of a host that sends one
+  # (lib/devbox-lib.sh). devbox_select reads no `admission` fact, so the choice
+  # rests on the probe line alone, and devbox-verify prints the record.
+  adm="${line#*$'\n'}"
   line="${line%%$'\n'*}"
   echo "$name probe $line"
+  if [ "$adm" != "$line" ] && devbox_admission_parse "$adm"; then
+    adm="${adm%%$'\n'*}"
+    echo "$name admission ${adm#admission }"
+  fi
   # The image is asked only of a target whose answer is a probe line at all: a
   # host that does not know `probe` is a handshake failure, and that is the
   # reason its skip line must name.
