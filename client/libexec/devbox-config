@@ -73,10 +73,26 @@ devbox_kv_parse() {
 # Every key a project may set. A key outside this list is refused, so a typo
 # fails the run instead of silently running it with a default.
 DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
-DEVBOX_FORWARD_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR DEVBOX_RUNPOD_IMAGE \
-DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
+DEVBOX_FORWARD_ENV DEVBOX_RUNPOD_IMAGE \
+DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
 DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS DEVBOX_LOCAL_GATE \
 DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_WORKER_MEMORY "
+
+# The replacement of each key that release 4.0 removed from .devbox/config.env
+# (docs/specs/2026-11-14-learned-selection-design.md, section 11). Each is
+# refused by name with the line that replaces it, never dropped. A gate that
+# ran with its database URL unset skipped its database tests and still exited
+# 0, MEASURED, and a DEVBOX_NEEDS_POSTGRES dropped in silence starts no
+# database. A DEVBOX_VERIFY beside .devbox/steps was a second gate that
+# nothing ran. .devbox.env refuses DEVBOX_VERIFY with the same line.
+devbox_config_removed_key() {
+  case "$1" in
+    DEVBOX_VERIFY) echo "Describe the gate in .devbox/steps, one step per line, such as 'verify -- <the command>'." ;;
+    DEVBOX_NEEDS_POSTGRES) echo "Write DEVBOX_SERVICES=postgres in .devbox/config.env." ;;
+    DEVBOX_DB_URL_VAR) echo "Write DEVBOX_SERVICE_ENV=postgres=<VARIABLE> in .devbox/config.env, or leave it out for DATABASE_URL." ;;
+    *) return 1 ;;
+  esac
+}
 
 # A path of DEVBOX_SETUP_INPUTS or DEVBOX_SHARED_INPUTS, relative to the
 # checkout root. The laptop hashes each one, and the steps hand them to other
@@ -98,7 +114,7 @@ devbox_config_paths_ok() {
 devbox_config_parse() {
   local file="$1" image="${DEVBOX_RUNPOD_IMAGE:-}" key rc=0 rerun_file
   local rerun_env="${DEVBOX_RERUN-}" rerun_env_set="${DEVBOX_RERUN+x}"
-  devbox_kv_parse "$file" "$DEVBOX_CONFIG_KEYS" || rc=2
+  devbox_kv_parse "$file" "$DEVBOX_CONFIG_KEYS" "" devbox_config_removed_key || rc=2
   # DEVBOX_RERUN (spec D13): a flag beats the environment, the environment
   # beats this file, and the file beats `changed`. The parser sets each key it
   # reads as a shell variable of the same name, so a file line would replace
@@ -110,18 +126,27 @@ devbox_config_parse() {
   [ "$rc" = 0 ] || return 2
   # The image is a default: a developer's .devbox.env, read first, may pick another.
   [ -z "$image" ] || DEVBOX_RUNPOD_IMAGE="$image"
-  for key in DEVBOX_PROJECT DEVBOX_SETUP DEVBOX_VERIFY; do
+  DEVBOX_SETUP_DEFAULT=0
+  for key in DEVBOX_PROJECT DEVBOX_SETUP; do
     case "$DEVBOX_KV_SEEN" in *" $key "*) continue ;; esac
-    # A project that describes its gate in .devbox/steps beside this file
-    # needs no DEVBOX_VERIFY (client-owns-the-gate spec, D2): a migrated
-    # project that had to keep a dead command here would keep a second gate
-    # that nothing runs.
-    if [ "$key" = DEVBOX_VERIFY ] && [ -f "$(dirname "$file")/steps" ]; then
-      DEVBOX_VERIFY=""
+    # A project with no DEVBOX_SETUP gets the install of its lock files. Every
+    # project wrote `uv sync` and `npm ci` beside each lock file in a setup of
+    # its own, and one of those scripts carried a symlink repair the client
+    # already made. devbox_config_load lists the lock files, from the checkout.
+    if [ "$key" = DEVBOX_SETUP ]; then
+      DEVBOX_SETUP=devbox_install_locks
+      DEVBOX_SETUP_DEFAULT=1
       continue
     fi
     echo "devbox: $file sets no $key" >&2; return 2
   done
+  # The gate is .devbox/steps beside this file (client-owns-the-gate spec, D2).
+  # Checked here, where verify, run, gc, status and doctor all read the config,
+  # so no path takes a project that names no gate as a whole one.
+  if [ ! -f "$(dirname "$file")/steps" ]; then
+    echo "devbox: $file has no .devbox/steps beside it, so the project names no gate; write one step per line there, such as 'test -- npm test'" >&2
+    return 2
+  fi
   # DEVBOX_LANES, the workspaces one worktree may hold on each target. MEASURED:
   # several runs of one worktree waited on one host's lock for tens of minutes
   # while that host ran at about a third of its CPU, because one worktree had
@@ -175,7 +200,7 @@ devbox_config_parse() {
         always|ci|never) ;;
         *) echo "devbox: $file: refusing DEVBOX_LOCAL_GATE '$DEVBOX_LOCAL_GATE': write always, ci or never" >&2; return 2 ;;
       esac ;;
-    *) DEVBOX_LOCAL_GATE=always ;;
+    *) DEVBOX_LOCAL_GATE=ci ;;
   esac
   devbox_config_services "$file"
 }
@@ -220,24 +245,19 @@ devbox_service_of_slot() {
 # DEVBOX_SERVICES, DEVBOX_SERVICE_ENV and DEVBOX_WORKER_MEMORY (learned-selection
 # spec, section 4.1), from the committed file alone, as DEVBOX_LANES is: an
 # exported DEVBOX_SERVICES would start a server the project never declared.
-# DEVBOX_NEEDS_POSTGRES and DEVBOX_DB_URL_VAR, the older keys, are read from the
-# file alone too, and the two forms are made one here:
 #
-#   - DEVBOX_NEEDS_POSTGRES=1 adds postgres to DEVBOX_SERVICES, and a
-#     DEVBOX_DB_URL_VAR becomes its DEVBOX_SERVICE_ENV name;
-#   - postgres in DEVBOX_SERVICES sets DEVBOX_NEEDS_POSTGRES=1 and
-#     DEVBOX_DB_URL_VAR to its name, which devbox-verify and devbox-runpod read
-#     to send the DSN.
-#
-# DEVBOX_NEEDS_POSTGRES=1 with no DEVBOX_DB_URL_VAR keeps DEVBOX_DB_URL_VAR
-# empty, so devbox-runpod and the queue fallback refuse it by name, as before.
+# Sets DEVBOX_NEEDS_POSTGRES, 1 when DEVBOX_SERVICES names postgres, else 0,
+# and DEVBOX_DB_URL_VAR, the name its URL is exported under, which
+# devbox-verify and devbox-runpod read to send the DSN. Neither is a key of the
+# file since release 4.0 (devbox_config_removed_key), so an exported value of
+# either is replaced here.
 #
 # Sets DEVBOX_WORKER_MEMORY_BYTES, which the hooks export to the workspace as
 # DEVBOX_WORKER_MEMORY.
 # shellcheck disable=SC2034  # DEVBOX_WORKER_MEMORY_BYTES is read by devbox_hooks_script
 devbox_config_services() {
-  local file="$1" key s pair slot name seen=" " names=" " n declared=0
-  for key in DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR; do
+  local file="$1" key s pair slot name seen=" " names=" " n
+  for key in DEVBOX_SERVICES DEVBOX_SERVICE_ENV; do
     case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) printf -v "$key" '%s' "" ;; esac
   done
   for s in $DEVBOX_SERVICES; do
@@ -250,32 +270,6 @@ devbox_config_services() {
     esac
     seen="$seen$s "
   done
-  case "$DEVBOX_NEEDS_POSTGRES" in
-    ""|0|1) ;;
-    *) echo "devbox: $file: refusing DEVBOX_NEEDS_POSTGRES '$DEVBOX_NEEDS_POSTGRES': write 1, or postgres in DEVBOX_SERVICES" >&2; return 2 ;;
-  esac
-  if [ "$DEVBOX_NEEDS_POSTGRES" = 0 ] && [[ "$seen" == *" postgres "* ]]; then
-    echo "devbox: $file: DEVBOX_SERVICES names postgres, and DEVBOX_NEEDS_POSTGRES=0 says no database; remove DEVBOX_NEEDS_POSTGRES" >&2
-    return 2
-  fi
-  # 1 when DEVBOX_SERVICES itself names postgres, so its name is DEVBOX_DB_URL_VAR.
-  if [[ "$seen" == *" postgres "* ]]; then declared=1; fi
-  if [ "$DEVBOX_NEEDS_POSTGRES" = 1 ] && [ "$declared" = 0 ]; then
-    DEVBOX_SERVICES="postgres${DEVBOX_SERVICES:+ $DEVBOX_SERVICES}"
-    seen="$seen postgres "
-  fi
-  # A DEVBOX_DB_URL_VAR beside a declared postgres is its name, whichever key
-  # declared it.
-  if [ -n "$DEVBOX_DB_URL_VAR" ] && [[ "$seen" == *" postgres "* ]]; then
-    (require_env_name "$DEVBOX_DB_URL_VAR" "$file") || return 2
-    for pair in $DEVBOX_SERVICE_ENV; do
-      [ "${pair%%=*}" = postgres ] || continue
-      [ "${pair#*=}" != "$DEVBOX_DB_URL_VAR" ] || continue
-      echo "devbox: $file: DEVBOX_DB_URL_VAR=$DEVBOX_DB_URL_VAR and DEVBOX_SERVICE_ENV $pair name two variables for one database; keep $pair and remove DEVBOX_DB_URL_VAR" >&2
-      return 2
-    done
-    [[ " $DEVBOX_SERVICE_ENV " == *" postgres="* ]] || DEVBOX_SERVICE_ENV="postgres=$DEVBOX_DB_URL_VAR${DEVBOX_SERVICE_ENV:+ $DEVBOX_SERVICE_ENV}"
-  fi
   for pair in $DEVBOX_SERVICE_ENV; do
     slot="${pair%%=*}"
     name="${pair#*=}"
@@ -308,9 +302,10 @@ devbox_config_services() {
   done
   if [[ "$seen" == *" postgres "* ]]; then
     DEVBOX_NEEDS_POSTGRES=1
-    [ "$declared" = 0 ] || DEVBOX_DB_URL_VAR="$(devbox_service_var postgres)"
+    DEVBOX_DB_URL_VAR="$(devbox_service_var postgres)"
   else
     DEVBOX_NEEDS_POSTGRES=0
+    DEVBOX_DB_URL_VAR=""
   fi
   # DEVBOX_WORKER_MEMORY, the memory one test worker needs (section 7). The
   # runner divides by it in bash arithmetic, which evaluates whatever text it
@@ -332,10 +327,11 @@ devbox_config_services() {
 #
 # A missing .devbox.env ran the whole gate on the laptop with one notice line:
 # concurrent gates of several worktrees put more test workers on one laptop
-# than it had cores. `ci` keeps a CI job, which has no .devbox.env, and a
-# developer who asks by name. `never` refuses both.
+# than it had cores. `ci`, the default since release 4.0, keeps a CI job,
+# which has no .devbox.env, and a developer who asks by name. `never` refuses
+# both, and `always`, the release 3 default, stays for a project that writes it.
 devbox_local_gate_allowed() {
-  case "${DEVBOX_LOCAL_GATE:-always}" in
+  case "${DEVBOX_LOCAL_GATE:-ci}" in
     always) return 0 ;;
     ci)
       [ -z "${CI:-}" ] && [ "${1:-0}" != 1 ] || return 0
@@ -344,6 +340,65 @@ devbox_local_gate_allowed() {
       echo "devbox verify: no .devbox.env, and DEVBOX_LOCAL_GATE=$DEVBOX_LOCAL_GATE refuses a gate on this machine; write a .devbox.env that names a target" >&2 ;;
   esac
   return 1
+}
+
+# Print the lock files the default setup installs, one per line: each uv.lock
+# and package-lock.json that git tracks in the checkout in $PWD, outside
+# node_modules/ and .venv/. These are the two lock files whose outputs, .venv/
+# and node_modules/ beside them, the setup skip and the plan's setup key
+# already know. A tracked file is a file the sync sends unless an exclude rule
+# holds it back, and the hooks skip a lock file that did not arrive.
+devbox_lock_files() {
+  local out path
+  out="$(git ls-files -- ':(glob)**/uv.lock' ':(glob)**/package-lock.json')" || {
+    echo "devbox: git ls-files failed in $PWD, so the lock files of the setup are unknown" >&2
+    return 1
+  }
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case "/$path" in */node_modules/*|*/.venv/*) continue ;; esac
+    printf '%s\n' "$path"
+  done <<<"$out"
+}
+
+# With no DEVBOX_SETUP in the file $1, the setup is devbox_install_locks, and
+# with no DEVBOX_SETUP_INPUTS either, the setup skip keys on the lock files it
+# installs, through the same DEVBOX_SETUP_INPUTS path a project would write.
+# A pnpm or yarn lock file refuses the default: the image carries pnpm only as
+# a feature, and a default that left those packages out would run the gate
+# with no dependencies, the silent skip this repository keeps finding.
+#
+# DEVBOX_SETUP_LOCKS, the lock files devbox_install_locks installs, is fixed
+# here, before a caller such as devbox-probe empties DEVBOX_SETUP_INPUTS to
+# turn the skip off: the lock files DEVBOX_SETUP_INPUTS names when it names
+# one, else every tracked one. MEASURED: a project may track a lock file its setup
+# never installed, such as one of a second app in the same repository.
+devbox_config_default_setup() {
+  local file="$1" other locks path
+  local -a inputs=()
+  DEVBOX_SETUP_LOCKS=""
+  case "$DEVBOX_SETUP" in *devbox_install_locks*) ;; *) return 0 ;; esac
+  read -r -a inputs <<<"$DEVBOX_SETUP_INPUTS"
+  for path in ${inputs[@]+"${inputs[@]}"}; do
+    case "${path##*/}" in uv.lock|package-lock.json) DEVBOX_SETUP_LOCKS+="$path"$'\n' ;; esac
+  done
+  if [ -z "$DEVBOX_SETUP_LOCKS" ]; then
+    DEVBOX_SETUP_LOCKS="$(devbox_lock_files)" || return 2
+  fi
+  [ "$DEVBOX_SETUP_DEFAULT" = 1 ] || return 0
+  other="$(git ls-files -- ':(glob)**/pnpm-lock.yaml' ':(glob)**/yarn.lock')" || {
+    echo "devbox: git ls-files failed in $PWD, so the lock files of the setup are unknown" >&2
+    return 2
+  }
+  other="$(awk '!/(^|\/)node_modules\// { print; exit }' <<<"$other")"
+  if [ -n "$other" ]; then
+    echo "devbox: $file sets no DEVBOX_SETUP, and the default installs only uv.lock and package-lock.json; $other needs a DEVBOX_SETUP" >&2
+    return 2
+  fi
+  [ -z "$DEVBOX_SETUP_INPUTS" ] || return 0
+  locks="$(printf '%s' "$DEVBOX_SETUP_LOCKS" | tr '\n' ' ')"
+  devbox_config_paths_ok DEVBOX_SETUP_INPUTS "$locks" "$file" || return 2
+  DEVBOX_SETUP_INPUTS="${locks% }"
 }
 
 # Load the config of the checkout in $PWD. Sets DEVBOX_CONFIG, the file to name
@@ -358,7 +413,8 @@ devbox_config_load() {
   if [ -f .devbox/config.env ]; then
     DEVBOX_CONFIG="$PWD/.devbox/config.env"
     DEVBOX_EXCLUDE=.devbox/exclude
-    devbox_config_parse "$DEVBOX_CONFIG"
+    devbox_config_parse "$DEVBOX_CONFIG" || return
+    devbox_config_default_setup "$DEVBOX_CONFIG"
   elif [ -f .devbox/profile.sh ]; then
     echo "devbox: .devbox/profile.sh is an older format this client does not read. Convert it to .devbox/config.env and rename .devbox/rsync-filter to .devbox/exclude." >&2
     return 2
@@ -396,6 +452,7 @@ devbox_env_removed_key() {
     DEVBOX_ENABLED) echo "A file that sets DEVBOX_TARGETS or DEVBOX_RENT is on. Remove both keys, or the file, to run the gate here." ;;
     DEVBOX_BACKEND) echo "Write DEVBOX_RENT=runpod to rent when no deployed target can take the gate, or run 'devbox verify --target runpod'." ;;
     DEVBOX_RUNPOD_SECONDS) echo "Write DEVBOX_RUNPOD_IDLE_SECONDS." ;;
+    DEVBOX_VERIFY) devbox_config_removed_key "$1" ;;
     *) return 1 ;;
   esac
 }
@@ -613,14 +670,29 @@ devbox_forward_name() {
 # devbox_hooks_script; the value is fixed into the text here.
 DEVBOX_SETUP_KEY_DIR=/home/dev/.devbox/setup
 devbox_hooks_script() {
-  local key=""
+  local key="" locks repair
   if [ -n "${DEVBOX_SETUP_INPUTS:-}" ]; then
     key="$(devbox_setup_key)" || return 1
   fi
   printf 'devbox_environment() {\n%s\n}\n' "${DEVBOX_ENVIRONMENT:-:}"
   [ -z "${DEVBOX_PROVISION:-}" ] || printf 'devbox_provision() {\n%s\n}\n' "$DEVBOX_PROVISION"
+  # Outside a git checkout no lock file is known: a test fixture that calls
+  # this function with a setup of its own, which repairs nothing below the
+  # root. A setup that installs lock files had its list from
+  # devbox_config_load, which refuses a checkout git cannot list.
+  locks="$(devbox_lock_files 2>/dev/null)" || locks=""
+  case "${DEVBOX_SETUP-}" in
+    *devbox_install_locks*)
+      if [ -z "${DEVBOX_SETUP_LOCKS+x}" ]; then
+        echo "devbox: DEVBOX_SETUP calls devbox_install_locks, and no config load listed its lock files" >&2
+        return 1
+      fi
+      devbox_install_hooks "$DEVBOX_SETUP_LOCKS" ;;
+  esac
+  repair="$(devbox_repair_hooks "$locks")"
+  [ -z "$repair" ] || printf '%s\n' "$repair"
   if [ -z "$key" ]; then
-    printf 'devbox_setup() {\n%s\n}\n' "$DEVBOX_SETUP"
+    printf 'devbox_setup() {\n%s%s\n}\n' "${repair:+_devbox_repair_links$'\n'}" "$DEVBOX_SETUP"
   else
     printf '_devbox_setup_body() {\n%s\n}\n' "$DEVBOX_SETUP"
     printf 'devbox_setup() {\n'
@@ -628,6 +700,9 @@ devbox_hooks_script() {
       "$DEVBOX_SETUP_KEY_DIR" "$key" "$DEVBOX_SETUP_INPUTS"
     printf '  local _devbox_setup_file=%q _devbox_setup_have="" _devbox_setup_rc\n' \
       "$DEVBOX_SETUP_KEY_DIR/$DEVBOX_PROJECT.key"
+    # Before the skip test, which reads .venv/ and node_modules/ as outputs: a
+    # symlink there is never one.
+    [ -z "$repair" ] || printf '  _devbox_repair_links\n'
     cat <<'SETUP'
   # A key file with no complete line reads as no key, so the setup runs.
   [ ! -r "$_devbox_setup_file" ] || read -r _devbox_setup_have <"$_devbox_setup_file" || _devbox_setup_have=""
@@ -663,14 +738,9 @@ devbox_hooks_script() {
 }
 SETUP
   fi
-  if [ -n "${DEVBOX_VERIFY:-}" ]; then
-    printf 'devbox_verify() {\n%s\n}\n' "$DEVBOX_VERIFY"
-  else
-    # A project with .devbox/steps sets no DEVBOX_VERIFY, and an empty function
-    # body is a syntax error in the workspace bash. The body fails, so a gate
-    # whose step hooks did not arrive can never pass by running nothing.
-    printf 'devbox_verify() {\necho "devbox: this gate has no DEVBOX_VERIFY and no step plan reached the workspace, so nothing ran" >&2\nreturn 2\n}\n'
-  fi
+  # The step hooks below replace this devbox_verify. The body fails, so a gate
+  # whose step hooks did not arrive can never pass by running nothing.
+  printf 'devbox_verify() {\necho "devbox: no step plan reached the workspace, so nothing ran" >&2\nreturn 2\n}\n'
   # The step runner and the plan, when devbox-verify planned a gate
   # (devbox_steps_hooks below). Here, and not appended by each caller, because
   # three paths send these hooks: a deployed target and the rented Hetzner
@@ -688,6 +758,76 @@ SETUP
   fi
 }
 
+# The install of one lock file in the workspace, by its name: `uv sync
+# --locked --all-packages` beside a uv.lock, `npm ci` beside a package-lock.json,
+# the install each project wrote in a setup of its own. --locked, not --frozen:
+# a gate must fail on a uv.lock its pyproject.toml has outgrown, and --frozen
+# installs the stale lock without a word. --all-packages, because some uv
+# projects are workspaces whose members the root sync leaves out. A lock file an exclude rule held
+# back did not arrive, and is named, not installed. The workspace bash expands
+# this text, never this one.
+# shellcheck disable=SC2016
+DEVBOX_INSTALL_LOCK_FN='_devbox_install_lock() {
+  local _dir="${1%/*}"
+  [ "$_dir" != "$1" ] || _dir=.
+  if [ ! -f "$1" ]; then
+    echo "==> setup: $1 did not sync, so it is not installed"
+    return 0
+  fi
+  case "${1##*/}" in
+    uv.lock)
+      echo "==> setup: uv sync --locked --all-packages in $_dir/"
+      uv sync --locked --all-packages --directory "$_dir" ;;
+    package-lock.json)
+      echo "==> setup: npm ci in $_dir/"
+      npm ci --prefix "$_dir" --no-audit --no-fund ;;
+  esac
+}'
+
+# Print devbox_install_locks for the lock files $1, one per line: the default
+# setup, which a project's own DEVBOX_SETUP may also call. Only a setup that
+# calls it gets it, so the hooks of every other project stay as they were.
+devbox_install_hooks() {
+  local lock
+  printf '%s\n' "$DEVBOX_INSTALL_LOCK_FN"
+  printf 'devbox_install_locks() {\n'
+  while IFS= read -r lock; do
+    [ -z "$lock" ] || printf '  _devbox_install_lock %q || return\n' "$lock"
+  done <<<"$1"
+  printf '  :\n}\n'
+}
+
+# Print _devbox_repair_links for the lock files $1, one per line, when one sits
+# below the checkout root, and nothing otherwise. devbox_setup runs it first.
+#
+# It removes a `.venv` or `node_modules` symlink in each folder below the root
+# that holds a lock file. A worktree whose .venv was a symlink to another
+# checkout sent a pointer to a laptop path, and `uv venv --allow-existing`
+# adopted the dangling link and left a venv with no pyvenv.cfg. MEASURED. The
+# sync filter stops a new symlink at any depth, and exclusion protects an
+# older one from --delete. devbox_sync_finish_script removes one at the root,
+# but it runs on the host from the host's library, so a folder below the root
+# is repaired here, where a new client reaches every host without a deploy.
+# A project wrote this loop into its own setup for two virtualenvs below its root.
+devbox_repair_hooks() {
+  local lock dir dirs=""
+  local -A seen=()
+  while IFS= read -r lock; do
+    dir="${lock%/*}"
+    [ "$dir" != "$lock" ] || continue
+    [ -z "${seen[$dir]+x}" ] || continue
+    seen[$dir]=1
+    dirs+=" $(printf '%q' "$dir")"
+  done <<<"$1"
+  [ -n "$dirs" ] || return 0
+  printf '_devbox_repair_links() {\n  local _d _n\n  for _d in%s; do\n' "$dirs"
+  printf '    for _n in .venv node_modules; do\n'
+  # The workspace bash expands these, never this one.
+  # shellcheck disable=SC2016
+  printf '      [ ! -L "$_d/$_n" ] || rm -f -- "$_d/$_n" || return\n'
+  printf '    done\n  done\n}\n'
+}
+
 # Print the setup key: the sha256 of the DEVBOX_SETUP text and of each
 # DEVBOX_SETUP_INPUTS file, in the list's order, read on the laptop from the
 # checkout in $PWD, before the sync sends the same files. A missing file
@@ -700,6 +840,14 @@ devbox_setup_key() {
   local -a paths=()
   sum="$(printf '%s' "${DEVBOX_SETUP-}" | sha256sum)" || return 1
   text="setup ${sum%% *}"$'\n'
+  # A setup that calls the client's install also keys on its text, so a client
+  # that installs another way runs the setup again. A setup that does not keeps
+  # the key it had, and does not run once more for a client upgrade.
+  case "${DEVBOX_SETUP-}" in
+    *devbox_install_locks*)
+      sum="$(printf '%s' "$DEVBOX_INSTALL_LOCK_FN" | sha256sum)" || return 1
+      text+="install ${sum%% *}"$'\n' ;;
+  esac
   read -r -a paths <<<"${DEVBOX_SETUP_INPUTS:-}"
   for path in ${paths[@]+"${paths[@]}"}; do
     if [ -f "$path" ]; then
@@ -819,8 +967,6 @@ DEVBOX_STEPS_RUNNER="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}"
 #   $2  the directory of the logs, and in a workspace of the runner and plan
 #   $3  the plan file on this machine
 #   $4  the run id, the name of this gate's log directory
-#   $5  1 when the runner writes its own `step` ledger lines, 0 for the one
-#       step of a DEVBOX_VERIFY gate, which writes its own ledger
 #
 # The function ends in exec, so the workspace's gate process is the runner
 # itself: a signal to the gate reaches the runner's own trap, which stops the
@@ -831,7 +977,7 @@ DEVBOX_STEPS_RUNNER="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}"
 # volume would keep the step logs of every gate it ran, and the collector that
 # runs when the disk is nearly full evicts whole workspaces.
 devbox_steps_hooks() {
-  local mode="$1" home="$2" plan="$3" run="$4" lines="$5" b64 runner_b64
+  local mode="$1" home="$2" plan="$3" run="$4" b64 runner_b64
   printf '_devbox_steps_home=%q\n' "$home"
   printf 'devbox_verify() {\n'
   # shellcheck disable=SC2016  # expanded by the workspace bash, never here
@@ -866,7 +1012,7 @@ devbox_steps_hooks() {
     printf '  export DEVBOX_STEPS_PLAN=%q' "$plan"
   fi
   # shellcheck disable=SC2016  # expanded by the workspace bash, never here
-  printf ' DEVBOX_STEPS_LOGS="$_d/logs/%s" DEVBOX_RUN_ID=%q DEVBOX_STEPS_STEP_LINES=%q\n' "$run" "$run" "$lines"
+  printf ' DEVBOX_STEPS_LOGS="$_d/logs/%s" DEVBOX_RUN_ID=%q\n' "$run" "$run"
   if [ "$mode" = remote ]; then
     # shellcheck disable=SC2016  # expanded by the workspace bash, never here
     printf '  exec bash "$_d/steps/devbox-steps"\n}\n'

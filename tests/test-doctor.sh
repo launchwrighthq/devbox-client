@@ -129,8 +129,9 @@ profile() {  # $1 is the DEVBOX_REQUIRES line, or empty for none
     # workspace's memory cap, and would skip on a profile that declares neither.
     printf 'DEVBOX_WANT_TOKENS=8\nDEVBOX_MIN_TOKENS=1\n'
     [ -z "${1-}" ] || printf 'DEVBOX_REQUIRES="%s"\n' "$1"
-    printf 'DEVBOX_SETUP=:\nDEVBOX_VERIFY=:\n'
+    printf 'DEVBOX_SETUP=:\n'
   } >"$CO/.devbox/config.env"
+  printf 'verify -- :\n' >"$CO/.devbox/steps"
 }
 profile ""
 
@@ -175,6 +176,16 @@ assert_ok "the pool's own words are passed through rather than summarised" \
   contains "ok   devbox-pool status: 0/20 0/4" "$out"
 assert_ok "a project that requires nothing is reported as requiring nothing" \
   contains "ok   DEVBOX_REQUIRES: this project declares no image requirement" "$out"
+
+# ── a key release 4.0 refuses ───────────────────────────────────────────────
+# doctor reads the config with the parser verify reads it with, so it names
+# the same line and the same replacement.
+printf 'DEVBOX_VERIFY=npm run verify\n' >>"$CO/.devbox/config.env"
+doctor
+assert_eq "1" "$rc" "doctor fails a config that sets DEVBOX_VERIFY"
+assert_ok "and names the line, the key and its replacement" contains \
+  "  FAIL devbox: .devbox/config.env:5: DEVBOX_VERIFY is no longer read. Describe the gate in .devbox/steps" "$out"
+profile ""
 
 # ── a check that cannot run says skip, and never ok ──────────────────────────
 #

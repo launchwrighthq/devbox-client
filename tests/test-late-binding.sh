@@ -110,8 +110,9 @@ CO="$TMP/checkout"
 mkdir -p "$CO/.devbox"
 git -C "$CO" init -q >/dev/null 2>&1
 : >"$CO/.devbox/exclude"
+printf 'verify -- echo LOCAL GATE RAN\n' >"$CO/.devbox/steps"
 write_config() {
-  printf 'DEVBOX_PROJECT=app\nDEVBOX_WANT_TOKENS=4\nDEVBOX_MIN_TOKENS=2\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=echo LOCAL GATE RAN\n' >"$CO/.devbox/config.env"
+  printf 'DEVBOX_PROJECT=app\nDEVBOX_WANT_TOKENS=4\nDEVBOX_MIN_TOKENS=2\nDEVBOX_SETUP=:\n' >"$CO/.devbox/config.env"
   printf '%s\n' "$@" >>"$CO/.devbox/config.env"
 }
 write_config
@@ -434,13 +435,42 @@ assert_ok "DEVBOX_LANES=1 sends one lane slug" grep -qE "devbox-gate@$A_LAN1 loc
 write_config
 
 # ═══ the env header crosses after go ═════════════════════════════════════════
-write_config 'DEVBOX_FORWARD_ENV=FIXTURE_SWITCH' 'DEVBOX_NEEDS_POSTGRES=1' 'DEVBOX_DB_URL_VAR=APP_DB_URL'
+write_config 'DEVBOX_FORWARD_ENV=FIXTURE_SWITCH' 'DEVBOX_SERVICES=postgres' 'DEVBOX_SERVICE_ENV=postgres=APP_DB_URL'
 : >"$TMP/header"
 FIXTURE_SWITCH=on FAKE_HEADER_FILE="$TMP/header" verify --target vps1
 assert_eq "0" "$rc" "a run with a forwarded switch and a DSN completes"
 assert_ok "the DSN crossed in the env header after go" grep -qxF "APP_DB_URL=postgresql://fixture:fixture@fixture/fixture" "$TMP/header"
 assert_ok "and the switch beside it" grep -qxF "FIXTURE_SWITCH=on" "$TMP/header"
 assert_fail "and neither is in any argv" grep -qE "FIXTURE_SWITCH|postgresql://" "$SSH_LOG"
+write_config
+
+# ═══ the token keys are optional ═════════════════════════════════════════════
+# A config with neither key runs. The floor is 2, the probe asks for it, and the
+# run sends a want from the target's probe: half the token total of 20 on a host
+# that sends no admission record, the whole core count on a pressure host.
+printf 'DEVBOX_PROJECT=app\nDEVBOX_SETUP=:\n' >"$CO/.devbox/config.env"
+verify --target vps1
+assert_eq "0" "$rc" "tokens: a config without both token keys runs the gate"
+assert_ok "tokens: the probe asks for the floor of 2" grep -qE "devbox-gate@$A_VPS1 probe 2 2$" "$SSH_LOG"
+assert_ok "tokens: a token host gets half its total, floor 2" grep -qE "devbox-gate@$A_VPS1 run [^ ]+ app 10 2 " "$SSH_LOG"
+mkdir -p "$TMP/probes"
+{
+  devbox_probe_line "$FAKE_VERSION" "now 0 3 0/16 0/4 0" "$(date +%s) ok" "$(date +%s)"
+  devbox_admission_line pressure 0 90.00 25 0.00 5 0.00 10 0 fits
+} >"$TMP/probes/$A_VPS1.probe"
+FAKE_PROBE_DIR="$TMP/probes" verify --target vps1
+assert_eq "0" "$rc" "tokens: the gate runs on a pressure host"
+assert_ok "tokens: a pressure host gets its whole core count" grep -qE "devbox-gate@$A_VPS1 run [^ ]+ app 16 2 " "$SSH_LOG"
+FAKE_PROBE_DIR="$TMP/probes" verify --target vps1 --run -- true
+assert_ok "tokens: devbox run still asks for the floor alone" grep -qE "devbox-gate@$A_VPS1 run [^ ]+ app 2 2 " "$SSH_LOG"
+rm -f "$TMP/probes/$A_VPS1.probe"
+# An explicit value still wins, and a want of 1 pulls the default floor down to it.
+write_config
+verify --target vps1
+assert_ok "tokens: an explicit want and min still cross as written" grep -qE "devbox-gate@$A_VPS1 run [^ ]+ app 4 2 " "$SSH_LOG"
+printf 'DEVBOX_PROJECT=app\nDEVBOX_WANT_TOKENS=1\nDEVBOX_SETUP=:\n' >"$CO/.devbox/config.env"
+verify --target vps1
+assert_ok "tokens: a want of 1 alone sends a floor of 1" grep -qE "devbox-gate@$A_VPS1 run [^ ]+ app 1 1 " "$SSH_LOG"
 write_config
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

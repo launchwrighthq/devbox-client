@@ -136,8 +136,8 @@ write_config() {
     echo 'DEVBOX_MIN_TOKENS=1'
     [ -z "${2:-}" ] || printf "DEVBOX_REQUIRES='%s'\n" "$2"
     echo 'DEVBOX_SETUP=:'
-    echo "DEVBOX_VERIFY=touch $LOCAL_MARK && exit \${FAKE_LOCAL_RC:-0}"
   } >"$CO/.devbox/config.env"
+  echo "verify -- touch $LOCAL_MARK && exit \${FAKE_LOCAL_RC:-0}" >"$CO/.devbox/steps"
 }
 write_config
 write_env() { printf '%s\n' "$@" >"$CO/.devbox.env"; }
@@ -178,8 +178,10 @@ assert_ok "and says strict mode refused the local run" contains "DEVBOX_STRICT=1
 assert_fail "the gate did not run on this machine" local_ran
 assert_eq "" "$ssh_log" "and nothing reached a host"
 
-run_verify
-assert_eq 0 "$rc" "without strict, no .devbox.env still runs the gate locally"
+# DEVBOX_LOCAL_GATE defaults to ci from release 4.0, so a checkout with no
+# .devbox.env runs the gate on this machine in CI alone.
+run_verify CI=true
+assert_eq 0 "$rc" "without strict, no .devbox.env runs the gate locally in CI"
 assert_ok "the local gate ran" local_ran
 
 # A file that names no target replaces the removed DEVBOX_ENABLED=0.
@@ -204,7 +206,7 @@ assert_eq 2 "$rc" "without strict, the same refusal exits 2"
 assert_fail "and the gate did not run here either" local_ran
 
 # Rule 5 of the target choice, with nothing that refuses the fallback: no
-# DEVBOX_REQUIRES and no DEVBOX_NEEDS_POSTGRES. Without strict the gate runs here.
+# DEVBOX_REQUIRES and no postgres in DEVBOX_SERVICES. Without strict the gate runs here.
 write_env "${TARGET_B[@]}" 'DEVBOX_MAX_QUEUE_WAIT=60' 'DEVBOX_QUEUE_FULL_ACTION=local'
 # FAKE_ACQ=75 is the pool giving up on the ceiling, so no target grants in time.
 run_verify DEVBOX_STRICT=1 FAKE_EST='wait 900 3 4/4 1/2 2' FAKE_ACQ=75

@@ -69,8 +69,8 @@ DEVBOX_PROJECT=handshake-fixture
 DEVBOX_WANT_TOKENS=1
 DEVBOX_MIN_TOKENS=1
 DEVBOX_SETUP=:
-DEVBOX_VERIFY=:
 PROFILE
+printf 'verify -- :\n' >"$CO/.devbox/steps"
 
 # Read as text rather than sourced, so this test compares against the literal
 # the shipped library carries.

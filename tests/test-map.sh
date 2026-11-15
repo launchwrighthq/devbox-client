@@ -224,6 +224,33 @@ tests/test_b.py	read setup.cfg" "$(devbox_map_select test "$M" base1 setup1)" \
 rm setup.cfg conftest.py
 rm -r .pytest_cache
 
+echo "-- a Worker's token, as the runner packs it (section 5.7)"
+# The trace below is the packed result tests/test-steps-trace.sh checks the
+# runner prints: a.test.ts started a Worker whose hook confirmed its token, so
+# its partial line is gone and the Worker's read of src/worker.ts is its own;
+# b.test.ts started a node child that never confirmed, so it keeps the plain
+# partial line, with no token.
+rm -f "$MAP"
+for f in src/a.test.ts src/b.test.ts src/a.ts src/b.ts src/worker.ts; do printf '%s v1\n' "$f" >"$f"; done
+printf '%s\n' \
+  $'partial\tsrc/b.test.ts\tchild_process' \
+  $'read\tsrc/a.test.ts\tsrc/a.ts' $'read\tsrc/a.test.ts\tsrc/worker.ts' \
+  $'read\tsrc/b.test.ts\tsrc/b.ts' >"$T"
+record pass src/a.test.ts:pass src/b.test.ts:pass
+devbox_map_update test "$RUN" "$T" run base1 setup1
+assert_eq ok "$(devbox_map_state test)" "the packed trace of a Worker's token makes a map that reads"
+assert_ok "the file whose Worker confirmed is complete" grep -q $'^file\tsrc/a.test.ts\t'"$RUN"$'\tcomplete\t' "$MAP"
+assert_ok "the file whose child did not confirm is partial" grep -q $'^file\tsrc/b.test.ts\t'"$RUN"$'\tpartial\t' "$MAP"
+assert_eq "" "$(awk -F '\t' '!(($1 == "map" && NF == 2) || ($1 == "context" && NF == 3) || ($1 == "untraced" && NF == 2) \
+  || (($1 == "path" || $1 == "dir") && NF == 3) || ($1 == "file" && NF == 5) || ($1 == "step" && (NF == 5 || NF == 6)))' "$MAP")" \
+  "every map line is a kind of section 5.5 with its field count: the format does not change"
+printf 'more\n' >>src/worker.ts
+manifest
+assert_eq "src/b.test.ts	partial
+src/a.test.ts	read src/worker.ts" "$(devbox_map_select test "$M" base1 setup1)" \
+  "a change to the file the Worker read selects the test file that started it, and the partial file runs on any change of its step"
+rm src/a.test.ts src/b.test.ts src/a.ts src/b.ts src/worker.ts
+
 echo "-- a map that breaks the format"
 printf 'map\t1\nfile\tx\n' >"$MAP"
 assert_eq bad "$(devbox_map_state test)" "a broken line makes the map bad"

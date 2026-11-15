@@ -193,7 +193,11 @@ runpod_execute() {
   local dsn_file=/home/dev/.devbox-dsn
   tokens=$(jq -r .cpus "$RP_STATE/pod.json")
   tokens=$((tokens - 1))
-  [ "$tokens" -le "$DEVBOX_WANT_TOKENS" ] || tokens=$DEVBOX_WANT_TOKENS
+  # A pod is this checkout's alone, so with no DEVBOX_WANT_TOKENS (WANT_AUTO,
+  # devbox-verify) the gate takes every CPU but the one the pod keeps. The
+  # verify default of the want is the floor, and a cap at it gives a 16-CPU pod
+  # 2 workers.
+  [ "${WANT_AUTO:-0}" = 1 ] || [ "$tokens" -le "$DEVBOX_WANT_TOKENS" ] || tokens=$DEVBOX_WANT_TOKENS
   [ "$tokens" -ge "$DEVBOX_MIN_TOKENS" ] || { echo 'devbox runpod: CPU shape cannot satisfy DEVBOX_MIN_TOKENS' >&2; OWN_EXIT=1; return 2; }
   SSH=(runpod_ssh)
   SYNC_RSYNC_ARGS=(-z --rsync-path='bash /opt/devbox/runpod-runtime activity rsync')
@@ -407,10 +411,6 @@ runpod_main() {
     devbox_forward_name "$name" || continue
     case "${!name:-}" in *$'\n'*) echo "devbox runpod: refusing newline in $name" >&2; OWN_EXIT=1; return 2 ;; esac
   done
-  if [ "${DEVBOX_NEEDS_POSTGRES:-0}" = 1 ] && ! [[ "${DEVBOX_DB_URL_VAR:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-    echo "devbox runpod: DEVBOX_NEEDS_POSTGRES=1 needs DEVBOX_DB_URL_VAR, an environment variable name, in $DEVBOX_CONFIG" >&2
-    OWN_EXIT=1; return 2
-  fi
   RP_CLEANUP=0
   trap runpod_finish EXIT
   trap 'exit 130' INT

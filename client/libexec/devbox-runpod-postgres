@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run as root on a RunPod pod when the project sets DEVBOX_NEEDS_POSTGRES=1. It gives the
+# Run as root on a RunPod pod when DEVBOX_SERVICES names postgres. It gives the
 # gate what a deployed target gives a workspace: pgvector Postgres 16 on 127.0.0.1:5435, one
 # role with CREATEDB, CREATEROLE and pg_signal_backend that owns its database, `vector` in
 # template1, and a psycopg URL. A pod has no pool, so without this the database tests skip

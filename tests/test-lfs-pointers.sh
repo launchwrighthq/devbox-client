@@ -48,8 +48,9 @@ new_checkout() {
   mkdir -p "$CO/.devbox"
   git -C "$CO" init -q >/dev/null 2>&1
   printf 'DEVBOX_TARGETS=undertest\nDEVBOX_TARGET_UNDERTEST=devbox-under-test\nDEVBOX_TARGET_UNDERTEST_HOSTKEY=%s\nDEVBOX_GATE_PASSWORD=fixture-gate-password\n' "$GATE_STUB_PIN" >"$CO/.devbox.env"
-  printf 'DEVBOX_PROJECT=lfs-fixture\nDEVBOX_WANT_TOKENS=1\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=:\n' \
+  printf 'DEVBOX_PROJECT=lfs-fixture\nDEVBOX_WANT_TOKENS=1\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\n' \
     >"$CO/.devbox/config.env"
+  printf 'verify -- :\n' >"$CO/.devbox/steps"
   return 0
 }
 # Writes one file with the given content and stages it with no filter.

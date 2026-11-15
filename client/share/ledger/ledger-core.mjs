@@ -165,6 +165,7 @@ export class FileRecorder {
 // wraps the fs module, so a trace write never traces itself.
 const rawOpenSync = fs.openSync;
 const rawWriteSync = fs.writeSync;
+const rawCloseSync = fs.closeSync;
 const rawReaddirSync = fs.readdirSync;
 const rawReadFileSync = fs.readFileSync;
 
@@ -231,9 +232,54 @@ export class TraceWriter {
   }
 }
 
+// Appends lines in blocks of about 1 MiB, for the reporter's graph, which
+// writes once, after the run. MEASURED: the graph of a suite of a few
+// thousand test files is millions of lines, and one write per line plus a set
+// of every line written kept vitest alive for over an hour after its summary,
+// past the gate's time limit. The caller gives each line once. A writer that adds nothing creates
+// no file, as TraceWriter does.
+export class TraceBlockWriter {
+  constructor(file) {
+    this.file = file;
+    this.fd = null;
+    this.parts = [];
+    this.size = 0;
+  }
+
+  add(line) {
+    this.parts.push(line);
+    this.size += line.length;
+    if (this.size >= 1 << 20) this.flush();
+  }
+
+  flush() {
+    if (this.parts.length === 0) return;
+    if (this.fd === null) this.fd = rawOpenSync(this.file, 'a', 0o600);
+    const buf = Buffer.from(this.parts.join(''), 'utf8');
+    this.parts = [];
+    this.size = 0;
+    let off = 0;
+    while (off < buf.length) {
+      const n = rawWriteSync(this.fd, buf, off, buf.length - off);
+      if (n <= 0) throw new Error(`devbox-trace: wrote ${off} of ${buf.length} bytes to ${this.file}`);
+      off += n;
+    }
+  }
+
+  close() {
+    this.flush();
+    if (this.fd !== null) rawCloseSync(this.fd);
+    this.fd = null;
+  }
+}
+
 // The module reads the hook wrote beside the traces, from every *.modules file
 // in dir: a map from a module's repository path to the [kind, path] pairs of
-// the reads whose innermost repository frame was that module.
+// the reads whose innermost repository frame was that module, each pair once.
+// Each test file runs in a process of its own under vitest's default
+// isolation, so a helper that 1000 test files import is in 1000 .modules
+// files. MEASURED: kept once per file, its reads were expanded again for every
+// test file of the graph, work that grew with the square of the suite.
 export function readModuleReads(dir) {
   const byModule = new Map();
   for (const name of rawReaddirSync(dir)) {
@@ -241,11 +287,17 @@ export function readModuleReads(dir) {
     for (const line of rawReadFileSync(path.join(dir, name), 'utf8').split('\n')) {
       const f = line.split('\t');
       if (f.length !== 3 || f[1] === '') continue;
-      if (!byModule.has(f[1])) byModule.set(f[1], []);
-      byModule.get(f[1]).push([f[0], f[2]]);
+      let reads = byModule.get(f[1]);
+      if (reads === undefined) {
+        reads = new Map();
+        byModule.set(f[1], reads);
+      }
+      reads.set(`${f[0]}\t${f[2]}`, [f[0], f[2]]);
     }
   }
-  return byModule;
+  const out = new Map();
+  for (const [mod, reads] of byModule) out.set(mod, [...reads.values()]);
+  return out;
 }
 
 // The absolute file a module graph id names, or null for a virtual id. A query
@@ -268,7 +320,9 @@ export function moduleIdPath(id) {
 export function graphTraceLines({ root, testFile, entries, importedOf, moduleReads }) {
   const owner = classifyPath(root, testFile);
   if (!owner || owner.kind !== 'read') return [];
-  const lines = [];
+  // A Set, because two modules of one closure often read one file, and each
+  // line is wanted once.
+  const lines = new Set();
   const seen = new Set();
   const stack = [testFile, ...entries];
   while (stack.length > 0) {
@@ -278,12 +332,12 @@ export function graphTraceLines({ root, testFile, entries, importedOf, moduleRea
     const c = classifyPath(root, abs);
     if (!c) continue;
     if (c.kind === 'setup') {
-      lines.push(formatTraceLine('setup', owner.rel));
+      lines.add(formatTraceLine('setup', owner.rel));
       continue;
     }
-    if (abs !== testFile) lines.push(formatTraceLine('read', owner.rel, c.rel));
-    for (const [kind, p] of moduleReads.get(c.rel) ?? []) lines.push(formatTraceLine(kind, owner.rel, p));
+    if (abs !== testFile) lines.add(formatTraceLine('read', owner.rel, c.rel));
+    for (const [kind, p] of moduleReads.get(c.rel) ?? []) lines.add(formatTraceLine(kind, owner.rel, p));
     for (const next of importedOf(abs)) stack.push(next);
   }
-  return lines.filter((l) => l !== null);
+  return [...lines].filter((l) => l !== null);
 }

@@ -148,8 +148,9 @@ make_checkout() {
   local dir="$1" project_line="$2" host="$3"
   mkdir -p "$dir/.devbox"
   git -C "$dir" init -q >/dev/null 2>&1
-  printf '%s\nDEVBOX_WANT_TOKENS=1\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=:\n' \
+  printf '%s\nDEVBOX_WANT_TOKENS=1\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\n' \
     "$project_line" >"$dir/.devbox/config.env"
+  printf 'verify -- :\n' >"$dir/.devbox/steps"
   # Ignored here for the reason every real project ignores it: the file names
   # ONE developer's machine. The worktree fixture below depends on that, and a
   # fixture that commits the file would test a lookup no worktree ever needs.

@@ -141,7 +141,7 @@ file	web	vitest	tools/u.test.ts	pass	1" "$(steps_file_lines)" \
 attr_steps verify::
 assert_eq "file	verify	vitest	apps/api/t.test.ts	fail	2
 file	verify	vitest	tools/u.test.ts	pass	1" "$(steps_file_lines)" \
-  "the one step of a DEVBOX_VERIFY gate keeps every file of its own ledger"
+  "the one step that ran, with no runner=, keeps every file of its own ledger"
 
 # ── end to end on this laptop, with the stub runner ──────────────────────────
 

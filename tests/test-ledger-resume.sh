@@ -101,7 +101,9 @@ for f in a.test.ts b.test.ts; do
   [ "${DEVBOX_RESUME:-0}" = 0 ] || stop_at="${FAKE_STOP_AT_RESUME:-$stop_at}"
   if [ "${FAKE_STOPPING:-0}" = 1 ] && [ "$f" = "$stop_at" ]; then
     [ -z "${FAKE_GRANT_AFTER_STOP-}" ] || printf '%s\n' "$FAKE_GRANT_AFTER_STOP" >"$FAKE_GRANT_FILE"
-    exit 0
+    # A watchdog stop ends the step before it passes. 143, the code of a
+    # SIGTERM, so the runner records no pass for the step that holds this gate.
+    exit 143
   fi
   if [ "$f" = "${FAKE_HANG_AT-}" ]; then
     echo "$$" >"$HANG_PID"
@@ -122,8 +124,9 @@ git -C "$CO" init -q >/dev/null 2>&1
 : >"$CO/.devbox/exclude"
 printf 'one\n' >"$CO/src.txt"
 write_config() {
-  printf 'DEVBOX_PROJECT=app\nDEVBOX_WANT_TOKENS=4\nDEVBOX_MIN_TOKENS=2\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=bash %s\nDEVBOX_FORWARD_ENV=FIXTURE_SWITCH\n' \
-    "$TMP/gate.sh" >"$CO/.devbox/config.env"
+  printf 'DEVBOX_PROJECT=app\nDEVBOX_WANT_TOKENS=4\nDEVBOX_MIN_TOKENS=2\nDEVBOX_SETUP=:\nDEVBOX_FORWARD_ENV=FIXTURE_SWITCH\n' \
+    >"$CO/.devbox/config.env"
+  printf 'verify -- bash %s\n' "$TMP/gate.sh" >"$CO/.devbox/steps"
   printf '%s\n' "$@" >>"$CO/.devbox/config.env"
 }
 write_config
@@ -179,14 +182,15 @@ craft() {
 #
 # lint fails, build passes, and the watchdog stops a.test.ts mid-file. The
 # resume runs lint (failed), a.test.ts (open) and b.test.ts (never started),
-# and not build.
+# and not build. The step `verify` that holds the gate is a unit too, written
+# by the runner, so the ledger holds four.
 reset
 stops 1
 FAKE_FAIL=lint FAKE_STOP_AT=a.test.ts verify --target lan1
 assert_eq "1" "$rc" "D5: the resume's own code is the run's code (lint fails again)"
 assert_ok "D5: the stop is reported" contains "the watchdog on lan1 stopped this gate" "$out"
 assert_ok "D5: the resume line names the passed units, the total and the count" \
-  contains "devbox: resuming, 1 of 3 units passed earlier, resume 1 of 1" "$out"
+  contains "devbox: resuming, 1 of 4 units passed earlier, resume 1 of 1" "$out"
 assert_eq "2" "$(runs)" "D5: the gate ran twice in one devbox verify"
 assert_eq "lint build a.test.ts" "$(ran 1)" "D1: the first run ran up to the stop"
 assert_eq "lint a.test.ts b.test.ts" "$(ran 2)" "D1: the resume ran the failed, the open and the unstarted units, and not build"
@@ -269,7 +273,7 @@ assert_ok "R1: it names lan1, lane 1 and the key" grep -qx $'target\tlan1' "$MAR
 rm -f "$HANG_PID"
 verify --target lan1
 assert_eq "0" "$rc" "R1: the next verify completes"
-assert_ok "R1: it resumes from the marker" contains "devbox: resuming, 2 of 3 units passed earlier, resume 1 of 1" "$out"
+assert_ok "R1: it resumes from the marker" contains "devbox: resuming, 2 of 4 units passed earlier, resume 1 of 1" "$out"
 assert_eq "a.test.ts b.test.ts" "$(ran 2)" "R1: and runs only the open and the unstarted files"
 assert_fail "R1: the completed resume leaves no marker" test -e "$MARK"
 
@@ -372,11 +376,16 @@ assert_ok "R6: a workspace with no ledger: one line names it" \
   contains "devbox verify: lan1 holds no ledger of this worktree's gate (gate-root: no ledger for project app in workspace ws-${LANES[0]}), so the gate runs in full" "$out"
 assert_eq "lint build a.test.ts b.test.ts" "$(ran 1)" "R6: and the gate runs in full"
 
-# ═══ D7: a verify gate that writes no ledger is warned, with its own code ═══
+# ═══ D7: a step whose command writes no ledger still has the runner's ═══════
+#
+# Release 4.0 runs every gate through the step runner, which writes a `step`
+# line for each step. A command that records nothing of its own still leaves
+# the step's units, so a stop resumes it by step, and no warning is due.
 reset
 FAKE_NO_LEDGER=1 FAKE_GATE_RC=3 verify --target lan1
 assert_eq "3" "$rc" "D7: the gate's own code passes unchanged"
-assert_ok "D7: with the warning line" contains "devbox verify: this gate wrote no ledger, so a stop cannot resume it" "$out"
+assert_fail "D7: with no warning, because the runner wrote the step's lines" contains "wrote no ledger" "$out"
+assert_ok "D7: the ledger holds the step that failed" grep -qE $'^step\tverify\tfail\t' "$WS_LAN1/ledger/app.ledger"
 FAKE_NO_LEDGER=1 FAKE_LEDGER_OLD="$A_LAN1" verify --target lan1
 assert_eq "0" "$rc" "D7: a fetch that fails changes no code"
 assert_fail "D7: and prints no warning" contains "wrote no ledger" "$out"

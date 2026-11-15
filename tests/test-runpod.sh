@@ -135,8 +135,8 @@ DEVBOX_PROJECT=example
 DEVBOX_WANT_TOKENS=4
 DEVBOX_MIN_TOKENS=2
 DEVBOX_SETUP=:
-DEVBOX_VERIFY=touch LOCAL_GATE_RAN
 PROFILE
+printf 'verify -- touch LOCAL_GATE_RAN\n' > "$TMP/checkout/.devbox/steps"
 # A deployed target this file never reaches: --target runpod passes it by.
 cat > "$TMP/checkout/.devbox.env" <<CONFIG
 DEVBOX_TARGETS=fixture
@@ -208,15 +208,18 @@ for bad in DEVBOX_RUNPOD_IDLE_SECONDS=0 DEVBOX_RUNPOD_CPUS=3 DEVBOX_RUNPOD_SECON
   assert_fail 'invalid configuration reaches no API call' test -e "$RP_HTTP_ARGS"
 done
 
-# A pod has no pool, so a project that needs Postgres must name the variable its URL goes in.
+# Release 4.0 refuses DEVBOX_NEEDS_POSTGRES on the rented path too, before a
+# pod is rented: a pod has no pool, and the key no longer declares a database.
 printf 'DEVBOX_RENT=runpod\nRUNPOD_KEY=fixture\n' > "$TMP/checkout/.devbox.env"
+cp "$TMP/checkout/.devbox/config.env" "$TMP/config.keep"
 printf 'DEVBOX_NEEDS_POSTGRES=1\n' >> "$TMP/checkout/.devbox/config.env"
 rm -f "$RP_HTTP_ARGS"
 rc=0
 err=$(cd "$TMP/checkout" && PATH="$TMP/bin:$PATH" bash "$TMP/client/client/bin/devbox" verify 2>&1) || rc=$?
-assert_eq 2 "$rc" 'DEVBOX_NEEDS_POSTGRES=1 with no DEVBOX_DB_URL_VAR fails before allocation'
-assert_ok 'and names the missing key' test "${err#*needs DEVBOX_DB_URL_VAR}" != "$err"
+assert_eq 2 "$rc" 'DEVBOX_NEEDS_POSTGRES=1 is refused before allocation'
+assert_ok 'and names its replacement' test "${err#*Write DEVBOX_SERVICES=postgres}" != "$err"
 assert_fail 'and reaches no API call' test -e "$RP_HTTP_ARGS"
+cp "$TMP/config.keep" "$TMP/checkout/.devbox/config.env"
 
 # The run script exports the pod's URL the way the SSH backend's --env-file does.
 src=$(cat "$REPO/client/libexec/devbox-runpod")
@@ -264,7 +267,7 @@ git() { :; }
 RP_STATE="$TMP/podstate" RP_CLIENT="$TMP/podclient" ROOT="$TMP/podroot"
 DEVBOX_LIB="$REPO/lib/devbox-lib.sh" DEVBOX_CONFIG="$TMP/checkout/.devbox/config.env"
 DEVBOX_PROJECT=example DEVBOX_WANT_TOKENS=2 DEVBOX_MIN_TOKENS=1
-DEVBOX_SETUP=: DEVBOX_VERIFY=: RUN_MODE=0 STRICT=0 OWN_EXIT=0
+DEVBOX_SETUP=: RUN_MODE=0 STRICT=0 OWN_EXIT=0
 read -r -a REQUIRES <<<"$POD_REQUIRES"
 trap 'printf "%s\n" "$OWN_EXIT" > "$TMP/own-exit"' EXIT
 runpod_execute
@@ -300,6 +303,16 @@ assert_eq 0 "$(cat "$TMP/own-exit")" 'and is not marked as a refusal'
 pod_run ''
 assert_eq 0 "$?" 'a project with no DEVBOX_REQUIRES runs its gate'
 assert_fail 'and pays no check' grep -q devbox-requires-local "$TMP/pod.log"
+assert_ok 'an explicit want caps the 4-CPU pod at 2 tokens' grep -q 'gate (2 tokens)' "$TMP/pod.out"
+
+# No DEVBOX_WANT_TOKENS: devbox-verify sets WANT_AUTO=1 and the want to the
+# floor, and the pod, this checkout's alone, gives every CPU but one.
+cp "$TMP/execute.sh" "$TMP/execute.sh.explicit"
+sed -i 's/^DEVBOX_PROJECT=example DEVBOX_WANT_TOKENS=2 DEVBOX_MIN_TOKENS=1$/& WANT_AUTO=1/' "$TMP/execute.sh"
+pod_run ''
+assert_eq 0 "$?" 'a project with no DEVBOX_WANT_TOKENS runs its gate on the pod'
+assert_ok 'and gets every CPU but one, 3 of 4' grep -q 'gate (3 tokens)' "$TMP/pod.out"
+mv "$TMP/execute.sh.explicit" "$TMP/execute.sh"
 
 # A cancel of a verify gate on a pod. The gate ran as a foreground pipeline, and
 # bash runs a trap only after a foreground command ends, so a newer gate's TERM

@@ -1,7 +1,7 @@
 #!/bin/bash
 # .devbox/steps is parsed and checked on the laptop, by line number, before any
 # target is asked (D2), and an each= line becomes one step per module (D12).
-# The attributes dir=, shards= and requires= and the ignored select=related are
+# The attributes dir=, shards= and requires= and the refused select= are
 # those of docs/specs/2026-11-14-learned-selection-design.md, section 4.2.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
@@ -92,7 +92,6 @@ refused "requires starting with a dash" 't requires=-x -- x' 1 'requires token "
 refused "requires all dots" 't requires=.. -- x' 1 'requires token ".." may hold only'
 refused "unknown runner" 't runner=jest -- npx jest' 1 'runner must be vitest or pytest, not "jest"'
 refused "unknown narrow" 't runner=vitest narrow=all -- npx vitest run' 1 'narrow must be failed, not "all"'
-refused "unknown select" 't runner=vitest select=all -- npx vitest run' 1 'select must be related, not "all"'
 refused "unknown rerun" 't rerun=never -- x' 1 'rerun must be always, not "never"'
 refused "after naming no step" $'lint -- a\n\ntest after=lint,ghost -- b' 3 'after names "ghost", which is no step'
 refused "after with {name} and no each line" 'report after=test:{name} -- x' 1 'after names "test:{name}", which is no step'
@@ -104,18 +103,16 @@ refused "each line after its own step" 't:{name} each=apps/*/ after=t:{name} -- 
 
 assert_eq "" "$(cat "$TMP/ssh.log" 2>/dev/null)" "no refusal calls ssh"
 
-# ── select=related, read and ignored ─────────────────────────────────────────
+# ── select=, refused since release 4.0 ───────────────────────────────────────
 
-printf '%s\n' 'lint -- x' 't select=related -- npm test' 'u runner=pytest select=related -- uv run pytest' >"$STEPS"
-rc=0
-err="$( (devbox_steps_load "$STEPS" "$ROOT") 2>&1 >/dev/null)" || rc=$?
-assert_eq 0 "$rc" "select=related loads, on any step"
-assert_eq 1 "$(printf '%s\n' "$err" | grep -c .)" "with one warning line for the file"
-assert_ok "that names its lines and says it is ignored" contains \
-  ".devbox/steps line 2, 3: select=related is ignored" "$err"
-devbox_steps_load "$STEPS" "$ROOT" 2>/dev/null
-assert_eq "|" "${STEP_SELECT[t]}|${STEP_SELECT[u]}" "and the step selects nothing of its own"
-assert_eq "u runner=pytest -- uv run pytest" "${STEP_SOURCE[u]}" "nor does the source hold it"
+# Release 3.4 read select=related and ignored it with a warning, because every
+# runner step selects its test files by what they read. Release 4.0 refuses it
+# by line, on any step, with the line that says what to do.
+refused "select=related on a runner step" $'lint -- x
+u runner=pytest select=related -- uv run pytest' 2 \
+  'select=related is no longer read, because every runner step selects its test files by what they read; remove it'
+refused "select=related on a step with no runner" 't select=related -- npm test' 1 'select=related is no longer read'
+refused "any other select" 't runner=vitest select=all -- npx vitest run' 1 'select=all is no longer read'
 
 rc=0; err="$( (devbox_steps_load "$TMP/absent" "$ROOT") 2>&1)" || rc=$?
 assert_eq 2 "$rc" "an unreadable file is refused"
@@ -148,11 +145,11 @@ assert_eq "test:api test:web test:worker lint" "${STEP_AFTER[report]}" \
 assert_eq "echo {name} done" "${STEP_CMD[report]}" "a line without each keeps {name} in its command"
 assert_eq "" "${STEP_AFTER[lint]}" "a step with no after waits on nothing"
 assert_eq "" "${STEP_INPUTS[report]}" "a step with no inputs reads every synced file"
-assert_eq "vitest|failed||" \
-  "${STEP_RUNNER[test:web]}|${STEP_NARROW[test:web]}|${STEP_SELECT[test:web]}|${STEP_RERUN[test:web]}" \
+assert_eq "vitest|failed|" \
+  "${STEP_RUNNER[test:web]}|${STEP_NARROW[test:web]}|${STEP_RERUN[test:web]}" \
   "the attributes of an each= line reach every module"
-assert_eq "|||" \
-  "${STEP_RUNNER[lint]}|${STEP_NARROW[lint]}|${STEP_SELECT[lint]}|${STEP_RERUN[lint]}" \
+assert_eq "||" \
+  "${STEP_RUNNER[lint]}|${STEP_NARROW[lint]}|${STEP_RERUN[lint]}" \
   "an attribute that is not given is empty"
 assert_eq "npm run lint -- --max-warnings  0" "${STEP_CMD[lint]}" \
   "tabs around -- split, and the command keeps a later -- and its blanks"
@@ -217,19 +214,12 @@ printf '%s\n' 'bad' >"$STEPS"
 rc=0; ( set -e; devbox_steps_load "$STEPS" "$ROOT" ) 2>/dev/null || rc=$?
 assert_eq 2 "$rc" "under set -e a refusal still returns 2"
 
-# ── DEVBOX_VERIFY as one step ────────────────────────────────────────────────
-
-devbox_steps_from_verify "npm run verify -- --ci"
-assert_eq "verify" "${STEP_NAMES[*]}" "DEVBOX_VERIFY becomes one step named verify"
+# The one step a DEVBOX_VERIFY gate became before release 4.0, written as its
+# line, has the source that gate's step had.
+printf '%s\n' 'verify -- npm run verify -- --ci' >"$STEPS"
+devbox_steps_load "$STEPS" "$ROOT"
+assert_eq "verify" "${STEP_NAMES[*]}" "the moved DEVBOX_VERIFY is one step named verify"
 assert_eq "npm run verify -- --ci" "${STEP_CMD[verify]}" "with the command as written"
-assert_eq "||||||||1|" \
-  "${STEP_AFTER[verify]}|${STEP_INPUTS[verify]}|${STEP_RUNNER[verify]}|${STEP_NARROW[verify]}|${STEP_SELECT[verify]}|${STEP_RERUN[verify]}|${STEP_DIR[verify]}|${STEP_REQUIRES[verify]}|${STEP_SHARDS[verify]}|" \
-  "and no attribute"
-assert_eq "verify -- npm run verify -- --ci" "${STEP_SOURCE[verify]}" "its source matches a steps line of the same step"
-assert_eq "verify -- npm run verify -- --ci" \
-  "$(source_of 'verify -- npm run verify -- --ci' verify)" "the same step written in .devbox/steps"
-rc=0; err="$( (devbox_steps_from_verify "") 2>&1)" || rc=$?
-assert_eq 2 "$rc" "an empty DEVBOX_VERIFY is refused"
-assert_ok "and the refusal says so" contains "DEVBOX_VERIFY is empty" "$err"
+assert_eq "verify -- npm run verify -- --ci" "${STEP_SOURCE[verify]}" "and the source a DEVBOX_VERIFY gate had"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

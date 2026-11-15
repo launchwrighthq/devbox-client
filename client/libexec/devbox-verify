@@ -334,14 +334,12 @@ run_identity() {
 # because it read a key this client refuses, and another printed a cancel for
 # every SIGTERM, so a time limit read as another session's cancel
 # (docs/specs/2026-11-14-client-owns-the-gate-design.md, section 1). The client
-# owns all of it now. The steps are those of .devbox/steps, or DEVBOX_VERIFY as
-# one step named `verify`. A step whose key passed in a complete record carries,
-# devbox-steps runs the rest in the workspace or here, and every gate writes one
-# record under the git common dir. A `devbox run` is one command and plans
-# nothing.
+# owns all of it now. The steps are those of .devbox/steps. A step whose key
+# passed in a complete record carries, devbox-steps runs the rest in the
+# workspace or here, and every gate writes one record under the git common dir.
+# A `devbox run` is one command and plans nothing.
 STEPS_ACTIVE=0
 STEPS_DIR=""
-STEPS_FROM_VERIFY=0
 # The target the record names, the gate's stdout as it streamed, and the ledger
 # the record reads its file lines from.
 STEPS_TARGET="-"
@@ -361,14 +359,7 @@ steps_prepare() {
   local rerun rc=0 step all=1 tok
   [ "$STEPS_ACTIVE" = 0 ] && [ "$RUN_MODE" = 0 ] || return 0
   run_identity
-  if [ -f "$ROOT/.devbox/steps" ]; then
-    devbox_steps_load "$ROOT/.devbox/steps" "$ROOT" || devbox_die 2
-    [ -z "${DEVBOX_VERIFY:-}" ] \
-      || echo "devbox verify: .devbox/steps is this gate, so DEVBOX_VERIFY in $DEVBOX_CONFIG does not run" >&2
-  else
-    devbox_steps_from_verify "${DEVBOX_VERIFY:-}" || devbox_die 2
-    STEPS_FROM_VERIFY=1
-  fi
+  devbox_steps_load "$ROOT/.devbox/steps" "$ROOT" || devbox_die 2
   # A gate of no step would pass having run nothing, the silent green this
   # repository keeps finding in its own history.
   if [ "${#STEP_NAMES[@]}" -eq 0 ]; then
@@ -414,7 +405,7 @@ steps_prepare() {
     steps_record_finish "" 1 1
     devbox_die 0
   fi
-  DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks remote /home/dev/.devbox "$STEPS_DIR/plan" "$RUN_ID" "$((1 - STEPS_FROM_VERIFY))")" || {
+  DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks remote /home/dev/.devbox "$STEPS_DIR/plan" "$RUN_ID")" || {
     echo "devbox verify: could not encode the step runner or its plan for the workspace (base64 failed), so the gate did not run" >&2
     devbox_die 1
   }
@@ -600,9 +591,9 @@ steps_traces() {
 }
 
 # Set STEPS_GATE_CODE: the code of the first failed step in plan order, 0 when
-# none failed. With one step, the DEVBOX_VERIFY of a project that has not
-# moved to .devbox/steps, that is the code its gate returned before, so strict
-# mode, the OOM report and every caller that reads the code see what they saw.
+# none failed. With one step, that is the code the step's command returned, as
+# the one command of a gate before .devbox/steps, so strict mode, the OOM
+# report and every caller that reads the code see what they saw.
 # A gate that printed no result keeps the status $2 it ended with.
 steps_gate_code() {
   local step outcome code
@@ -650,7 +641,7 @@ steps_tree_unchanged() {
 # prefix of its path, a step with no dir= being the shortest, and of those, to
 # the ones whose inputs= holds it when any does. A file under no candidate's
 # folder goes to none. A file of no running step's runner goes to the one step
-# that ran, the DEVBOX_VERIFY gate that writes its own ledger.
+# that ran, a step with no runner= whose command writes its own ledger.
 #
 # The last fallback once gave a file to every candidate whose inputs= was
 # empty: in a monorepo of one vitest step per module, with dir= and no
@@ -803,7 +794,7 @@ steps_run_local() {
   local priv root_sum hooks fpid ofd rc=0 n=0
   priv="$(devbox_gate_private_dir)" || devbox_die 1
   root_sum="$(printf '%s' "$ROOT" | sha256sum)" || { echo "devbox verify: sha256sum failed, so the gate has no log directory and did not run" >&2; devbox_die 1; }
-  DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks local "$priv/steps/local-${root_sum:0:16}" "$STEPS_DIR/plan" "$RUN_ID" "$((1 - STEPS_FROM_VERIFY))")"
+  DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks local "$priv/steps/local-${root_sum:0:16}" "$STEPS_DIR/plan" "$RUN_ID")"
   # The declared services start in docker before the first step and stop at
   # the exit, as a workspace's do (learned-selection spec, D8 and D10).
   # devbox_services_load sources devbox-services. Before the hooks script:
@@ -1077,6 +1068,26 @@ require_safe_name "DEVBOX_PROJECT" "${DEVBOX_PROJECT:-}" "$DEVBOX_CONFIG"
 # gate-root and devbox-pool apply this same rule on their own side, and those
 # checks do not make this one redundant: a refusal here names the file to fix
 # before anything has crossed.
+#
+# Both keys are optional. Each project guessed its count once, and the guesses
+# were wrong both ways, MEASURED (docs/specs/2026-11-15-prep-throughput-design.md
+# section 1.1): hosts held every token with a run queued while most of their
+# cores stood idle, and one small grant used several times its count in cores.
+# A pressure host now sizes the grant itself, so a guess there can only cap it.
+# Unset, the floor is 2, the least worker hint a pressure host grants, or the
+# explicit want when that is lower, so the two never cross. Unset, the want is
+# chosen per target from its probe (join_want), and the probe asks for the floor.
+WANT_AUTO=0
+MIN_AUTO=0
+if [ -z "${DEVBOX_WANT_TOKENS:-}" ]; then WANT_AUTO=1; fi
+if [ -z "${DEVBOX_MIN_TOKENS:-}" ]; then
+  MIN_AUTO=1
+  DEVBOX_MIN_TOKENS=2
+  if [ "$WANT_AUTO" = 0 ] && is_uint "$DEVBOX_WANT_TOKENS" && [ "$DEVBOX_WANT_TOKENS" -lt 2 ]; then
+    DEVBOX_MIN_TOKENS="$DEVBOX_WANT_TOKENS"
+  fi
+fi
+[ "$WANT_AUTO" = 0 ] || DEVBOX_WANT_TOKENS="$DEVBOX_MIN_TOKENS"
 require_uint "DEVBOX_WANT_TOKENS" "${DEVBOX_WANT_TOKENS:-}" "$DEVBOX_CONFIG"
 require_uint "DEVBOX_MIN_TOKENS" "${DEVBOX_MIN_TOKENS:-}" "$DEVBOX_CONFIG"
 # The gate's wall-clock limit. The watchdog on a deployed target stops
@@ -1232,14 +1243,12 @@ queue_fallback() {
     {
       echo "devbox verify: NOT running $DEVBOX_PROJECT's gate on this machine."
       echo "  $why"
-      # Defaulted to the KEY'S OWN NAME rather than read bare. A profile that
-      # sets DEVBOX_NEEDS_POSTGRES=1 and no DEVBOX_DB_URL_VAR is one somebody
-      # half-edited, and under `set -u` a bare read ends the run with a raw
-      # "unbound variable" in the middle of the sentence explaining why the
-      # gate stayed remote. The developer then loses the refusal that names
-      # the file to fix, which is the same failure the DEVBOX_WANT_TOKENS read
-      # above records against itself.
-      echo "  DEVBOX_NEEDS_POSTGRES=1 in $DEVBOX_CONFIG: a gate here would run with \$${DEVBOX_DB_URL_VAR:-DEVBOX_DB_URL_VAR} unset, because only a target provisions the Postgres role and database behind it."
+      # Defaulted rather than read bare. Under `set -u` a bare read of an
+      # unset name ends the run with a raw "unbound variable" in the middle of
+      # the sentence explaining why the gate stayed remote. The developer then
+      # loses the refusal that names the file to fix, which is the same
+      # failure the DEVBOX_WANT_TOKENS read above records against itself.
+      echo "  DEVBOX_SERVICES names postgres in $DEVBOX_CONFIG: a gate here would run with \$${DEVBOX_DB_URL_VAR:-DATABASE_URL} unset, because only a target provisions the Postgres role and database behind it."
       echo "  MEASURED: a project skipped its database tests and still exited 0 that way."
       echo "  $FALLBACK_STAY"
       echo "  run 'devbox verify --local' if you know this machine already has one configured, or raise DEVBOX_MAX_QUEUE_WAIT in $DEVBOX_ENV."
@@ -1271,14 +1280,14 @@ queue_fallback() {
     echo "devbox verify: running $DEVBOX_PROJECT's gate on THIS machine instead of $FALLBACK_FROM."
     echo "  $why"
     # States what was actually checked, never "covers the same code as the
-    # remote one": that equivalence claim is exactly what DEVBOX_NEEDS_POSTGRES
+    # remote one": that equivalence claim is exactly what a declared postgres
     # disproves above, and an empty or all-whitespace DEVBOX_REQUIRES used to
     # reach this line having checked nothing at all while it was still
     # reported as "every token is satisfied here".
     if [ "$checked_requires" -eq 1 ]; then
-      echo "  every DEVBOX_REQUIRES token is satisfied here: $DEVBOX_REQUIRES. DEVBOX_NEEDS_POSTGRES is not set, so nothing else about this machine was checked."
+      echo "  every DEVBOX_REQUIRES token is satisfied here: $DEVBOX_REQUIRES. DEVBOX_SERVICES names no postgres, so nothing else about this machine was checked."
     else
-      echo "  DEVBOX_REQUIRES names nothing to check here, and DEVBOX_NEEDS_POSTGRES is not set, so nothing about this machine was checked before running its gate."
+      echo "  DEVBOX_REQUIRES names nothing to check here, and DEVBOX_SERVICES names no postgres, so nothing about this machine was checked before running its gate."
     fi
   } >&2
   run_local
@@ -1379,6 +1388,36 @@ JOIN_T0=""
 WINNER=""
 declare -A JOIN_LOCK_FD=() JOIN_RUN_FD=() JOIN_PID=() JOIN_STATE=()
 
+# The want the `run` verb sends to target $1. An explicit DEVBOX_WANT_TOKENS,
+# and every `devbox run`, send GRANT_WANT as before. With the key unset it comes
+# from the pool total of the target's probe (JOIN_FACT), read by its admission
+# rule (JOIN_ADMISSION). A pressure host caps its worker hint at the want, so a
+# want below its total takes workers from a gate alone on the host: the want is
+# the total. A token host grants the want only while that many tokens are free,
+# so a want of its total would wait for an empty pool on every run: the want is
+# half the total, which lets two such gates run at once, and never under the
+# floor. A host older than the admission record sends none, and it admits on
+# tokens. A target with no total in its probe gets GRANT_WANT, the floor.
+# Trade-off: the probe went out before the total was known, with the floor as
+# its want, so on a token host a `now` verdict can still mean a wait of up to
+# the pool's DEVBOX_MIN_WAIT, after which the pool grants what is free.
+# shellcheck disable=SC2317  # called from join_job, which runs in the background
+join_want() {
+  local name="$1" tokens total want
+  if [ "$WANT_AUTO" = 0 ] || [ "$RUN_MODE" = 1 ]; then printf '%s' "$GRANT_WANT"; return 0; fi
+  read -r _ _ tokens _ <<<"${JOIN_FACT[$name]-}"
+  total="${tokens#*/}"
+  if ! [[ "$total" =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$GRANT_WANT"; return 0; fi
+  if [ -n "${JOIN_ADMISSION[$name]-}" ] && devbox_admission_parse "admission ${JOIN_ADMISSION[$name]}" \
+     && [ "$ADMISSION_RULE" = pressure ]; then
+    want="$total"
+  else
+    want=$((total / 2))
+  fi
+  [ "$want" -ge "$DEVBOX_MIN_TOKENS" ] || want="$DEVBOX_MIN_TOKENS"
+  printf '%s' "$want"
+}
+
 # The job of one join. $1 the target, $2 the max wait the pool is sent. It
 # writes what happened into its directory: `lane` once it holds one, `end`
 # when it stopped before a run, and `run.rc` when its run ended. `run.err` is
@@ -1444,7 +1483,7 @@ join_job() {
     exec {ofd}>&1
   fi
   join_fifo_reader "$d/run.in"
-  devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$maxwait" \
+  devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$(join_want "$name")" "$DEVBOX_MIN_TOKENS" "$maxwait" \
     "$GATE_MAX_SECONDS" "$GATE_MODE" "$HISTORY_SLUG" "$RUN_ID" <&"$JOIN_READER" 2>&"$efd" >&"$ofd" \
     || { exec {efd}>&- {ofd}>&-; echo "the run could not be sent" >"$d/end"; exit 0; }
   exec {JOIN_READER}<&-
@@ -2716,8 +2755,13 @@ decide() {
           {
             echo "devbox verify: every target can NEVER grant this gate's tokens:"
             skip_lines "  "
-            echo "  DEVBOX_MIN_TOKENS is $DEVBOX_MIN_TOKENS in $DEVBOX_CONFIG."
-            echo "  lower DEVBOX_MIN_TOKENS there, or raise DEVBOX_TOTAL_TOKENS in the deployment config of each target and redeploy it with the server's deploy.sh."
+            if [ "$MIN_AUTO" = 1 ]; then
+              echo "  DEVBOX_MIN_TOKENS is $DEVBOX_MIN_TOKENS, the default, because $DEVBOX_CONFIG sets none."
+              echo "  raise DEVBOX_TOTAL_TOKENS in the deployment config of each target and redeploy it with the server's deploy.sh."
+            else
+              echo "  DEVBOX_MIN_TOKENS is $DEVBOX_MIN_TOKENS in $DEVBOX_CONFIG."
+              echo "  lower DEVBOX_MIN_TOKENS there, or raise DEVBOX_TOTAL_TOKENS in the deployment config of each target and redeploy it with the server's deploy.sh."
+            fi
             echo "  without this check the acquire would have waited out DEVBOX_POOL_DEADLINE, an hour, and then failed."
           } >&2 ;;
         unreachable)
@@ -3048,8 +3092,8 @@ fi
 refuse_lost_ticket "$status" "$GATE_ERR" "$TARGET"
 # From here the status is the gate's own. A planned gate's code is the code of
 # its first failed step in plan order, read from the runner's result lines: the
-# runner itself exits 1 for any failure, and a project's DEVBOX_VERIFY that
-# exited 3 must still make this run exit 3.
+# runner itself exits 1 for any failure, and a step whose command exited 3
+# must still make this run exit 3.
 if [ "$STEPS_ACTIVE" = 1 ]; then
   steps_gate_code "$STEPS_RAW" "$status"
   status="$STEPS_GATE_CODE"
@@ -3114,7 +3158,11 @@ if [ "$status" -ne 0 ] || [ "$STRICT" = 1 ]; then
       echo "  a partial test summary, or none at all, is the SYMPTOM: the kernel kills the process before it can print one"
       echo "  the counter does not say WHICH killer, so both causes are live:"
       echo "    this workspace crossed its own cap, which is $cap_text"
-      echo "      then lower DEVBOX_WANT_TOKENS, now $DEVBOX_WANT_TOKENS, in $DEVBOX_CONFIG: every token is one more worker sharing that cap"
+      if [ "$WANT_AUTO" = 1 ]; then
+        echo "      then set DEVBOX_WANT_TOKENS in $DEVBOX_CONFIG below the worker count the host gave this gate: every token is one more worker sharing that cap"
+      else
+        echo "      then lower DEVBOX_WANT_TOKENS, now $DEVBOX_WANT_TOKENS, in $DEVBOX_CONFIG: every token is one more worker sharing that cap"
+      fi
       echo "      or raise DEVBOX_WORKSPACE_MEMORY in the deployment config for $TARGET, then redeploy the host with the server's deploy.sh"
       echo "    or $TARGET ran out of memory host-wide and the kernel chose a process in here"
       echo "      then RAISING the cap makes the next one more likely: cap times DEVBOX_MAX_JOBS is a budget against the box's RAM"

@@ -21,7 +21,8 @@ contains() { case "$2" in *"$1"*) return 0 ;; esac; return 1; }
 # A checkout with no .devbox.env, which is where a gate falls back to local.
 git -C "$TMP" init -q checkout
 mkdir -p "$TMP/checkout/.devbox"
-printf 'DEVBOX_PROJECT=run-fixture\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=echo GATE-RAN\n' >"$TMP/checkout/.devbox/config.env"
+printf 'DEVBOX_PROJECT=run-fixture\nDEVBOX_SETUP=:\n' >"$TMP/checkout/.devbox/config.env"
+printf 'verify -- echo GATE-RAN\n' >"$TMP/checkout/.devbox/steps"
 
 rc=0
 err="$(cd "$TMP/checkout" && "$DEVBOX" run 2>&1 >/dev/null)" || rc=$?
@@ -70,7 +71,10 @@ assert_ok "a run sends the command mode, not the verify mode" \
 # Both are source text to find, not expansions.
 # shellcheck disable=SC2016
 assert_ok "a run asks the pool for its floor, not the gate's want" \
-  contains 'devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$GRANT_WANT" "$DEVBOX_MIN_TOKENS"' "$src"
+  contains 'devbox_gate_spawn run "$slug" "$DEVBOX_PROJECT" "$(join_want "$name")" "$DEVBOX_MIN_TOKENS"' "$src"
+# shellcheck disable=SC2016
+assert_ok "and join_want sends GRANT_WANT for a run, whatever the probe said" \
+  contains 'if [ "$WANT_AUTO" = 0 ] || [ "$RUN_MODE" = 1 ]; then printf '"'"'%s'"'"' "$GRANT_WANT"; return 0; fi' "$src"
 # shellcheck disable=SC2016
 assert_ok "and GRANT_WANT is the floor in a run" \
   contains '[ "$RUN_MODE" = "1" ] && GRANT_WANT="$DEVBOX_MIN_TOKENS"' "$src"

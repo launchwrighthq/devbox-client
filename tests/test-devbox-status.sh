@@ -106,8 +106,9 @@ gate_stub_keyscan "$TMP/bin"
 CO="$TMP/fix-cache"
 mkdir -p "$CO/.devbox"
 git -C "$CO" init -q >/dev/null 2>&1
-printf 'DEVBOX_PROJECT=status-fixture\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=:\n' >"$CO/.devbox/config.env"
-git -C "$CO" add .devbox/config.env >/dev/null 2>&1
+printf 'DEVBOX_PROJECT=status-fixture\nDEVBOX_SETUP=:\n' >"$CO/.devbox/config.env"
+printf 'verify -- :\n' >"$CO/.devbox/steps"
+git -C "$CO" add .devbox/config.env .devbox/steps >/dev/null 2>&1
 git -C "$CO" -c user.email=t@fixture.invalid -c user.name=fixture commit -q -m init >/dev/null 2>&1
 git -C "$CO" worktree add -q -b feat "$TMP/feat-login" >/dev/null 2>&1
 ENV_BOTH="$(printf 'DEVBOX_TARGETS=lan1,cloud1\nDEVBOX_TARGET_LAN1=lan1.invalid\nDEVBOX_TARGET_LAN1_HOSTKEY=%s\nDEVBOX_TARGET_CLOUD1=cloud1.invalid\nDEVBOX_TARGET_CLOUD1_HOSTKEY=%s\nDEVBOX_GATE_PASSWORD=fixture-gate-password\n' "$GATE_STUB_PIN" "$GATE_STUB_PIN")"

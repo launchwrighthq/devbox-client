@@ -426,8 +426,9 @@ CO="$TMP/checkout"
 mkdir -p "$CO/.devbox"
 git -C "$CO" init -q >/dev/null 2>&1
 : >"$CO/.devbox/exclude"
-printf 'DEVBOX_PROJECT=select-fixture\nDEVBOX_WANT_TOKENS=2\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=echo LOCAL GATE RAN\n' \
+printf 'DEVBOX_PROJECT=select-fixture\nDEVBOX_WANT_TOKENS=2\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\n' \
   >"$CO/.devbox/config.env"
+printf 'verify -- echo LOCAL GATE RAN\n' >"$CO/.devbox/steps"
 printf 'DEVBOX_TARGETS=lan1,cloud1\nDEVBOX_TARGET_LAN1=lan-fixture\nDEVBOX_TARGET_LAN1_HOSTKEY=%s\nDEVBOX_TARGET_CLOUD1=cloud-fixture\nDEVBOX_TARGET_CLOUD1_HOSTKEY=%s\nDEVBOX_GATE_PASSWORD=fixture-gate-password\nDEVBOX_MAX_QUEUE_WAIT=600\n' "$GATE_STUB_PIN" "$GATE_STUB_PIN" \
   >"$CO/.devbox.env"
 SSH_LOG="$TMP/ssh.log"
@@ -707,7 +708,7 @@ assert_ok "and the way to run here" contains "devbox verify --local" "$out"
 cp "$CO/.devbox.env" "$TMP/env.keep"
 cp "$CO/.devbox/config.env" "$TMP/config.keep"
 printf 'DEVBOX_QUEUE_FULL_ACTION=local\n' >>"$CO/.devbox.env"
-printf 'DEVBOX_NEEDS_POSTGRES=1\nDEVBOX_DB_URL_VAR=SELECT_DB_URL\n' >>"$CO/.devbox/config.env"
+printf 'DEVBOX_SERVICES=postgres\nDEVBOX_SERVICE_ENV=postgres=SELECT_DB_URL\n' >>"$CO/.devbox/config.env"
 verify
 assert_eq "8" "$rc" "the local action refused, with no target to wait on, exits 8"
 assert_ok "the refusal says the gate runs nowhere" \

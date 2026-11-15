@@ -41,16 +41,16 @@ git -C "$TMP/proj" init -q
 # any machine this suite runs on, so "unmet" never depends on what happens to
 # be installed here.
 ABSENT_TOKEN="devbox-test-tool-nobody-installs-hgq7"
-# DEVBOX_NEEDS_POSTGRES is the second thing the fallback has to decide on, and
-# it is varied through this variable rather than a second positional argument,
-# so every existing call below keeps meaning exactly what it meant. The key is
-# written ONLY when this is 1: a project that needs no database commits a
-# profile that never mentions it, and a fixture that always wrote a 0 would
-# test a file shape no project has.
+# postgres in DEVBOX_SERVICES is the second thing the fallback has to decide
+# on, and it is varied through this variable rather than a second positional
+# argument, so every existing call below keeps meaning exactly what it meant.
+# The key is written ONLY when this is 1: a project that needs no database
+# commits a profile that never mentions it, and a fixture that always wrote an
+# empty one would test a file shape no project has.
 PROFILE_PG=0
 # The name of the variable the profile exports the DSN under. Emptied by one
-# case below, which writes a profile that asks for a database and never says
-# what to call it: half an edit, and a shape a person really commits.
+# case below, which writes a profile that declares a database and names no
+# variable, so the DSN goes to the default, DATABASE_URL.
 PROFILE_DB_URL_VAR=DEMO_TEST_DATABASE_URL
 write_profile() {
   {
@@ -64,14 +64,14 @@ write_profile() {
     # it said something else.
     [ -n "${1:-}" ] && printf "DEVBOX_REQUIRES='%s'\n" "$1"
     if [ "$PROFILE_PG" = "1" ]; then
-      echo 'DEVBOX_NEEDS_POSTGRES=1'
-      [ -n "$PROFILE_DB_URL_VAR" ] && printf 'DEVBOX_DB_URL_VAR=%s\n' "$PROFILE_DB_URL_VAR"
+      echo 'DEVBOX_SERVICES=postgres'
+      [ -n "$PROFILE_DB_URL_VAR" ] && printf 'DEVBOX_SERVICE_ENV=postgres=%s\n' "$PROFILE_DB_URL_VAR"
     fi
     echo 'DEVBOX_SETUP=:'
-    # The marker a local gate leaves, and the one line every "did NOT fall
-    # back" assertion below checks is absent from the run's whole output.
-    echo 'DEVBOX_VERIFY=echo "LOCAL GATE RAN"'
   } >"$TMP/proj/.devbox/config.env"
+  # The marker a local gate leaves, and the one line every "did NOT fall
+  # back" assertion below checks is absent from the run's whole output.
+  echo 'verify -- echo "LOCAL GATE RAN"' >"$TMP/proj/.devbox/steps"
 }
 write_profile
 
@@ -364,7 +364,7 @@ assert_fail "and claims no equivalence with the remote gate" \
   contains "covers the same code as the remote one" "$out"
 write_profile
 
-# ── DEVBOX_NEEDS_POSTGRES refuses the fallback ───────────────────────────────
+# ── postgres in DEVBOX_SERVICES refuses the fallback ─────────────────────────
 #
 # DEVBOX_REQUIRES has three token forms, a path, a name on PATH and a version
 # pin, and none of them can say "a provisioned Postgres role with its DSN
@@ -385,7 +385,7 @@ assert_fail "the local gate must NOT have run: this laptop provisions no databas
 assert_ok "the refusal says which machine and why" \
   contains "NOT running demo's gate on this machine." "$out"
 assert_ok "and names the key that caused it, in the file that holds it" \
-  contains "DEVBOX_NEEDS_POSTGRES=1 in $TMP/proj/.devbox/config.env" "$out"
+  contains "DEVBOX_SERVICES names postgres in $TMP/proj/.devbox/config.env" "$out"
 assert_ok "and names the variable a gate here would have run without" \
   contains "\$DEMO_TEST_DATABASE_URL unset" "$out"
 assert_ok "and says the run keeps waiting on the devbox" \
@@ -394,15 +394,17 @@ assert_fail "the satisfied token list is never reported as if it settled the que
   contains "every DEVBOX_REQUIRES token is satisfied here" "$out"
 assert_ok "which it does: the acquire really ran" contains "devbox-gate@fakehost run " "$ssh_log"
 
-# The same key with DEVBOX_DB_URL_VAR missing. The refusal reads that name to
-# tell the developer which variable a local gate would run without, and a bare
-# read of it under `set -u` ends the whole run with "unbound variable" halfway
-# through the sentence, taking with it the one line that names the file to fix.
+# The same service with no DEVBOX_SERVICE_ENV. The refusal reads the variable
+# name to tell the developer which variable a local gate would run without,
+# and a bare read of an unset name under `set -u` ends the whole run with
+# "unbound variable" halfway through the sentence, taking with it the one line
+# that names the file to fix.
 PROFILE_DB_URL_VAR=""
 write_profile "bash"
 run_verify
 assert_ok "a profile that names no URL variable still gets the whole refusal" \
-  contains "DEVBOX_NEEDS_POSTGRES=1 in $TMP/proj/.devbox/config.env" "$out"
+  contains "DEVBOX_SERVICES names postgres in $TMP/proj/.devbox/config.env" "$out"
+assert_ok "and names the default variable" contains "\$DATABASE_URL unset" "$out"
 assert_fail "and the local gate is still not what runs" \
   contains "LOCAL GATE RAN" "$out"
 PROFILE_DB_URL_VAR=DEMO_TEST_DATABASE_URL

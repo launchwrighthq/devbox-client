@@ -17,34 +17,38 @@ TMP="$(mktemp -d)" || { echo "mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 contains() { case "$2" in *"$1"*) return 0 ;; esac; return 1; }
 
+# The gate is .devbox/steps beside the config, and every case below but the
+# one that removes it has one.
+printf 'verify -- npm run verify\n' >"$TMP/steps"
+
 # Each case parses in a subshell, so no value leaks into the next one.
-parse() {  # $1 is the file content; prints DEVBOX_PROJECT|SETUP|VERIFY|REQUIRES|RUNPOD_IMAGE
+parse() {  # $1 is the file content; prints DEVBOX_PROJECT|SETUP|ENVIRONMENT|REQUIRES|RUNPOD_IMAGE
   printf '%s\n' "$1" >"$TMP/config.env"
   (
-    unset DEVBOX_PROJECT DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_REQUIRES
+    unset DEVBOX_PROJECT DEVBOX_SETUP DEVBOX_ENVIRONMENT DEVBOX_REQUIRES
     devbox_config_parse "$TMP/config.env" || exit
-    printf '%s|%s|%s|%s|%s' "$DEVBOX_PROJECT" "$DEVBOX_SETUP" "$DEVBOX_VERIFY" \
+    printf '%s|%s|%s|%s|%s' "$DEVBOX_PROJECT" "$DEVBOX_SETUP" "${DEVBOX_ENVIRONMENT:-}" \
       "${DEVBOX_REQUIRES:-}" "${DEVBOX_RUNPOD_IMAGE:-}"
   )
 }
 BASE='DEVBOX_PROJECT=p
 DEVBOX_SETUP=npm ci
-DEVBOX_VERIFY=npm run verify'
+DEVBOX_ENVIRONMENT=export MODE=ci'
 
-assert_eq "p|npm ci|npm run verify||" "$(parse "$BASE")" "plain values are read verbatim"
-assert_eq 'p|npm ci|npm run verify|jq=1.7 shellcheck|' \
+assert_eq "p|npm ci|export MODE=ci||" "$(parse "$BASE")" "plain values are read verbatim"
+assert_eq 'p|npm ci|export MODE=ci|jq=1.7 shellcheck|' \
   "$(parse "$BASE"$'\nDEVBOX_REQUIRES="jq=1.7 shellcheck"')" "one pair of double quotes is stripped"
 assert_eq 'p|npm ci|echo "a b"||' \
   "$(parse 'DEVBOX_PROJECT=p
 DEVBOX_SETUP=npm ci
-DEVBOX_VERIFY='"'"'echo "a b"'"'"'')" "single quotes keep inner double quotes"
+DEVBOX_ENVIRONMENT='"'"'echo "a b"'"'"'')" "single quotes keep inner double quotes"
 # The dollar and backquote are data under test, never expanded.
 # shellcheck disable=SC2016
 assert_eq 'p|npm ci|echo $HOME `id`||' \
   "$(parse 'DEVBOX_PROJECT=p
 DEVBOX_SETUP=npm ci
-DEVBOX_VERIFY=echo $HOME `id`')" "nothing in a value is expanded"
-assert_eq "p|npm ci|npm run verify||" \
+DEVBOX_ENVIRONMENT=echo $HOME `id`')" "nothing in a value is expanded"
+assert_eq "p|npm ci|export MODE=ci||" \
   "$(parse "  # comment"$'\n\n'"$BASE"$'\n  ')" "comments, blank lines and outer spaces are skipped"
 
 err="$(parse "$BASE"$'\nDEVBOX_TOKENS=4' 2>&1)"; rc=$?
@@ -59,15 +63,48 @@ assert_ok "and the refusal says so" contains "opens a quote it does not close" "
 err="$(parse "$BASE"$'\nexport DEVBOX_REQUIRES=x' 2>&1)"; rc=$?
 assert_eq "2" "$rc" "a shell statement is refused"
 assert_ok "and the refusal names the line" contains "config.env:4 is not KEY=value" "$err"
-err="$(parse $'DEVBOX_PROJECT=p\nDEVBOX_SETUP=:' 2>&1)"; rc=$?
-assert_eq "2" "$rc" "a config with no DEVBOX_VERIFY is refused"
-assert_ok "and the refusal names the key" contains "sets no DEVBOX_VERIFY" "$err"
-err="$(DEVBOX_VERIFY=inherited parse $'DEVBOX_PROJECT=p\nDEVBOX_SETUP=:' 2>&1)"; rc=$?
+err="$(parse $'DEVBOX_SETUP=:' 2>&1)"; rc=$?
+assert_eq "2" "$rc" "a config with no DEVBOX_PROJECT is refused"
+assert_ok "and the refusal names the key" contains "sets no DEVBOX_PROJECT" "$err"
+err="$(DEVBOX_PROJECT=inherited parse $'DEVBOX_SETUP=:' 2>&1)"; rc=$?
 assert_eq "2" "$rc" "an inherited environment value does not stand in for a missing key"
 
-assert_eq "p|npm ci|npm run verify||fixture/image:1" \
+# ── the keys release 4.0 refuses (learned-selection spec, section 11) ────────
+#
+# Each is refused by line with exit 2 and the line that replaces it, never
+# dropped in silence.
+removed() {  # $1 the line, $2 the replacement text
+  local err rc=0
+  err="$(parse "$BASE"$'\n'"$1" 2>&1)" || rc=$?
+  assert_eq "2" "$rc" "$1 is refused with exit 2"
+  assert_eq "devbox: $TMP/config.env:4: ${1%%=*} is no longer read. $2" "$err" \
+    "$1: one line that names the line, the key and its replacement"
+}
+removed 'DEVBOX_VERIFY=npm run verify' \
+  "Describe the gate in .devbox/steps, one step per line, such as 'verify -- <the command>'."
+removed 'DEVBOX_NEEDS_POSTGRES=1' "Write DEVBOX_SERVICES=postgres in .devbox/config.env."
+removed 'DEVBOX_NEEDS_POSTGRES=0' "Write DEVBOX_SERVICES=postgres in .devbox/config.env."
+removed 'DEVBOX_DB_URL_VAR=APP_DB' \
+  "Write DEVBOX_SERVICE_ENV=postgres=<VARIABLE> in .devbox/config.env, or leave it out for DATABASE_URL."
+printf 'DEVBOX_VERIFY=npm run verify\n' >"$TMP/dev.env"
+rc=0
+err="$(devbox_env_load "$TMP/dev.env" 2>&1)" || rc=$?
+assert_eq "2" "$rc" "DEVBOX_VERIFY in .devbox.env is refused with exit 2"
+assert_eq "devbox: $TMP/dev.env:1: DEVBOX_VERIFY is no longer read. Describe the gate in .devbox/steps, one step per line, such as 'verify -- <the command>'." \
+  "$err" "with the same replacement line"
+
+mv "$TMP/steps" "$TMP/steps.away"
+err="$(parse "$BASE" 2>&1)"; rc=$?
+assert_eq "2" "$rc" "a config with no .devbox/steps beside it is refused"
+assert_eq "devbox: $TMP/config.env has no .devbox/steps beside it, so the project names no gate; write one step per line there, such as 'test -- npm test'" \
+  "$err" "and the refusal says what to write"
+err="$(DEVBOX_VERIFY=inherited parse "$BASE" 2>&1)"; rc=$?
+assert_eq "2" "$rc" "an exported DEVBOX_VERIFY does not stand in for .devbox/steps"
+mv "$TMP/steps.away" "$TMP/steps"
+
+assert_eq "p|npm ci|export MODE=ci||fixture/image:1" \
   "$(parse "$BASE"$'\nDEVBOX_RUNPOD_IMAGE=fixture/image:1')" "the config sets a RunPod image"
-assert_eq "p|npm ci|npm run verify||mine" \
+assert_eq "p|npm ci|export MODE=ci||mine" \
   "$(DEVBOX_RUNPOD_IMAGE=mine parse "$BASE"$'\nDEVBOX_RUNPOD_IMAGE=fixture/image:1')" \
   "a developer's RunPod image wins over the config's default"
 
@@ -124,14 +161,16 @@ cat >"$TMP/co/.devbox/config.env" <<'CONFIG'
 DEVBOX_PROJECT=co
 DEVBOX_ENVIRONMENT=export GREETING=hello
 DEVBOX_SETUP=echo "setup $GREETING"
-DEVBOX_VERIFY=echo verify; exit 3
 CONFIG
+printf 'verify -- echo verify\n' >"$TMP/co/.devbox/steps"
 out="$(cd "$TMP/co" && devbox_config_load && bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_setup')"
 assert_eq "setup hello" "$out" "setup runs after the environment hook"
+# The step hooks of a planned gate replace devbox_verify. Without them it
+# fails, so a gate whose plan did not arrive never passes by running nothing.
 rc=0
-out="$(cd "$TMP/co" && devbox_config_load && bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_verify')" || rc=$?
-assert_eq "verify" "$out" "verify runs its command"
-assert_eq "3" "$rc" "and its exit status is the gate's"
+err="$(cd "$TMP/co" && devbox_config_load && bash -c "$(devbox_hooks_script)"$'\n''devbox_environment && devbox_verify' 2>&1 >/dev/null)" || rc=$?
+assert_eq "2" "$rc" "devbox_verify with no step hooks exits 2"
+assert_eq "devbox: no step plan reached the workspace, so nothing ran" "$err" "and says that nothing ran"
 assert_eq "$TMP/co/.devbox/config.env" "$(cd "$TMP/co" && devbox_config_load && echo "$DEVBOX_CONFIG")" \
   "DEVBOX_CONFIG names the file for messages"
 assert_eq ".devbox/exclude" "$(cd "$TMP/co" && devbox_config_load && echo "$DEVBOX_EXCLUDE")" \
@@ -180,18 +219,18 @@ newkeys() {  # $1 the file content
       "$DEVBOX_SETUP_INPUTS" "$DEVBOX_SHARED_INPUTS" "$DEVBOX_LOCAL_GATE"
   )
 }
-assert_eq "|<unset>/<unset>|||always" "$(newkeys "$BASE")" \
-  "with none of the four keys: no config rerun, no inputs, local gate always"
-assert_eq "|<unset>/<unset>|||always" \
+assert_eq "|<unset>/<unset>|||ci" "$(newkeys "$BASE")" \
+  "with none of the four keys: no config rerun, no inputs, local gate ci"
+assert_eq "|<unset>/<unset>|||ci" \
   "$(ENV_RERUN_CONFIG=full ENV_INPUTS=package-lock.json ENV_LOCAL_GATE=never newkeys "$BASE")" \
   "and no exported value stands in for a key the file does not set"
-assert_eq "full|<unset>/<unset>|||always" "$(newkeys "$BASE"$'\nDEVBOX_RERUN=full')" \
+assert_eq "full|<unset>/<unset>|||ci" "$(newkeys "$BASE"$'\nDEVBOX_RERUN=full')" \
   "DEVBOX_RERUN=full lands in DEVBOX_RERUN_CONFIG, and DEVBOX_RERUN stays unset"
-assert_eq "changed|<unset>/<unset>|||always" "$(newkeys "$BASE"$'\nDEVBOX_RERUN=changed')" \
+assert_eq "changed|<unset>/<unset>|||ci" "$(newkeys "$BASE"$'\nDEVBOX_RERUN=changed')" \
   "DEVBOX_RERUN=changed is read"
-assert_eq "full|changed/changed|||always" "$(ENV_RERUN=changed newkeys "$BASE"$'\nDEVBOX_RERUN=full')" \
+assert_eq "full|changed/changed|||ci" "$(ENV_RERUN=changed newkeys "$BASE"$'\nDEVBOX_RERUN=full')" \
   "the file's DEVBOX_RERUN never replaces the exported value, which stays exported"
-assert_eq "|full/full|||always" "$(ENV_RERUN=full newkeys "$BASE")" \
+assert_eq "|full/full|||ci" "$(ENV_RERUN=full newkeys "$BASE")" \
   "and an exported DEVBOX_RERUN is never read as the config's value"
 for bad in "" Full all "changed full"; do
   rc=0
@@ -206,12 +245,12 @@ err="$(ENV_RERUN=changed newkeys "$BASE"$'\nDEVBOX_RERUN=full\nDEVBOX_NOPE=1' 2>
 assert_eq "2" "$rc" "a config refused after its DEVBOX_RERUN line exits 2"
 assert_ok "and the exported value stays in place" contains "rerun after the refusal: changed/changed" "$err"
 
-assert_eq "|<unset>/<unset>|package-lock.json uv.lock|tsconfig.base.json apps/web/package.json|always" \
+assert_eq "|<unset>/<unset>|package-lock.json uv.lock|tsconfig.base.json apps/web/package.json|ci" \
   "$(newkeys "$BASE"$'\nDEVBOX_SETUP_INPUTS="package-lock.json uv.lock"\nDEVBOX_SHARED_INPUTS="tsconfig.base.json apps/web/package.json"')" \
   "both input lists are read as space-separated relative paths"
-assert_eq "|<unset>/<unset>|||always" "$(newkeys "$BASE"$'\nDEVBOX_SETUP_INPUTS=\nDEVBOX_SHARED_INPUTS=')" \
+assert_eq "|<unset>/<unset>|||ci" "$(newkeys "$BASE"$'\nDEVBOX_SETUP_INPUTS=\nDEVBOX_SHARED_INPUTS=')" \
   "an empty input list is allowed"
-assert_eq "|<unset>/<unset>|./a/.b/c@1+2_x-y||always" "$(newkeys "$BASE"$'\nDEVBOX_SETUP_INPUTS=./a/.b/c@1+2_x-y')" \
+assert_eq "|<unset>/<unset>|./a/.b/c@1+2_x-y||ci" "$(newkeys "$BASE"$'\nDEVBOX_SETUP_INPUTS=./a/.b/c@1+2_x-y')" \
   "a path may hold letters, digits and . _ + @ / -"
 for key in DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS; do
   for bad in /etc/passwd ../up a/../b a/.. .. -rf 'a*b' "a'b" "a\$b" 'a~b'; do
@@ -257,7 +296,7 @@ assert_eq "refused|$CI_REFUSAL" "$(local_gate ci "" 0)" "ci refuses with no CI a
 assert_eq "run|" "$(local_gate ci "" 1)" "ci runs here with --local"
 assert_eq "run|" "$(local_gate ci true 0)" "ci runs here when CI is set"
 assert_eq "run|" "$(local_gate ci true 1)" "ci runs here when CI is set and --local is given"
-assert_eq "run|" "$(unset DEVBOX_LOCAL_GATE; CI="" devbox_local_gate_allowed 0 2>&1 && printf 'run|')" \
-  "an unloaded DEVBOX_LOCAL_GATE runs here, the release 1 default"
+assert_eq "refused|$CI_REFUSAL" "$(local_gate '' '' 0)" \
+  "an empty or unloaded DEVBOX_LOCAL_GATE is ci, the release 4.0 default"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

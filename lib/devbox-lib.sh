@@ -121,6 +121,13 @@ devbox_sanitize() {
 # and a client on 2 reads that reply as malformed. A host on 2 refuses the
 # nine-word `run` after the lock; the handshake refuses it at the probe.
 #
+# 4 changes nothing either half computes. The client refuses DEVBOX_VERIFY,
+# select=related, DEVBOX_NEEDS_POSTGRES and DEVBOX_DB_URL_VAR with exit 2, and
+# runs a gate with no .devbox.env on this machine only in CI or under --local,
+# so every consumer must change its files to move its pin. A release that makes
+# a consumer change is a major, and tests/test-version-agreement.sh holds the
+# major equal to this integer, so the integer moves with it.
+#
 # This assignment sits BELOW devbox_sanitize, and only for the directive under
 # this line. A shellcheck directive placed before the first command of a file
 # applies to the whole file and to every line added to it later, so a genuinely
@@ -131,7 +138,7 @@ devbox_sanitize() {
 # file is SOURCED, so every line here runs before the sourcing script
 # continues, and the variable is set long before any consumer reads it.
 # shellcheck disable=SC2034  # read by whatever sources this file, never here
-DEVBOX_PROTOCOL_VERSION=3
+DEVBOX_PROTOCOL_VERSION=4
 
 # The handshake's second field: the sha256 of a library file, hex only, with no
 # filename beside it. It is handed the path rather than reading its own, so it

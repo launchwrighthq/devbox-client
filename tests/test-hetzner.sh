@@ -151,8 +151,9 @@ CO="$TMP/checkout"
 mkdir -p "$CO/.devbox"
 git -C "$CO" init -q >/dev/null 2>&1
 : >"$CO/.devbox/exclude"
-printf 'DEVBOX_PROJECT=hetzner-fixture\nDEVBOX_WANT_TOKENS=2\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\nDEVBOX_VERIFY=echo LOCAL GATE RAN\n' \
+printf 'DEVBOX_PROJECT=hetzner-fixture\nDEVBOX_WANT_TOKENS=2\nDEVBOX_MIN_TOKENS=1\nDEVBOX_SETUP=:\n' \
   >"$CO/.devbox/config.env"
+printf 'verify -- echo LOCAL GATE RAN\n' >"$CO/.devbox/steps"
 STATE="$CO/.git/devbox-hetzner"
 write_env() { printf '%s\n' "$@" >"$CO/.devbox.env"; }
 reset_api() { rm -rf "$API" "$STATE"; mkdir -p "$API"; printf '41 42' >"$API/images"; : >"$ARGV_LOG"; : >"$SSH_LOG"; }

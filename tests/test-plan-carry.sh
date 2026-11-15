@@ -47,7 +47,7 @@ new_repo() {
     apps/worker/tests/test_c.py packages/core/c.ts package-lock.json; do
     mkdir -p "$(dirname "$f")" && printf '%s v1\n' "$f" >"$f"
   done
-  mkdir -p .devbox && printf 'DEVBOX_PROJECT=app\nDEVBOX_SETUP=true\nDEVBOX_VERIFY=true\n' >.devbox/config.env
+  mkdir -p .devbox && printf 'DEVBOX_PROJECT=app\nDEVBOX_SETUP=true\n' >.devbox/config.env
   DEVBOX_CONFIG="$PWD/.devbox/config.env"
   DEVBOX_SHARED_INPUTS="package-lock.json"
   DEVBOX_FORWARD_ENV=""

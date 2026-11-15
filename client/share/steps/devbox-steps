@@ -19,13 +19,6 @@
 #                        devbox_ledger.py and devbox-trace-hook.mjs; required
 #                        when DEVBOX_LEDGER is set and the plan holds a runner
 #                        step
-#   DEVBOX_STEPS_STEP_LINES  0 writes no `step` line of this program's own. The
-#                        one step of a DEVBOX_VERIFY gate writes its own ledger
-#                        (resumable-gates spec, section 4.2), and a `verify`
-#                        step line around it would count as a unit of its own:
-#                        open at every stop, it was named as a hang at both
-#                        stops, and it hid the warning for a gate that wrote no
-#                        ledger at all.
 #   DEVBOX_TOKENS        the grant; unset on a laptop and in CI, where the
 #                        cores of nproc stand for it; also the most runner
 #                        steps that run at once
@@ -61,7 +54,6 @@ plan_die() { echo "devbox-steps: plan line $1: $2" >&2; exit 2; }
 mkdir -p "$DEVBOX_STEPS_LOGS" || die "cannot create the log directory $DEVBOX_STEPS_LOGS"
 LEDGER="${DEVBOX_LEDGER-}"
 RESUME="${DEVBOX_RESUME-0}"
-STEP_LINES="${DEVBOX_STEPS_STEP_LINES-1}"
 VITEST_DIR=node_modules/.devbox-ledger
 
 # ── the plan ─────────────────────────────────────────────────────────────────
@@ -182,7 +174,7 @@ done
 # and the plug-ins of parallel steps write interleave whole and never as
 # fragments of two records. devbox-ledger writes the same `step` lines.
 ledger_step() {
-  [ -n "$LEDGER" ] && [ "$STEP_LINES" != 0 ] || return 0
+  [ -n "$LEDGER" ] || return 0
   local line
   printf -v line 'step\t%s\t%s' "$1" "$2"
   [ "$#" -lt 3 ] || line+=$'\t'"$3"
@@ -193,9 +185,7 @@ ledger_step() {
 # for their units: a `start` after a `pass` means a later run began the step
 # and did not finish it.
 declare -A LEDGER_PASSED=()
-# With no step lines of this program's own, a `step` record in the ledger is
-# the gate's, and one it named `verify` must not skip the whole gate.
-if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ "$STEP_LINES" != 0 ] && [ -f "$LEDGER" ]; then
+if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ -f "$LEDGER" ]; then
   while IFS= read -r name; do
     LEDGER_PASSED[$name]=1
   done < <(awk -F '\t' '$1 == "step" { last[$2] = $3 } END { for (s in last) if (last[s] == "pass") print s }' "$LEDGER")
@@ -828,8 +818,8 @@ done
 
 # A plan in which one step runs streams that step's output as it comes, after
 # its `== <name>: <log>` header, and the log is not printed again at the end.
-# Every DEVBOX_VERIFY gate is one step, and its output used to stream to the
-# terminal: behind the log file alone it printed nothing for its whole length,
+# A gate of one command used to stream its output to the terminal: behind
+# the log file alone it printed nothing for its whole length,
 # and an agent that watches a silent terminal reads a hang. Two or more steps
 # that run in parallel keep their logs apart, because interleaved lines of two
 # test runs cannot be read.
@@ -943,6 +933,29 @@ for name in "${failed[@]}"; do
   cat "$(log_of "$name")"
 done
 
+# The tokens of section 5.7, resolved over every trace file of one step. The
+# hook writes `partial <test file> <reason> <token>` when a test starts a
+# Worker or a node child, and the hook in that Worker or child writes
+# `covered <test file> <token>` in its own trace file when it loads. Most of
+# the partial test files of one vitest suite were partial only because a test
+# started a Worker, and one partial file makes its step lose its learned
+# inputs. A confirmed token drops its partial line. An unconfirmed one, or a
+# line whose fields or token break the form, stays as the plain
+# `partial <test file> <reason>` of section 5.4, because a failure in this
+# path must leave the file partial. Every covered line is dropped, so the
+# client and the map read only the forms they read before tokens.
+# shellcheck disable=SC2016  # awk code: the $ fields are awk's, never the shell's
+TOKEN_AWK='
+function token_ok(t) { return length(t) >= 8 && length(t) <= 64 && t !~ /[^A-Za-z0-9._-]/ }
+$1 == "covered" { if (NF == 3 && token_ok($3)) covered[$2 FS $3] = 1; next }
+$1 == "partial" && NF > 3 {
+  if (NF == 4 && token_ok($4)) { file[++n] = $2; reason[n] = $3; token[n] = $4 }
+  else print $1 FS $2 FS $3
+  next
+}
+{ print }
+END { for (i = 1; i <= n; i++) if (!((file[i] FS token[i]) in covered)) print "partial" FS file[i] FS reason[i] }'
+
 # The trace of each traced step that ran, sorted, de-duplicated, gzipped and
 # in base64 chunks (section 5.6). The host keeps nothing, so the trace reaches
 # the client on the same stdout as the result lines. gzip's own length and
@@ -959,7 +972,7 @@ for name in "${NAMES[@]}"; do
     echo "devbox-steps: $name wrote no trace file under $tdir, so it has no trace this run" >&2
     continue
   fi
-  if ! packed="$(cat -- "${traces[@]}" | LC_ALL=C sort -u | gzip -cn | base64 | tr -d '\n')"; then
+  if ! packed="$(cat -- "${traces[@]}" | LC_ALL=C awk -F '\t' "$TOKEN_AWK" | LC_ALL=C sort -u | gzip -cn | base64 | tr -d '\n')"; then
     echo "devbox-steps: could not pack the trace of $name, so it has no trace this run" >&2
     continue
   fi

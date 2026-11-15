@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v3.5.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.0.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.5.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.0.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v3.5.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.0.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v3.5.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.0.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -92,8 +92,8 @@ verify:
 Keep the message in the else branch. A failed install leaves no client. Without the message,
 the local gate runs, passes, and nothing reports that the remote gate did not run.
 
-**`DEVBOX_VERIFY` must call the project's local gate target, never this guard.** The guard
-chooses between remote and local. A call to it from inside `DEVBOX_VERIFY` recurses.
+**A step's command must call the project's local gate target, never this guard.** The guard
+chooses between remote and local. A call to it from inside a step recurses.
 
 ## Configuration
 
@@ -101,7 +101,7 @@ Four files. The split decides who owns each value.
 
 | File | Committed | Owner | Holds |
 |---|---|---|---|
-| `.devbox/config.env` | yes | the project | how to set up, how to verify, how much machine to ask for |
+| `.devbox/config.env` | yes | the project | how to set up, which services, how much machine to ask for |
 | `.devbox/steps` | yes | the project | the steps of the gate, their order, their runners and folders |
 | `.devbox/exclude` | yes | the project | rsync patterns for files that must not reach the workspace |
 | `.devbox.env` | no, add it to `.gitignore` | the developer | which targets, the gate password, what to rent, and how long to queue |
@@ -119,19 +119,20 @@ DEVBOX_WANT_TOKENS=10
 DEVBOX_MIN_TOKENS=3
 DEVBOX_REQUIRES="jq=1.7 shellcheck"
 DEVBOX_SETUP="npm ci"
-DEVBOX_VERIFY="npm run verify:local"
 ```
+
+The gate itself is `.devbox/steps` beside this file. A `.devbox/config.env` with no
+`.devbox/steps` beside it exits 2.
 
 | Key | Required | Holds |
 |---|---|---|
 | `DEVBOX_PROJECT` | yes | the directory name of this checkout on the remote machine; `A-Za-z0-9._+-` only, not all dots |
 | `DEVBOX_WANT_TOKENS`, `DEVBOX_MIN_TOKENS` | yes | the vCPU count the gate asks for, and the count below which it waits; on a host that admits on pressure, the cap of the worker hint, and a floor checked against the host's core count |
 | `DEVBOX_SETUP` | yes | the command that installs dependencies in the workspace |
-| `DEVBOX_VERIFY` | yes, without `.devbox/steps` | the command that is the gate, run as one step named `verify`; with `.devbox/steps` it is not run |
 | `DEVBOX_RERUN` | no | `changed`, the default, carries unchanged steps and narrows or selects tests; `full` runs every step in full; the environment wins over the file |
 | `DEVBOX_SETUP_INPUTS` | no | files, such as lock files, whose content decides whether `DEVBOX_SETUP` runs again |
 | `DEVBOX_SHARED_INPUTS` | no | files every step reads; a change to one runs every step |
-| `DEVBOX_LOCAL_GATE` | no | with no `.devbox.env`: `always` (default) runs the gate on this machine, `ci` only with `CI` set or `--local`, `never` exits 2 |
+| `DEVBOX_LOCAL_GATE` | no | with no `.devbox.env`: `ci` (the default since 4.0) runs the gate on this machine only with `CI` set or `--local`, `always` runs it here, `never` exits 2 |
 | `DEVBOX_ENVIRONMENT` | no | a command that runs in the same shell before every other command |
 | `DEVBOX_PROVISION` | no | a command that RunPod runs as root before setup |
 | `DEVBOX_REQUIRES` | no | what the workspace image must carry |
@@ -139,11 +140,20 @@ DEVBOX_VERIFY="npm run verify:local"
 | `DEVBOX_SERVICES` | no | some of `postgres redis rabbitmq minio`, separated by spaces; see "Services" |
 | `DEVBOX_SERVICE_ENV` | no | `<name>=<VARIABLE>` pairs: the variable a service's value is exported under |
 | `DEVBOX_WORKER_MEMORY` | no | the memory one test worker needs, `1536M` by default; it caps the worker count |
-| `DEVBOX_NEEDS_POSTGRES`, `DEVBOX_DB_URL_VAR` | no | the older form of `postgres` in `DEVBOX_SERVICES` and its variable name, still read |
 | `DEVBOX_RUNPOD_IMAGE` | no | the RunPod image; a value in `.devbox.env` wins |
 | `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target, counted from the moment the gate starts; default `7200`, at most `14400` |
 | `DEVBOX_LANES` | no | how many workspaces this worktree may hold on each target, so that many of its runs can run there at once; default `2`, `1` to `4` |
 | `DEVBOX_MAX_RESUMES` | no | how many times a stopped gate may resume from its ledger; default `1`, `0` to `9`, `0` turns resuming off |
+
+Refused in 4.0, each with exit 2 and one line that names the file, the line and what to write
+instead. `.devbox.env` refuses `DEVBOX_VERIFY` with the same line.
+
+| Refused | Write instead |
+|---|---|
+| `DEVBOX_VERIFY=<command>` | the line `verify -- <command>` in `.devbox/steps`, the one step the key ran |
+| `DEVBOX_NEEDS_POSTGRES=1` | `DEVBOX_SERVICES=postgres` |
+| `DEVBOX_DB_URL_VAR=<VARIABLE>` | `DEVBOX_SERVICE_ENV=postgres=<VARIABLE>`, or nothing for `DATABASE_URL` |
+| `select=related` on a line of `.devbox/steps` | nothing: remove it, because every runner step selects its test files by what they read |
 
 Each command key becomes the body of a shell function. The function text goes to the
 workspace on stdin, so no command becomes part of an ssh argument list. Put a command longer
@@ -173,8 +183,8 @@ changed with no warning.
 
 ### `.devbox/steps`
 
-`devbox verify` runs the steps of `.devbox/steps`. A project without the file runs its
-`DEVBOX_VERIFY` as one step named `verify`. One step per line, `#` for a comment; the words
+`devbox verify` runs the steps of `.devbox/steps`, and a project without the file exits 2. One
+step per line, `#` for a comment; the words
 before ` -- ` are the name and its attributes, and the words after it are the command:
 
 ```
@@ -195,7 +205,8 @@ before ` -- ` are the name and its attributes, and the words after it are the co
 | `inputs=src/,tests/` | an override of what the step reads; a step without a runner that sets it is never traced |
 | `rerun=always` | always run in full |
 
-`select=related` is ignored with one warning line, and release 2 refuses it.
+`select=related` exits 2 since release 4.0, by its line: every runner step selects its test
+files by what they read, so remove it.
 
 ```
 # .devbox/steps
@@ -224,9 +235,20 @@ without `strace` runs the step untraced, and `devbox verify --plan` says `no tra
 **Learned selection.** A runner step is traced on every run, inside the runner: the vitest
 reporter and a hook in every vitest worker record what each test file opens, lists or imports,
 also through a cached module. When the step's key changed, it runs only the test files that
-can see the change: `changed`, `failed`, `new`, `no trace`, `partial` (the file started a child
-process) or `read <path>`. No such file carries the step with `no test read a changed file`. A
-missing map runs the step in full.
+can see the change: `changed`, `failed`, `new`, `no trace`, `partial` or `read <path>`. No such
+file carries the step with `no test read a changed file`. A missing map runs the step in full.
+
+A `worker_threads` Worker, or a `node` child, that a test starts directly records its reads for
+that test file. A test file is partial, because its trace may miss reads, when:
+
+- it starts a Worker with `eval: true` or `env: SHARE_ENV`, or a Worker or child whose
+  environment drops `NODE_OPTIONS`;
+- it starts node under a shell, or through `npx` or `npm exec`;
+- it starts another program, such as `bash` or `git`, that may read repository files;
+- under vitest's `isolate: false`, it may reach a live Worker that an earlier test file started.
+
+A partial file runs whenever an input of its step changed. One partial file also makes its step
+key every synced file, so any synced edit runs the step instead of carrying it.
 
 **Workers.** Every step gets `DEVBOX_WORKERS=<n>`. A vitest step gets `--maxWorkers=<n>`, plus `--minWorkers=1` on vitest 2 and 3, and a
 pytest step `-n <n>` when pytest-xdist loads. `<n>` is the grant (`DEVBOX_TOKENS`, or the
@@ -337,10 +359,11 @@ A listed target without its `DEVBOX_TARGET_<NAME>` line or its `DEVBOX_TARGET_<N
 line is refused, and so is a pin that is not `SHA256:` and 43 characters, and either line for a
 target that the list does not name. `runpod`, `hetzner` and `local` are
 not deployed target names. A file with neither `DEVBOX_TARGETS` nor `DEVBOX_RENT` runs the
-gate locally, as a missing file does.
+gate locally. A missing file runs it locally only as `DEVBOX_LOCAL_GATE` allows, by default in
+CI or under `--local`.
 
-`DEVBOX_QUEUE_FULL_ACTION=local` never runs a gate here when the project sets
-`DEVBOX_NEEDS_POSTGRES=1` or names `postgres` in `DEVBOX_SERVICES`. Only the remote machine
+`DEVBOX_QUEUE_FULL_ACTION=local` never runs a gate here when the project names `postgres` in
+`DEVBOX_SERVICES`. Only the remote machine
 provisions that database. A local run without it skipped its database tests and still exited 0.
 
 Give `.devbox.env` mode 0600, because it holds the gate password. A worktree uses its own file
@@ -481,8 +504,8 @@ devbox runpod down      delete the pod now
 ```
 
 The account key never enters a command argument, a log or the pod. Use a Debian-family image
-with bash, curl and apt. With `DEVBOX_NEEDS_POSTGRES=1`, the pod gets pgvector Postgres 16 on
-127.0.0.1:5435 and the URL in `DEVBOX_DB_URL_VAR`. Output and reports go to
+with bash, curl and apt. With `postgres` in `DEVBOX_SERVICES`, the pod gets pgvector Postgres 16
+on 127.0.0.1:5435 and the URL in `DATABASE_URL`, or the `postgres=` name of `DEVBOX_SERVICE_ENV`. Output and reports go to
 `.build/devbox/runpod/`. A command can write reports into `$DEVBOX_RESULTS`, and devbox
 downloads them even when the command fails.
 
@@ -630,8 +653,10 @@ difference skips that target, and exits 5 when it holds for every target. The me
 both sides and the fix. The library decides workspace names and Postgres role names, so two
 copies that differ can put two checkouts on one Postgres role.
 
-The protocol version is not the release version. The protocol version changes only when the
-library or a gate verb changes.
+The protocol version is not the release version. The protocol version moves with the release
+major: when the library or a gate verb changes, and when a release refuses what a consumer's
+files still say, as 4.0 refuses `DEVBOX_VERIFY`, `select=related`, `DEVBOX_NEEDS_POSTGRES` and
+`DEVBOX_DB_URL_VAR`.
 
 ## Exit codes
 

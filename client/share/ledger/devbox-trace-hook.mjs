@@ -27,6 +27,14 @@
 // helper does not run again, and this hook sees no read for that file. The
 // reporter gives the module's reads to every test file whose graph holds it.
 //
+// A worker_threads Worker or a node child that a test starts gets the test file
+// and a token in a copy of its environment (spec section 5.7). The hook loads
+// there through NODE_OPTIONS, owns every read there by that test file, and
+// writes `covered <test file> <token>` at once, which confirms the parent's
+// `partial <test file> <reason> <token>` line. The runner drops a confirmed
+// pair before it packs the trace, so a file whose Worker the hook reached is
+// complete. Anything the hook cannot confirm keeps its file partial.
+//
 // With DEVBOX_TRACE_DIR unset this file wraps nothing.
 
 import fs from 'node:fs';
@@ -35,7 +43,8 @@ import childProcess from 'node:child_process';
 import workerThreads from 'node:worker_threads';
 import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { TraceWriter, classifyPath, formatTraceLine, traceFileName, traceRoot } from './ledger-core.mjs';
+import { randomBytes } from 'node:crypto';
+import { TraceWriter, classifyPath, formatTraceLine, traceFileName, traceRoot, validUnit } from './ledger-core.mjs';
 
 const TRACE_DIR = process.env.DEVBOX_TRACE_DIR;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -53,8 +62,8 @@ function writers() {
   return { trace, modules };
 }
 
-// The test file running in this worker and the repository root, or null.
-function current() {
+// The test file vitest runs in this worker and the repository root, or null.
+function vitestOwner() {
   const state = globalThis.__vitest_worker__;
   const file = state?.filepath;
   if (typeof file !== 'string' || file === '') return null;
@@ -67,6 +76,46 @@ function current() {
   const owner = classifyPath(root, file);
   if (!owner || owner.kind !== 'read') return null;
   return { root, owner: owner.rel };
+}
+
+// A trace line of the handoff, which carries a token as its last field, or
+// null when a field holds a tab or a newline.
+function tokenLine(kind, owner, ...fields) {
+  const parts = [kind, owner, ...fields];
+  return parts.every(validUnit) ? `${parts.join('\t')}\n` : null;
+}
+
+// Section 5.7, step 3: the test file and token a parent hook handed to this
+// Worker or node child, or null. The three variables leave this environment in
+// every case, so a child of this process starts without them. A node child
+// takes the handoff only when its parent is the process that wrote the token,
+// so a grandchild that inherited the variables from a child the hook did not
+// reach never confirms in that child's place. A Worker takes it only when the
+// token names this process, so a Worker of such a child does not confirm
+// either. A handoff with no DEVBOX_TRACE_ROOT is refused: a root guessed from
+// the working directory can drop every read as outside the repository, and
+// the file would then look complete with its reads missing.
+const TOKEN_FORM = /^[A-Za-z0-9._-]{8,64}$/;
+
+function takeHandoff() {
+  const { DEVBOX_TRACE_OWNER: owner, DEVBOX_TRACE_TOKEN: token, DEVBOX_TRACE_PARENT: parent, DEVBOX_TRACE_ROOT: root } = process.env;
+  delete process.env.DEVBOX_TRACE_OWNER;
+  delete process.env.DEVBOX_TRACE_TOKEN;
+  delete process.env.DEVBOX_TRACE_PARENT;
+  if (!validUnit(owner) || typeof token !== 'string' || !TOKEN_FORM.test(token) || !root) return null;
+  const writer = token.split('.')[0];
+  const direct = workerThreads.isMainThread
+    ? parent !== undefined && parent === String(process.ppid) && writer === parent
+    : parent === undefined && writer === String(process.pid);
+  return direct ? { root: path.resolve(root), owner, token } : null;
+}
+
+const handed = TRACE_DIR ? takeHandoff() : null;
+
+// The owner of a read here: the test file a parent handed over, else the one
+// vitest runs, else null.
+function current() {
+  return handed ?? vitestOwner();
 }
 
 // A path as fs takes it: a string, a file URL or a Buffer. vitest's error
@@ -210,19 +259,201 @@ function childMayRead(root, name, args) {
   return false;
 }
 
-function record(kind, target) {
-  const cur = current();
+// Section 5.7, step 2: a child is node itself when it is a fork, when its
+// program's base name is node or it is this node, or when the program is a
+// script whose first line names node. Under a shell option the program is the
+// shell, which runs whatever its command line says. npm, npx and the other
+// package runners are node scripts that start the tool they run under a shell
+// or a program of their own, so those keep the plain partial of section 5.4.
+const PACKAGE_RUNNERS = new Set(['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'corepack']);
+
+function shebangNamesNode(file) {
+  const head = Buffer.alloc(256);
+  let fd = null;
+  let n = 0;
+  try {
+    fd = fs.openSync(file, 'r');
+    n = fs.readSync(fd, head, 0, head.length, 0);
+  } catch {
+    // A program this process cannot read is not taken for node, so its test
+    // file keeps the plain partial: the safe direction.
+    return false;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+  const text = head.toString('utf8', 0, n);
+  if (!text.startsWith('#!')) return false;
+  return text.slice(2).split('\n')[0].split(/\s+/).some((word) => path.basename(word) === 'node');
+}
+
+function isNodeChild(name, args) {
+  if (name === 'fork') return true;
+  const { program } = childCommand(name, args);
+  if (program === null || PACKAGE_RUNNERS.has(path.basename(program))) return false;
+  if (path.basename(program) === 'node') return true;
+  let real;
+  try {
+    real = fs.realpathSync(program);
+  } catch {
+    // A program that does not resolve starts no node: the plain partial stays.
+    return false;
+  }
+  if (PACKAGE_RUNNERS.has(path.basename(real))) return false;
+  return real === fs.realpathSync(process.execPath) || shebangNamesNode(real);
+}
+
+let tokens = 0;
+
+function newToken() {
+  tokens += 1;
+  return `${process.pid}.${workerThreads.threadId}.${tokens}.${randomBytes(4).toString('hex')}`;
+}
+
+// The environment a Worker or child starts with: a copy of the one the call
+// names, or of process.env, plus the handoff. process.env itself is never
+// written, because every test file of this worker reads it, and two test files
+// would then share one owner.
+function handoffEnv(base, cur, token, child) {
+  const env = { ...(base == null ? process.env : base) };
+  env.DEVBOX_TRACE_ROOT = cur.root;
+  env.DEVBOX_TRACE_OWNER = cur.owner;
+  env.DEVBOX_TRACE_TOKEN = token;
+  if (child) env.DEVBOX_TRACE_PARENT = String(process.pid);
+  else delete env.DEVBOX_TRACE_PARENT;
+  return env;
+}
+
+function isOptions(o) {
+  return typeof o === 'object' && o !== null && !Array.isArray(o);
+}
+
+// The arguments of one spawn, execFile or fork call with the handoff in its
+// options, placed where node's own parse looks for them: after the argument
+// array when there is one, before a callback.
+function withHandoff(args, cur, token) {
+  const out = [...args];
+  let i = Array.isArray(out[1]) || (out.length > 2 && out[1] == null) ? 2 : 1;
+  if (isOptions(out[i])) {
+    out[i] = { ...out[i], env: handoffEnv(out[i].env, cur, token, true) };
+    return out;
+  }
+  const options = { env: handoffEnv(undefined, cur, token, true) };
+  if (i === 1) {
+    if (out.length > 1 && out[1] == null) out[1] = [];
+    else out.splice(1, 0, []);
+    i = 2;
+  }
+  if (out[i] == null) out[i] = options;
+  else out.splice(i, 0, options);
+  return out;
+}
+
+// The shared Worker guard of section 5.7. Every Worker and every child that
+// outlives the call that started it, and that the hook marked partial for a
+// test file, stays here until it exits. With isolate: false, a Worker one test
+// file started and a later file reused recorded the later file's reads against
+// the first file, and the later file looked complete with those reads missing.
+// So a test file that runs while another file's Worker or child is alive, or
+// posts to such a Worker, is partial.
+const live = new Set();
+const watched = new WeakSet();
+
+function sharedCheck() {
+  if (live.size === 0) return;
+  const cur = vitestOwner();
   if (cur === null) return;
+  for (const entry of live) {
+    if (entry.owner !== cur.owner) {
+      writers().trace.write(formatTraceLine('partial', cur.owner, 'shared worker'));
+      return;
+    }
+  }
+}
+
+function quietly(fn) {
+  if (busy) return fn();
+  busy = true;
+  try {
+    return fn();
+  } finally {
+    busy = false;
+  }
+}
+
+// vitest 2 to 5 assign the next test file to `filepath` of one state object, so
+// a setter there sees each change of file. A state object vitest replaces, or
+// one whose filepath cannot be redefined, is still checked at each traced call
+// and at each postMessage to a live Worker.
+function watchState() {
+  const state = globalThis.__vitest_worker__;
+  if (typeof state !== 'object' || state === null || watched.has(state)) return;
+  watched.add(state);
+  const d = Object.getOwnPropertyDescriptor(state, 'filepath');
+  if (d === undefined ? !Object.isExtensible(state) : !d.configurable || !('value' in d)) return;
+  let file = d?.value;
+  Object.defineProperty(state, 'filepath', {
+    configurable: true,
+    enumerable: d?.enumerable ?? true,
+    get: () => file,
+    set: (value) => {
+      file = value;
+      quietly(sharedCheck);
+    },
+  });
+}
+
+function track(handle, owner, worker) {
+  if (!worker && handle?.pid === undefined) return;
+  const entry = { owner };
+  live.add(entry);
+  handle.once('exit', () => live.delete(entry));
+  quietly(watchState);
+  if (worker) {
+    const post = handle.postMessage;
+    handle.postMessage = function (...args) {
+      quietly(() => {
+        watchState();
+        sharedCheck();
+      });
+      return Reflect.apply(post, this, args);
+    };
+  }
+}
+
+// A record of a child or a Worker returns the arguments the call runs with and
+// what to do with what it returns; every other record returns undefined.
+function record(kind, target) {
+  if (live.size > 0) {
+    watchState();
+    sharedCheck();
+  }
+  const cur = current();
+  if (cur === null) return undefined;
   const w = writers();
-  if (kind === 'partial') {
-    w.trace.write(formatTraceLine('partial', cur.owner, target));
-    return;
+  if (kind === 'worker') {
+    const [file, given, ...rest] = target;
+    const options = isOptions(given) ? given : {};
+    const started = (worker) => track(worker, cur.owner, true);
+    // An eval Worker does not load the hook, and a SHARE_ENV Worker has no
+    // environment of its own to carry the handoff (section 5.7).
+    if (options.eval || options.env === workerThreads.SHARE_ENV) {
+      w.trace.write(formatTraceLine('partial', cur.owner, 'worker_threads'));
+      return { args: target, started };
+    }
+    const token = newToken();
+    w.trace.write(tokenLine('partial', cur.owner, 'worker_threads', token));
+    return { args: [file, { ...options, env: handoffEnv(options.env, cur, token, false) }, ...rest], started };
   }
   if (kind === 'child') {
-    if (childMayRead(cur.root, target.name, target.args)) {
-      w.trace.write(formatTraceLine('partial', cur.owner, 'child_process'));
+    if (!childMayRead(cur.root, target.name, target.args)) return undefined;
+    const started = target.name.endsWith('Sync') ? null : (child) => track(child, cur.owner, false);
+    if (isNodeChild(target.name, target.args)) {
+      const token = newToken();
+      w.trace.write(tokenLine('partial', cur.owner, 'child_process', token));
+      return { args: withHandoff(target.args, cur, token), started };
     }
-    return;
+    w.trace.write(formatTraceLine('partial', cur.owner, 'child_process'));
+    return { args: target.args, started };
   }
   const abs = toAbs(target);
   if (abs === null) return;
@@ -254,18 +485,23 @@ function wrap(obj, name, kind, argOf = (args) => args[0]) {
   const orig = obj[name];
   if (typeof orig !== 'function') return;
   const wrapped = function (...args) {
+    let call = args;
+    let started = null;
     if (!busy) {
       const target = argOf(args);
       if (target !== undefined) {
         busy = true;
         try {
-          record(kind, target);
+          const handoff = record(kind, target);
+          if (handoff !== undefined) ({ args: call, started } = handoff);
         } finally {
           busy = false;
         }
       }
     }
-    return new.target ? Reflect.construct(orig, args, new.target) : Reflect.apply(orig, this, args);
+    const result = new.target ? Reflect.construct(orig, call, new.target) : Reflect.apply(orig, this, call);
+    if (started !== null) started(result);
+    return result;
   };
   Object.defineProperties(wrapped, Object.getOwnPropertyDescriptors(orig));
   obj[name] = wrapped;
@@ -302,7 +538,10 @@ if (TRACE_DIR) {
   for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
     wrap(childProcess, name, 'child', (args) => ({ name, args }));
   }
-  wrap(workerThreads, 'Worker', 'partial', () => 'worker_threads');
+  wrap(workerThreads, 'Worker', 'worker', (args) => args);
+  // Section 5.7, step 3: confirm at load, never at exit, because a Worker's
+  // exit handler does not run on terminate().
+  if (handed !== null) writers().trace.write(tokenLine('covered', handed.owner, handed.token));
   // An ESM `import { readFileSync } from 'node:fs'` binds the export as it was
   // when the module loaded. This copies the wrappers into those bindings.
   syncBuiltinESMExports();

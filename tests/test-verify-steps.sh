@@ -93,8 +93,8 @@ echo "step $name output"
 exit "${!var:-0}"
 STEP
 
-# A checkout with only .devbox/ files and its sources: config.env with no
-# DEVBOX_VERIFY, and a three-step .devbox/steps. The lock file is a shared input.
+# A checkout with only .devbox/ files and its sources: config.env and a
+# three-step .devbox/steps. The lock file is a shared input.
 new_checkout() {
   local co="$1"
   mkdir -p "$co/.devbox" "$co/src" "$co/types" "$co/tests"
@@ -204,15 +204,14 @@ assert_eq "fail 5 full" "$(step_line "$RED" typecheck)" "D10: the record keeps e
 assert_ok "D10: devbox result --log lint prints that step's section" \
   contains "step lint output" "$(result --log lint)"
 assert_ok "D10: devbox result prints the red verdict" contains "devbox: red (lint failed; typecheck failed)" "$(result)"
-# A project that has not moved to .devbox/steps: DEVBOX_VERIFY is one step, and
-# its code is the run's, as it was before.
+# The one step a DEVBOX_VERIFY gate became, now written in .devbox/steps: its
+# code is the run's, as it was before.
 COMPAT="$TMP/compat"
 new_checkout "$COMPAT"
-rm "$COMPAT/.devbox/steps"
-printf 'DEVBOX_VERIFY=bash %s verify\n' "$TMP/step.sh" >>"$COMPAT/.devbox/config.env"
+printf 'verify -- bash %s verify\n' "$TMP/step.sh" >"$COMPAT/.devbox/steps"
 cp "$CO/.devbox.env" "$COMPAT/.devbox.env"
 IN="$COMPAT" FAKE_RC_verify=3 verify --target lan1
-assert_eq "3" "$rc" "exit code: a DEVBOX_VERIFY that exits 3 makes devbox verify exit 3"
+assert_eq "3" "$rc" "exit code: a one-step gate that exits 3 makes devbox verify exit 3"
 assert_ok "exit code: its output streams as it did, one step alone" grep -qx 'step verify output' <<<"$out"
 assert_eq "fail 3 full" "$(IN="$COMPAT"; step_line "$(newest_record)" verify)" "exit code: the record names the step verify"
 rc=0
@@ -220,12 +219,43 @@ out="$(cd "$COMPAT" && env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DI
   DEVBOX_LOCK_WAIT=30 DEVBOX_STRICT=1 FAKE_RC_verify=3 bash "$REPO/client/libexec/devbox-verify" --target lan1 2>&1)" || rc=$?
 assert_eq "3" "$rc" "exit code: under DEVBOX_STRICT=1 the gate's own 3 passes unmapped"
 IN="$COMPAT" verify --target lan1
-assert_eq "0" "$rc" "exit code: the same DEVBOX_VERIFY passing exits 0"
-printf 'DEVBOX_VERIFY=bash %s verify\n' "$TMP/step.sh" >>"$CO/.devbox/config.env"
-verify --target lan1 --plan
-assert_eq "1" "$(grep -c 'DEVBOX_VERIFY in .* does not run' <<<"$out")" "both set: one line says .devbox/steps is the gate"
-assert_ok "both set: the plan holds the three steps of the file" test "$(grep -cE '^(lint|typecheck|test)  ' <<<"$out")" = 3
-sed -i '/^DEVBOX_VERIFY=/d' "$CO/.devbox/config.env"
+assert_eq "0" "$rc" "exit code: the same step passing exits 0"
+
+# ═══ R7: release 4.0 refuses the older keys on every path ════════════════════
+#
+# A refused line in .devbox/config.env stops verify, its plan, --local and
+# devbox run with exit 2 before any target is asked. select= in .devbox/steps
+# stops every path that reads the steps: verify, its plan, --local and devbox
+# ci matrix. devbox run runs one command and reads no steps file. Each line
+# names what replaces the key.
+refused_everywhere() {  # $1 the description, $2 the text the refusal holds, then the argument lists
+  local desc="$1" text="$2" args
+  shift 2
+  for args in "$@"; do
+    # shellcheck disable=SC2086  # each entry is a list of words
+    verify $args
+    assert_eq "2" "$rc" "R7: $desc: verify $args exits 2"
+    assert_ok "R7: $desc: verify $args names the replacement" contains "$text" "$out"
+    assert_eq "" "$(cat "$SSH_LOG")" "R7: $desc: verify $args asks no target"
+    assert_eq "" "$(ran)" "R7: $desc: verify $args runs no step"
+  done
+}
+cp "$CO/.devbox/config.env" "$TMP/config.good"
+for line in 'DEVBOX_VERIFY=npm run verify' 'DEVBOX_NEEDS_POSTGRES=1' 'DEVBOX_DB_URL_VAR=APP_DB'; do
+  printf '%s\n' "$line" >>"$CO/.devbox/config.env"
+  refused_everywhere "$line" "${line%%=*} is no longer read. " "--target lan1" "--plan" "--local" "--run -- true"
+  cp "$TMP/config.good" "$CO/.devbox/config.env"
+done
+cp "$CO/.devbox/steps" "$TMP/steps.good"
+printf 'more runner=vitest select=related -- npx vitest run\n' >>"$CO/.devbox/steps"
+refused_everywhere "select=related" \
+  "devbox verify: .devbox/steps line 5: select=related is no longer read, because every runner step selects its test files by what they read; remove it" \
+  "--target lan1" "--plan" "--local"
+rc=0
+out="$(cd "$CO" && bash "$REPO/client/libexec/devbox-ci" matrix 2>&1)" || rc=$?
+assert_eq "2" "$rc" "R7: select=related: devbox ci matrix exits 2"
+assert_ok "R7: select=related: devbox ci matrix names the line" contains ".devbox/steps line 5: select=related is no longer read" "$out"
+cp "$TMP/steps.good" "$CO/.devbox/steps"
 
 # ═══ R2: --step writes a partial record and never prints green ═══════════════
 printf 'three\n' >"$CO/src/a.ts"
@@ -284,9 +314,15 @@ assert_ok "D11: all three steps" test "$(wc -l <"$STEP_LOG" | tr -d ' ')" = 3
 sed -i 's/^DEVBOX_LOCAL_GATE=ci$/DEVBOX_LOCAL_GATE=never/' "$SOLO/.devbox/config.env"
 IN="$SOLO" verify --local
 assert_eq "2" "$rc" "D11: DEVBOX_LOCAL_GATE=never refuses --local too"
+sed -i 's/^DEVBOX_LOCAL_GATE=never$/DEVBOX_LOCAL_GATE=always/' "$SOLO/.devbox/config.env"
+IN="$SOLO" verify --full
+assert_eq "0" "$rc" "D11: DEVBOX_LOCAL_GATE=always runs the gate here as release 3 did"
 sed -i '/^DEVBOX_LOCAL_GATE=/d' "$SOLO/.devbox/config.env"
 IN="$SOLO" verify --full
-assert_eq "0" "$rc" "D11: the default, always, runs the gate here as release 1 did"
+assert_eq "2" "$rc" "D11: the default since release 4.0, ci, refuses a gate here with no CI and no --local"
+assert_ok "D11: and its line names the key and the way out" contains "DEVBOX_LOCAL_GATE=ci refuses a gate on this machine" "$out"
+IN="$SOLO" CI=true verify --full
+assert_eq "0" "$rc" "D11: the default runs the gate here when CI is set"
 
 # ═══ D2 end to end: a broken .devbox/steps is refused before any host ════════
 cp "$CO/.devbox/steps" "$TMP/steps.good"

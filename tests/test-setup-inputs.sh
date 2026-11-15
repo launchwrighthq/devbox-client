@@ -28,7 +28,6 @@ KEY="$DEVBOX_SETUP_KEY_DIR/app.key"
 LOG="$TMP/setup.log"
 export LOG
 DEVBOX_PROJECT=app
-DEVBOX_VERIFY=:
 DEVBOX_ENVIRONMENT=
 # The setup counts its runs in $LOG and makes the outputs a real one makes.
 # The setup text is the project's, expanded by the workspace bash, never here.
@@ -187,12 +186,12 @@ assert_eq "" "$(cd "$WS" && DEVBOX_SETUP_INPUTS=adir devbox_hooks_script 2>/dev/
 # ── no inputs: the text is today's, byte for byte ────────────────────────────
 #
 # A host and a test that read the hooks see no change unless a project sets
-# DEVBOX_SETUP_INPUTS. This is the text the function printed before the skip.
+# DEVBOX_SETUP_INPUTS, calls devbox_install_locks or holds a lock file below its
+# root. This is the text the function printed before the skip.
 DEVBOX_ENVIRONMENT='export A=1'
 DEVBOX_PROVISION='apt-get install -y x'
 DEVBOX_SETUP='npm ci'
-DEVBOX_VERIFY='npm test'
-want="$(printf 'devbox_environment() {\nexport A=1\n}\ndevbox_provision() {\napt-get install -y x\n}\ndevbox_setup() {\nnpm ci\n}\ndevbox_verify() {\nnpm test\n}\n')"
+want="$(printf 'devbox_environment() {\nexport A=1\n}\ndevbox_provision() {\napt-get install -y x\n}\ndevbox_setup() {\nnpm ci\n}\ndevbox_verify() {\necho "devbox: no step plan reached the workspace, so nothing ran" >&2\nreturn 2\n}\n')"
 assert_eq "$want" "$(DEVBOX_SETUP_INPUTS='' devbox_hooks_script)" "with DEVBOX_SETUP_INPUTS empty the hooks are today's text"
 assert_eq "$want" "$(unset DEVBOX_SETUP_INPUTS; devbox_hooks_script)" "and with it unset"
 assert_fail "and they name no key directory" contains "$DEVBOX_SETUP_KEY_DIR" "$(DEVBOX_SETUP_INPUTS='' devbox_hooks_script)"
@@ -212,5 +211,85 @@ before="$(runs)"
 out="$(setup_run)"
 assert_eq "$before" "$(runs)" "a uv.lock the inputs do not name asks for no .venv/, so the setup skips"
 assert_eq "==> setup: skipped, package-lock.json unchanged since the last setup here" "$out" "and says so"
+
+# ── no DEVBOX_SETUP: the client installs the lock files ─────────────────────
+#
+# Every project wrote `uv sync` and `npm ci` beside each lock file in a setup
+# of its own. A checkout with app/uv.lock and web/package-lock.json, a third
+# lock file under node_modules/ that is never installed, and stubs of uv and
+# npm that log their arguments and make the outputs a real install makes.
+CO="$TMP/checkout"
+mkdir -p "$CO/.devbox" "$CO/app" "$CO/web/node_modules/dep" "$TMP/bin"
+printf 'DEVBOX_PROJECT=app\n' >"$CO/.devbox/config.env"
+printf 'verify -- :\n' >"$CO/.devbox/steps"
+printf 'version = 1\n' >"$CO/app/uv.lock"
+printf '{"lockfileVersion": 3}\n' >"$CO/web/package-lock.json"
+printf '{"lockfileVersion": 3}\n' >"$CO/web/node_modules/dep/package-lock.json"
+git -C "$CO" init -q
+git -C "$CO" add -f .devbox/config.env app/uv.lock web/package-lock.json web/node_modules/dep/package-lock.json
+# The stubs' text is expanded by the bash that runs them, never here.
+# shellcheck disable=SC2016
+printf '#!/bin/bash\necho "uv $*" >>"$LOG"\nmkdir -p "${5:-.}/.venv"\n' >"$TMP/bin/uv"
+# shellcheck disable=SC2016
+printf '#!/bin/bash\necho "npm $*" >>"$LOG"\nmkdir -p "${3:-.}/node_modules"\n' >"$TMP/bin/npm"
+chmod +x "$TMP/bin/uv" "$TMP/bin/npm"
+rm -f "$LOG"
+DEVBOX_SETUP_KEY_DIR="$TMP/co-home/.devbox/setup"
+default_load() {  # prints DEVBOX_SETUP|DEVBOX_SETUP_INPUTS after a load in $CO
+  (cd "$CO" && unset DEVBOX_SETUP DEVBOX_SETUP_INPUTS && devbox_config_load &&
+    printf '%s|%s' "$DEVBOX_SETUP" "$DEVBOX_SETUP_INPUTS")
+}
+default_run() {
+  local hooks
+  hooks="$(cd "$CO" && unset DEVBOX_SETUP DEVBOX_SETUP_INPUTS && devbox_config_load && devbox_hooks_script)" || return 99
+  (cd "$CO" && printf '%s\n' "$hooks" | PATH="$TMP/bin:$PATH" bash -c 'set -e'$'\n''eval "$(cat)" && devbox_environment && devbox_setup' 2>&1)
+}
+assert_eq "devbox_install_locks|app/uv.lock web/package-lock.json" "$(default_load)" \
+  "a config with no DEVBOX_SETUP installs its lock files, and keys the skip on them"
+out="$(default_run)"; rc=$?
+assert_eq "0" "$rc" "the default setup passes"
+assert_eq "uv sync --locked --all-packages --directory app
+npm ci --prefix web --no-audit --no-fund" "$(cat "$LOG")" \
+  "and runs uv sync in app/ and npm ci in web/, and nothing under node_modules/"
+assert_ok "and names each install" contains "==> setup: uv sync --locked --all-packages in app/" "$out"
+out="$(default_run)"
+assert_eq "==> setup: skipped, app/uv.lock web/package-lock.json unchanged since the last setup here" "$out" \
+  "an unchanged checkout skips the default setup"
+
+# ── a .venv symlink below the root is removed before the setup ──────────────
+rm -rf "$CO/app/.venv"
+ln -s /nonexistent/laptop/venv "$CO/app/.venv"
+rm -f "$LOG"
+default_run >/dev/null
+assert_fail "a .venv symlink in a lock file's folder is removed" test -L "$CO/app/.venv"
+assert_ok "and the setup builds a real one, because the skip saw no output" test -d "$CO/app/.venv"
+assert_ok "with uv sync" grep -qx "uv sync --locked --all-packages --directory app" "$LOG"
+
+# ── a project's own setup keeps its text, and gains the repair ──────────────
+hooks="$(cd "$CO" && DEVBOX_SETUP='make deps' DEVBOX_SETUP_INPUTS='' devbox_hooks_script)"
+assert_ok "a project's own setup keeps its command" contains $'_devbox_repair_links\nmake deps\n}' "$hooks"
+assert_fail "and gets no install function it does not call" contains "devbox_install_locks()" "$hooks"
+hooks="$(cd "$CO" && DEVBOX_SETUP='devbox_install_locks && make models' DEVBOX_SETUP_INPUTS='' \
+  DEVBOX_SETUP_LOCKS=$'app/uv.lock\n' devbox_hooks_script)"
+assert_ok "a setup that composes the install gets it" contains "_devbox_install_lock app/uv.lock || return" "$hooks"
+rc=0
+(cd "$CO" && unset DEVBOX_SETUP_LOCKS && DEVBOX_SETUP=devbox_install_locks devbox_hooks_script) >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$rc" "an install whose lock files no config load listed is refused"
+
+# ── DEVBOX_SETUP_INPUTS chooses the lock files the default installs ─────────
+# A project may track a lock file its setup never installed.
+printf 'DEVBOX_PROJECT=app\nDEVBOX_SETUP_INPUTS=app/uv.lock\n' >"$CO/.devbox/config.env"
+rm -f "$LOG"
+default_run >/dev/null
+assert_eq "uv sync --locked --all-packages --directory app" "$(cat "$LOG")" \
+  "a lock file DEVBOX_SETUP_INPUTS names is installed, and one it does not name is not"
+printf 'DEVBOX_PROJECT=app\n' >"$CO/.devbox/config.env"
+
+# ── a pnpm or yarn lock file refuses the default ────────────────────────────
+printf 'lockfileVersion: 9\n' >"$CO/pnpm-lock.yaml"
+git -C "$CO" add pnpm-lock.yaml
+err="$(default_load 2>&1)"; rc=$?
+assert_eq "2" "$rc" "a pnpm-lock.yaml with no DEVBOX_SETUP is refused"
+assert_ok "and the refusal names the file" contains "pnpm-lock.yaml needs a DEVBOX_SETUP" "$err"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

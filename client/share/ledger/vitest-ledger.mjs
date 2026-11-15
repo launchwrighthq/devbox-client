@@ -29,7 +29,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  FileRecorder, TraceWriter, excludePatterns, findProjectRoot, graphTraceLines, moduleIdPath,
+  FileRecorder, TraceBlockWriter, excludePatterns, findProjectRoot, graphTraceLines, moduleIdPath,
   readModuleReads, traceFileName, traceRoot,
 } from './ledger-core.mjs';
 
@@ -201,16 +201,28 @@ function projectEntries(ctx, project) {
   return out;
 }
 
+// One test file at a time, with the lines of every project that ran it in one
+// set, so each line is written once and no set outlives its test file.
 function writeGraph(ctx, dir, runs) {
   const root = traceRoot(ctx?.config?.root ?? process.cwd());
-  const writer = new TraceWriter(path.join(dir, traceFileName('vitest', process.pid, 0)));
   const moduleReads = readModuleReads(dir);
+  const byFile = new Map();
   for (const [file, project] of runs) {
     if (typeof file !== 'string' || file === '') continue;
-    const graph = viteOf(project ?? ctx)?.moduleGraph ?? viteOf(ctx)?.moduleGraph;
-    const lines = graphTraceLines({
-      root, testFile: path.resolve(file), entries: projectEntries(ctx, project), importedOf: importedOf(graph), moduleReads,
-    });
-    for (const line of lines) writer.write(line);
+    const abs = path.resolve(file);
+    if (!byFile.has(abs)) byFile.set(abs, []);
+    byFile.get(abs).push(project);
   }
+  const writer = new TraceBlockWriter(path.join(dir, traceFileName('vitest', process.pid, 0)));
+  for (const [testFile, projects] of byFile) {
+    const lines = new Set();
+    for (const project of projects) {
+      const graph = viteOf(project ?? ctx)?.moduleGraph ?? viteOf(ctx)?.moduleGraph;
+      for (const line of graphTraceLines({
+        root, testFile, entries: projectEntries(ctx, project), importedOf: importedOf(graph), moduleReads,
+      })) lines.add(line);
+    }
+    for (const line of lines) writer.add(line);
+  }
+  writer.close();
 }
