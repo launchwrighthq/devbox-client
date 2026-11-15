@@ -18,12 +18,21 @@
 #   target    <target name, or local>
 #   scope     full | partial
 #   complete  1 | 0
-#   step      <name>  <key>  pass | fail | carried  <seconds>  <code>  full | narrowed | related
-#   file      <step>  <runner>  <path>  pass | fail | open
+#   step      <name>  <key>  pass | fail | carried  <seconds>  <code>  <mode>
+#   file      <step>  <runner>  <path>  pass | fail | open  <seconds or ->
+#
+# The mode is `full`, `narrowed`, `related` (3.3 records only), `selected` or
+# `shard`. `selected` is a run of the test files the map selected, and a
+# carried step whose plan said `no test read a changed file`
+# (docs/specs/2026-11-14-learned-selection-design.md, D2 and D3). `shard` is
+# one shard of `--step <name> --shard <i>/<n>`: it ran a part of the step's
+# test files by design, so no carry, narrow or selection ever reads it.
 #
 # A `file` line is `open` when the ledger holds the file's `start` and no end:
 # the gate ended while that file ran. Section 6.4 refuses to narrow such a step,
-# because the open file's result is unknown.
+# because the open file's result is unknown. Its seconds come from the ledger,
+# for the shard balance of D10; a 3.3 record has no such field, and reads as a
+# file of unknown duration.
 #
 # Beside each `<run-id>.record` lie `<run-id>.files`, the manifest of the files
 # that run hashed, and `<run-id>.log`, the gate output the client saved. Only a
@@ -122,32 +131,54 @@ devbox_record_prune() {
 # Print the run id of the newest complete record in which step $1 passed under
 # the key $2. A `carried` step passed under that key in an earlier run, so it
 # answers too, and keeps a key alive after the run that first passed it is
-# pruned.
+# pruned. A shard ran a part of the step's files, so it never answers: a full
+# gate that carried from one shard's pass would skip every other shard.
 devbox_record_find_pass() {
   # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
   RECORD_STEP="$1" RECORD_KEY="$2" _devbox_record_query '
     function begin() { hit = 0 }
-    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && $3 == ENVIRON["RECORD_KEY"] && ($4 == "pass" || $4 == "carried") { hit = 1 }
+    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && $3 == ENVIRON["RECORD_KEY"] && ($4 == "pass" || $4 == "carried") && $7 != "shard" { hit = 1 }
     function done() { if (complete == "1" && hit) print at "\t" run }'
 }
 
 # Print `<run-id> <outcome> <code>` of step $1's newest result in a complete
-# record.
+# record, a shard's left out.
 devbox_record_last_of() {
   # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
   RECORD_STEP="$1" _devbox_record_query '
     function begin() { res = "" }
-    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] { res = $4 " " $6 }
+    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && $7 != "shard" { res = $4 " " $6 }
     function done() { if (complete == "1" && res != "") print at "\t" run " " res }'
 }
 
-# Print the run id of step $1's newest pass in a complete record, under any key.
+# Print the run id of step $1's newest pass in a complete record, under any key,
+# a shard's left out.
 devbox_record_last_pass_of() {
   # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
   RECORD_STEP="$1" _devbox_record_query '
     function begin() { hit = 0 }
-    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && ($4 == "pass" || $4 == "carried") { hit = 1 }
+    $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && ($4 == "pass" || $4 == "carried") && $7 != "shard" { hit = 1 }
     function done() { if (complete == "1" && hit) print at "\t" run }'
+}
+
+# Print `<path>\t<seconds>` for each test file of step $1 that some record
+# timed, the newest record's seconds for each, in path order. A record of any
+# completeness counts: a duration is a weight for the shard split of D10, never
+# a result. A 3.3 record's file lines carry no seconds, and add nothing.
+devbox_record_durations() {
+  local dir
+  local -a files
+  dir="$(devbox_record_dir)" || return 1
+  [ -d "$dir" ] || return 0
+  files=("$dir"/*.record)
+  [ -e "${files[0]}" ] || return 0
+  # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
+  RECORD_STEP="$1" awk -F'\t' "$_DEVBOX_RECORD_AWK_HEAD"'
+    function begin() { n = 0 }
+    $1 == "file" && $2 == ENVIRON["RECORD_STEP"] && $6 ~ /^[0-9]+$/ { n++; p[n] = $4; s[n] = $6 }
+    function done() { for (i = 1; i <= n; i++) print p[i] "\t" at "\t" s[i] }' "${files[@]}" \
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2nr \
+    | awk -F'\t' '$1 != last { print $1 "\t" $3; last = $1 }'
 }
 
 # Print the paths of run $1's file lines for step $2 whose outcome is $3, one

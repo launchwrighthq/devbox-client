@@ -1,0 +1,424 @@
+#!/bin/bash
+# The services a project declares in DEVBOX_SERVICES: postgres, redis, rabbitmq
+# and minio (docs/specs/2026-11-14-learned-selection-design.md, D8 and section
+# 8). Sourced by devbox-config when a gate declares a service, after
+# lib/devbox-lib.sh; it reads the slots and names devbox-config defines.
+# shellcheck shell=bash
+#
+# Projects each carried a script that installed a broker or an object
+# store, polled it until it answered, and made the run's own vhost or bucket,
+# and one of them ran it as a `services` step. A carried plan skipped that
+# step, so the next step met a stopped server. A service here is never a step:
+# the hooks script starts it before the first step of every gate that runs a
+# step.
+#
+# Two halves:
+#   devbox_services_hook <run-id>
+#       prints the shell text that defines devbox_services in a workspace.
+#       The step runner's devbox_verify calls it before the runner starts.
+#   devbox_services_local_up <run-id> / devbox_services_local_down <run-id>
+#       start and stop the docker containers of `--local` and CI, on this
+#       machine, and export the same variables.
+
+# The images of `--local` and CI. postgres and rabbitmq are the images a host
+# runs (server/install.sh), so a laptop gate meets the server a target gives.
+# The official MinIO images and binaries are no longer published: dl.min.io
+# answers 410 and the registry refuses the pull, MEASURED 2026-11-14. The
+# image and server/workspace/features/minio.Dockerfile both take the
+# pgsty/minio fork at one release.
+DEVBOX_SERVICES_IMAGE_POSTGRES=pgvector/pgvector:pg16
+DEVBOX_SERVICES_IMAGE_REDIS=redis:8.0
+DEVBOX_SERVICES_IMAGE_RABBITMQ=rabbitmq:4.3-management
+DEVBOX_SERVICES_IMAGE_MINIO=pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+
+# The vhost and the bucket of a run: the run id with its dot as a dash, because
+# a bucket name with a dot breaks virtual-host addressing in an S3 client.
+devbox_services_run_name() {
+  printf 'devbox-run-%s\n' "${1/./-}"
+}
+
+# ── the workspace half ───────────────────────────────────────────────────────
+#
+# The functions below run in a workspace, never on this machine:
+# devbox_services_hook prints them with `declare -f`, so their text is checked
+# here by shellcheck and crosses as code nobody wrote twice. The local half
+# calls _devbox_services_wait and _devbox_services_s3 itself.
+
+# Run "$@" until it answers: at most 60 s and 60 tries, one second apart. The
+# try count bounds a probe that answers fast; the clock bounds one that hangs
+# until its own timeout. $1 is the service the message names.
+_devbox_services_wait() {
+  local name="$1" n=0 end=$((SECONDS + 60))
+  shift
+  until "$@"; do
+    n=$((n + 1))
+    if [ "$n" -ge 60 ] || [ "$SECONDS" -ge "$end" ]; then
+      echo "devbox verify: service $name did not answer in 60 s" >&2
+      return 3
+    fi
+    sleep 1
+  done
+}
+
+# One signed S3 request with curl's own SigV4: $1 the endpoint, $2 the access
+# key, $3 the secret, $4 the method, $5 the bucket. The keys cross on curl's
+# stdin as a config line, so no argv holds them. A workspace image holds no
+# S3 client of its own. curl stays quiet: a refused try while the server
+# starts is the wait, and _devbox_services_wait names a server that never
+# answers.
+_devbox_services_s3() {
+  printf 'user = "%s:%s"\n' "$2" "$3" |
+    curl -fs --max-time 5 -o /dev/null -K - --aws-sigv4 'aws:amz:us-east-1:s3' -X "$4" "$1/$5"
+}
+
+# The broker's management API, as guest: $1 the method, $2 the path, the rest
+# curl's. guest is RabbitMQ's published default, which install.sh opens to the
+# devbox network, so it is no secret.
+_devbox_services_rabbit_api() {
+  local method="$1" path="$2"
+  shift 2
+  curl -fs --max-time 5 -o /dev/null -u guest:guest -X "$method" "$@" "http://127.0.0.1:15672/api/$path"  # RabbitMQ's published default: gitleaks:allow
+}
+
+_devbox_services_pg_ready() {
+  timeout 5 pg_isready -q -t 4 -h "$1" -p "$2"
+}
+
+_devbox_services_redis_ping() {
+  [ "$(timeout 5 redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null)" = PONG ]
+}
+
+# The end of a run: the vhost goes, and the MinIO of this run stops and its
+# data directory goes, with the bucket in it. One gate runs in a workspace at a
+# time, under its lane's lock, so the MinIO here is this run's.
+_devbox_services_cleanup() {
+  if [ -n "${_devbox_services_vhost:-}" ]; then
+    _devbox_services_rabbit_api DELETE "vhosts/$_devbox_services_vhost" ||
+      echo "devbox: could not delete the vhost $_devbox_services_vhost" >&2
+  fi
+  if [ -n "${_devbox_services_minio_dir:-}" ]; then
+    # 1 is "no process matched": a MinIO that died needs no stop.
+    pkill -x minio || [ "$?" = 1 ] || echo "devbox: could not stop this run's minio" >&2
+    rm -rf -- "$_devbox_services_minio_dir" || echo "devbox: could not remove $_devbox_services_minio_dir" >&2
+  fi
+}
+
+# Run the cleanup once the gate process is gone. devbox_verify ends in exec,
+# so the gate's pid becomes the step runner's, and no EXIT trap of this shell
+# survives it. The watcher ignores the signals a stop sends the gate's process
+# group, and writes to no stream of the gate: ssh waits for every holder of
+# the gate's output to close it. Its output goes nowhere, because a vhost
+# whose delete failed is removed by `devbox-runner gc-vhosts` after
+# DEVBOX_VHOST_IDLE_HOURS, and the next gate here stops a MinIO left behind.
+_devbox_services_cleanup_arm() {
+  local gate="$BASHPID"
+  (
+    trap '' TERM HUP INT
+    while kill -0 "$gate" 2>/dev/null; do sleep 2; done
+    _devbox_services_cleanup
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+# Start this run's MinIO with fresh keys and an empty data directory. A MinIO
+# that a killed run left carries that run's keys, so it is stopped first.
+_devbox_services_minio_start() {
+  local n=0
+  if ! command -v minio >/dev/null; then
+    echo "devbox verify: service minio: this workspace has no minio binary, so the host's image lacks the minio feature" >&2
+    return 3
+  fi
+  # 1 is "no process matched", the usual case.
+  pkill -x minio || [ "$?" = 1 ] || return 3
+  while pgrep -x minio >/dev/null && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+  rm -rf -- "$_devbox_services_minio_dir" && mkdir -p -- "$_devbox_services_minio_dir" || return 3
+  # Random keys per run, in the environment and never in an argv. The server
+  # listens on the workspace's loopback alone.
+  _devbox_services_minio_key="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" || return 3
+  _devbox_services_minio_secret="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')" || return 3
+  MINIO_ROOT_USER="$_devbox_services_minio_key" MINIO_ROOT_PASSWORD="$_devbox_services_minio_secret" \
+    MINIO_BROWSER=off setsid minio server --quiet --address 127.0.0.1:9000 \
+    "$_devbox_services_minio_dir/data" </dev/null >"$_devbox_services_minio_dir.log" 2>&1 &
+}
+
+# The body of devbox_services in a workspace. Each declared service is
+# reached or started, waited for, given the run's own vhost or bucket, and
+# exported under its name. Returns 3 with the service named when one fails.
+# shellcheck disable=SC2154  # _devbox_services_want, _run and _var_* are lines devbox_services_hook prints before this function
+_devbox_services_up() {
+  local s url rest host port v
+  _devbox_services_vhost=""
+  _devbox_services_minio_dir=""
+  # The names first, and one watcher for both, armed before anything is made:
+  # a service that fails after the vhost exists still ends the gate.
+  case " $_devbox_services_want " in *" rabbitmq "*)
+    _devbox_services_vhost="$(devbox_services_run_name "$_devbox_services_run")" ;;
+  esac
+  case " $_devbox_services_want " in *" minio "*)
+    _devbox_services_minio_dir="${TMPDIR:-/tmp}/devbox-minio" ;;
+  esac
+  [ -z "$_devbox_services_vhost$_devbox_services_minio_dir" ] || _devbox_services_cleanup_arm
+  for s in $_devbox_services_want; do
+    v="_devbox_services_var_$s"
+    v="${!v}"
+    case "$s" in
+      postgres)
+        # The host's shared server. The DSN arrives in the gate's
+        # environment, from ensure-workspace on a target and from
+        # devbox-runpod-postgres on a pod. pg_isready takes the host and port
+        # alone, because the DSN holds the role's password.
+        url="${!v:-}"
+        if [ -z "$url" ]; then
+          echo "devbox verify: service postgres: the gate's environment has no $v, so this target gave the run no database" >&2
+          return 3
+        fi
+        if ! command -v pg_isready >/dev/null; then
+          echo "devbox verify: service postgres: this workspace has no pg_isready, so the host's image lacks the postgres-client feature" >&2
+          return 3
+        fi
+        rest="${url#*://}"; rest="${rest%%/*}"; rest="${rest%%\?*}"; rest="${rest##*@}"
+        host="${rest%:*}"; port="${rest##*:}"
+        [ "$host" != "$rest" ] || port=5432
+        _devbox_services_wait postgres _devbox_services_pg_ready "$host" "$port" || return 3
+        export "${v?}" ;;
+      redis)
+        # ensure-workspace starts it with these arguments. Started here too,
+        # for a server that died since and for a target that starts none.
+        if ! pgrep -x redis-server >/dev/null; then
+          if ! command -v redis-server >/dev/null; then
+            echo "devbox verify: service redis: this workspace has no redis-server, so the host's image lacks the redis feature" >&2
+            return 3
+          fi
+          redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no \
+            --maxmemory-policy noeviction --maxmemory 1gb --daemonize yes >/dev/null || return 3
+        fi
+        _devbox_services_wait redis _devbox_services_redis_ping || return 3
+        export "$v=redis://127.0.0.1:6379" ;;
+      rabbitmq)
+        # The host's shared broker, which ensure-workspace forwards to
+        # 127.0.0.1:5672 and the management API to 127.0.0.1:15672. Every
+        # workspace reached the same default vhost, and two runs that purge
+        # fixed queue names failed each other's tests (README.md, "One broker
+        # means one namespace"). The run's own vhost closes that. The PUT is
+        # the wait: it answers once the broker does.
+        _devbox_services_wait rabbitmq _devbox_services_rabbit_api PUT "vhosts/$_devbox_services_vhost" || return 3
+        if ! _devbox_services_rabbit_api PUT "permissions/$_devbox_services_vhost/guest" \
+          -H 'content-type: application/json' -d '{"configure":".*","write":".*","read":".*"}'; then
+          echo "devbox verify: service rabbitmq did not grant guest the vhost $_devbox_services_vhost" >&2
+          return 3
+        fi
+        export "$v=amqp://guest:guest@127.0.0.1:5672/$_devbox_services_vhost" ;;
+      minio)
+        _devbox_services_minio_start || return 3
+        url="$(devbox_services_run_name "$_devbox_services_run")"
+        _devbox_services_wait minio _devbox_services_s3 http://127.0.0.1:9000 \
+          "$_devbox_services_minio_key" "$_devbox_services_minio_secret" PUT "$url" || return 3
+        export "$v=http://127.0.0.1:9000" \
+          "$_devbox_services_var_minio_bucket=$url" \
+          "$_devbox_services_var_minio_access_key=$_devbox_services_minio_key" \
+          "$_devbox_services_var_minio_secret_key=$_devbox_services_minio_secret" ;;
+    esac
+  done
+}
+
+# Print the shell text of the services for the hooks script. $1 is the run id,
+# which names the run's vhost and bucket. A project that declares no service
+# gets no text, and the step runner's call is guarded, so its hooks are as
+# before. A gate on this machine got its services from
+# devbox_services_local_up, which sets DEVBOX_SERVICES_LOCAL, and gets none.
+devbox_services_hook() {
+  local run="${1-}" slot
+  [ -n "${DEVBOX_SERVICES:-}" ] || return 0
+  [ "${DEVBOX_SERVICES_LOCAL:-0}" != 1 ] || return 0
+  (require_run_id "$run" "the services of this gate") || return 1
+  printf '_devbox_services_want=%q\n_devbox_services_run=%q\n' "$DEVBOX_SERVICES" "$run"
+  for slot in $DEVBOX_SERVICE_SLOTS; do
+    printf '_devbox_services_var_%s=%q\n' "${slot//-/_}" "$(devbox_service_var "$slot")"
+  done
+  declare -f devbox_services_run_name _devbox_services_wait _devbox_services_s3 \
+    _devbox_services_rabbit_api _devbox_services_pg_ready _devbox_services_redis_ping \
+    _devbox_services_cleanup _devbox_services_cleanup_arm _devbox_services_minio_start \
+    _devbox_services_up
+  printf 'devbox_services() {\n  _devbox_services_up\n}\n'
+}
+
+# ── the local half: --local and CI ───────────────────────────────────────────
+#
+# One container per server on this machine, each port published on 127.0.0.1
+# alone, to a port docker picks, so a developer's own server on the default
+# port is never in the way. postgres and rabbitmq are shared by every run here
+# and give each run a database and a vhost. redis and minio are one container
+# per run: a server per run is their boundary, as in a workspace.
+
+# The container names of a run, from the run id.
+_devbox_services_local_name() {
+  case "$1" in
+    postgres|rabbitmq) printf 'devbox-services-%s\n' "$1" ;;
+    *) printf 'devbox-services-%s-%s\n' "$1" "${2/./-}" ;;
+  esac
+}
+
+# Make sure container $1 runs, creating it with the rest as `docker run`
+# arguments. Another run of this machine may create it at the same moment, so
+# a failed create counts when the container runs after all.
+_devbox_services_local_container() {
+  local name="$1" state
+  shift
+  # A missing container is the empty answer, and its message says nothing.
+  state="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" || state=""
+  case "$state" in
+    true) return 0 ;;
+    false) docker start "$name" >/dev/null && return 0 ;;
+    *) docker run -d -q --name "$name" "$@" >/dev/null && return 0 ;;
+  esac
+  [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] && return 0
+  echo "devbox verify: could not start the container $name" >&2
+  return 1
+}
+
+# Whether something on this machine listens on 127.0.0.1:$1.
+_devbox_services_local_listening() {
+  # A refused connection is the answer "free", and its message says nothing.
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# The port docker published for container port $2 of container $1.
+_devbox_services_local_port() {
+  local out
+  out="$(docker port "$1" "$2/tcp")" || return 1
+  out="${out%%$'\n'*}"
+  out="${out##*:}"
+  is_uint "$out" || { echo "devbox verify: docker published no port $2 for $1" >&2; return 1; }
+  printf '%s\n' "$out"
+}
+
+_devbox_services_local_pg_ready() {
+  docker exec "$1" pg_isready -q -h 127.0.0.1 -U postgres
+}
+_devbox_services_local_redis_ping() {
+  [ "$(docker exec "$1" redis-cli ping 2>/dev/null)" = PONG ]
+}
+# Every rabbitmq CLI call runs as the rabbitmq user. MEASURED: a ping as root
+# during the broker's first start wrote /var/lib/rabbitmq/.erlang.cookie as
+# root, the broker died on "Error when reading .erlang.cookie: eacces", and the
+# wait ran out its 60 s. The output of a ping that fails is the wait's to
+# drop: _devbox_services_wait names a broker that never answers.
+_devbox_services_local_rabbit_ping() {
+  docker exec -u rabbitmq "$1" rabbitmq-diagnostics -q ping >/dev/null 2>&1
+}
+
+# Start the declared services on this machine, give the run its database,
+# vhost and bucket, and export each variable in this shell. $1 is the run id.
+# Sets DEVBOX_SERVICES_LOCAL=1, so devbox_hooks_script adds no services text,
+# and DEVBOX_SERVICES_LOCAL_UP, the services devbox_services_local_down stops.
+# Call it before devbox_hooks_script, and devbox_services_local_down when the
+# gate ends, on every exit.
+#
+# Returns 0, 2 when docker is missing (the services are named), 3 when a
+# service does not answer in 60 s, 1 when docker failed otherwise.
+# shellcheck disable=SC2034  # DEVBOX_SERVICES_LOCAL is read by devbox_services_hook
+devbox_services_local_up() {
+  local run="$1" s c port name key secret rc
+  local -a publish=()
+  DEVBOX_SERVICES_LOCAL_UP=""
+  [ -n "${DEVBOX_SERVICES:-}" ] || return 0
+  (require_run_id "$run" "the services of this gate") || return 2
+  if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
+    echo "devbox verify: a gate on this machine starts $DEVBOX_SERVICES in docker, and docker is not available here, so the gate did not run" >&2
+    return 2
+  fi
+  name="$(devbox_services_run_name "$run")"
+  for s in $DEVBOX_SERVICES; do
+    c="$(_devbox_services_local_name "$s" "$run")"
+    # A run's own container is down's to remove from the moment it may
+    # exist. A database or a vhost is, once it was made.
+    case "$s" in redis|minio) DEVBOX_SERVICES_LOCAL_UP="$DEVBOX_SERVICES_LOCAL_UP $s" ;; esac
+    case "$s" in
+      postgres)
+        # trust on a port bound to 127.0.0.1: the server holds only the test
+        # databases of this machine's gates, and a password would have to
+        # cross an argv to reach the container.
+        # max_connections as a host's devbox-postgres sets it: at the image's
+        # default of 100, a suite with several workers ran out of connections.
+        _devbox_services_local_container "$c" -e POSTGRES_HOST_AUTH_METHOD=trust \
+          -p 127.0.0.1::5432 "$DEVBOX_SERVICES_IMAGE_POSTGRES" -c max_connections=300 || return 1
+        rc=0; _devbox_services_wait postgres _devbox_services_local_pg_ready "$c" || rc=$?
+        [ "$rc" = 0 ] || return "$rc"
+        port="$(_devbox_services_local_port "$c" 5432)" || return 1
+        docker exec "$c" psql -q -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 \
+          -c "CREATE DATABASE \"${name//-/_}\"" >/dev/null || return 1
+        DEVBOX_SERVICES_LOCAL_UP="$DEVBOX_SERVICES_LOCAL_UP $s"
+        # The scheme a host's DSN has: with plain postgresql://, an ORM
+        # loaded a driver the suite does not install.
+        export "$(devbox_service_var postgres)=postgresql+psycopg://postgres@127.0.0.1:$port/${name//-/_}" ;;
+      redis)
+        _devbox_services_local_container "$c" -p 127.0.0.1::6379 "$DEVBOX_SERVICES_IMAGE_REDIS" \
+          redis-server --save '' --appendonly no --maxmemory-policy noeviction --maxmemory 1gb || return 1
+        rc=0; _devbox_services_wait redis _devbox_services_local_redis_ping "$c" || rc=$?
+        [ "$rc" = 0 ] || return "$rc"
+        port="$(_devbox_services_local_port "$c" 6379)" || return 1
+        export "$(devbox_service_var redis)=redis://127.0.0.1:$port" ;;
+      rabbitmq)
+        # loopback_users cleared as on a host: a connection through a
+        # published port does not arrive from the broker's loopback.
+        # A host's workspace reaches the broker on 127.0.0.1:5672 and its
+        # management API on 127.0.0.1:15672, and suites that make a vhost per
+        # worker call both at those fixed addresses. With only 5672 published
+        # on a random port, such a suite could not run in CI. So the fixed
+        # ports when both are free, as on a CI runner, else random ones.
+        publish=(-p 127.0.0.1:5672:5672 -p 127.0.0.1:15672:15672)
+        if _devbox_services_local_listening 5672 || _devbox_services_local_listening 15672; then
+          publish=(-p 127.0.0.1::5672 -p 127.0.0.1::15672)
+        fi
+        _devbox_services_local_container "$c" -e 'RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit loopback_users []' \
+          "${publish[@]}" "$DEVBOX_SERVICES_IMAGE_RABBITMQ" || return 1
+        rc=0; _devbox_services_wait rabbitmq _devbox_services_local_rabbit_ping "$c" || rc=$?
+        [ "$rc" = 0 ] || return "$rc"
+        port="$(_devbox_services_local_port "$c" 5672)" || return 1
+        docker exec -u rabbitmq "$c" rabbitmqctl -q add_vhost "$name" >/dev/null || return 1
+        DEVBOX_SERVICES_LOCAL_UP="$DEVBOX_SERVICES_LOCAL_UP $s"
+        docker exec -u rabbitmq "$c" rabbitmqctl -q set_permissions -p "$name" guest '.*' '.*' '.*' >/dev/null || return 1
+        export "$(devbox_service_var rabbitmq)=amqp://guest:guest@127.0.0.1:$port/$name" ;;
+      minio)
+        key="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" || return 1
+        secret="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')" || return 1
+        # `-e NAME` with no value: docker reads the value from its own
+        # environment, so the keys never reach an argv.
+        MINIO_ROOT_USER="$key" MINIO_ROOT_PASSWORD="$secret" _devbox_services_local_container "$c" \
+          -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD -e MINIO_BROWSER=off \
+          -p 127.0.0.1::9000 "$DEVBOX_SERVICES_IMAGE_MINIO" server --quiet /data || return 1
+        port="$(_devbox_services_local_port "$c" 9000)" || return 1
+        rc=0; _devbox_services_wait minio _devbox_services_s3 "http://127.0.0.1:$port" "$key" "$secret" PUT "$name" || rc=$?
+        [ "$rc" = 0 ] || return "$rc"
+        export "$(devbox_service_var minio)=http://127.0.0.1:$port" \
+          "$(devbox_service_var minio-bucket)=$name" \
+          "$(devbox_service_var minio-access-key)=$key" \
+          "$(devbox_service_var minio-secret-key)=$secret" ;;
+    esac
+  done
+  DEVBOX_SERVICES_LOCAL=1
+}
+
+# Remove what devbox_services_local_up made for run $1: the database, the
+# vhost, and the redis and minio containers. The shared postgres and rabbitmq
+# containers stay for the next gate. Returns 1 with a line per leftover.
+devbox_services_local_down() {
+  local run="$1" s c name rc=0
+  name="$(devbox_services_run_name "$run")"
+  for s in ${DEVBOX_SERVICES_LOCAL_UP:-}; do
+    c="$(_devbox_services_local_name "$s" "$run")"
+    case "$s" in
+      postgres)
+        docker exec "$c" psql -q -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 \
+          -c "DROP DATABASE IF EXISTS \"${name//-/_}\" WITH (FORCE)" >/dev/null ||
+          { echo "devbox verify: could not drop the database ${name//-/_} in $c" >&2; rc=1; } ;;
+      rabbitmq)
+        docker exec -u rabbitmq "$c" rabbitmqctl -q delete_vhost "$name" >/dev/null ||
+          { echo "devbox verify: could not delete the vhost $name in $c" >&2; rc=1; } ;;
+      *)
+        docker rm -f "$c" >/dev/null ||
+          { echo "devbox verify: could not remove the container $c" >&2; rc=1; } ;;
+    esac
+  done
+  DEVBOX_SERVICES_LOCAL_UP=""
+  return "$rc"
+}

@@ -253,4 +253,19 @@ printf 'run\t0123456789abcdef.7002\nat\t1\nclient\t3.3.0\nbranch\tmain\ncommit\t
 assert_eq "devbox: empty (run 0123456789abcdef.7002 planned no step)" \
   "$(devbox_record_summary "$TMP/none.record")" "a complete record with no step line still reads as empty"
 
+echo "-- a shard never answers a carry, and file lines carry seconds"
+new_repo shard
+write_record "$R1" 100 main full 1 "step test kfull pass 9 0 full" \
+  "file test vitest a.test.ts pass 12" "file test vitest b.test.ts pass"
+write_record "$R2" 200 main partial 1 "step test kshard pass 3 0 shard" \
+  "file test vitest a.test.ts pass 30" "file test vitest c.test.ts fail 4"
+assert_eq "$R1" "$(devbox_record_find_pass test kfull)" "a full pass answers its key"
+assert_eq "" "$(devbox_record_find_pass test kshard)" "a shard's pass does not"
+assert_eq "$R1" "$(devbox_record_last_pass_of test)" "nor is it the last pass"
+assert_eq "$R1 pass 0" "$(devbox_record_last_of test)" "nor the last result"
+assert_eq "c.test.ts" "$(devbox_record_failed_files "$R2" test)" "a sixth field leaves the failed files readable"
+assert_eq "a.test.ts	30
+c.test.ts	4" "$(devbox_record_durations test)" \
+  "the durations: the newest seconds of each file, a 3.3 line with none left out"
+
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

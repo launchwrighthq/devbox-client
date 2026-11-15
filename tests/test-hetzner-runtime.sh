@@ -80,11 +80,9 @@ reset_server() {
   # The host key cloud-init wrote from ssh_keys, and a copy of it that cloud-init
   # kept as JSON, with its lines joined by a literal \n.
   mkdir -p "$HZR_ROOT/etc/ssh"
-  printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nfixtureHostKeyLineOne0123456789\nfixtureHostKeyLineTwo0123456789\n-----END OPENSSH PRIVATE KEY-----\n' \
-    > "$HZR_ROOT/etc/ssh/ssh_host_ed25519_key"
-  printf '{"ed25519_private": "-----BEGIN OPENSSH PRIVATE KEY-----\\nfixtureHostKeyLineOne0123456789\\nfixtureHostKeyLineTwo0123456789\\n"}\n' \
-    > "$HZR_ROOT/var/lib/cloud/instances/i-1/sem/hostkey-copy"
-  printf 'a note that names -----BEGIN OPENSSH PRIVATE KEY----- and no key\n' > "$HZR_ROOT/var/lib/cloud/instances/i-1/scripts/note"
+  printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nfixtureHostKeyLineOne0123456789\nfixtureHostKeyLineTwo0123456789\n-----END OPENSSH PRIVATE KEY-----\n' >"$HZR_ROOT/etc/ssh/ssh_host_ed25519_key"  # a fake fixture, no key: gitleaks:allow publish-audit: allow
+  printf '{"ed25519_private": "-----BEGIN OPENSSH PRIVATE KEY-----\\nfixtureHostKeyLineOne0123456789\\nfixtureHostKeyLineTwo0123456789\\n"}\n' >"$HZR_ROOT/var/lib/cloud/instances/i-1/sem/hostkey-copy"  # a fake fixture, no key: gitleaks:allow publish-audit: allow
+  printf 'a note that names -----BEGIN OPENSSH PRIVATE KEY----- and no key\n' > "$HZR_ROOT/var/lib/cloud/instances/i-1/scripts/note"  # a fake fixture, no key: gitleaks:allow publish-audit: allow
 }
 
 # ── boot ─────────────────────────────────────────────────────────────────────

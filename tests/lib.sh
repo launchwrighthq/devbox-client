@@ -96,10 +96,10 @@ assert_fail() {
 # Both pairs were made with `ssh-keygen -t ed25519`, and
 # tests/test-gate-transport.sh proves each pin is ssh-keygen's fingerprint of
 # its key.
-GATE_STUB_HOSTKEY='AAAAC3NzaC1lZDI1NTE5AAAAIJehVVg5hAqvDxiDuGr6+xbLNXoKNBU03p8aBozaMjZV'
+GATE_STUB_HOSTKEY='AAAAC3NzaC1lZDI1NTE5AAAAIJehVVg5hAqvDxiDuGr6+xbLNXoKNBU03p8aBozaMjZV'  # a fixture public host key: gitleaks:allow
 # shellcheck disable=SC2034  # read by the test files that source this one
 GATE_STUB_PIN='SHA256:AxgZABtng1WaRtMoFRGUQhH6VAClAtM0YBtXnpRehaA'
-GATE_STUB_OTHER_HOSTKEY='AAAAC3NzaC1lZDI1NTE5AAAAIN/7aa2XZE/Ux8+GMpPB+Y6ksvQRwL1vr9a/QM7IegiR'
+GATE_STUB_OTHER_HOSTKEY='AAAAC3NzaC1lZDI1NTE5AAAAIN/7aa2XZE/Ux8+GMpPB+Y6ksvQRwL1vr9a/QM7IegiR'  # a fixture public host key: gitleaks:allow
 # shellcheck disable=SC2034  # read by the test files that source this one
 GATE_STUB_OTHER_PIN='SHA256:tl/XHkjgYd44QfiAPtqIAjshCF3n3aF+Kjercf6B4g0'
 
@@ -182,4 +182,27 @@ case "$GATE_CMD" in
     exit 0 ;;
 esac
 PRELUDE
+}
+
+# ── a fake /proc/stat that moves ─────────────────────────────────────────────
+#
+# devbox-pool judges CPU by the idle share of all cores, as the difference of
+# two readings of the `cpu` line of /proc/stat. A file that never changes is no
+# reading at all, so a test that admits on it needs one that moves.
+# proc_stat_writer <file> <idle percent> starts a writer in the background that
+# adds <idle percent> idle and the rest user time every 0.1 s, each write by
+# rename, and sets PROC_STAT_WRITER to its pid. The caller kills it.
+proc_stat_writer() {
+  local file="$1" idle="$2"
+  (
+    i=0; b=0
+    while :; do
+      i=$((i + idle)); b=$((b + 100 - idle))
+      printf 'cpu  %s 0 0 %s 0 0 0 0 0 0\ncpu0 %s 0 0 %s 0 0 0 0 0 0\n' "$b" "$i" "$b" "$i" >"$file.tmp" \
+        && mv -f "$file.tmp" "$file"
+      sleep 0.1
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  # shellcheck disable=SC2034  # read by the test files that source this one
+  PROC_STAT_WRITER=$!
 }

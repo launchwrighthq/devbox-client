@@ -1,0 +1,66 @@
+#!/bin/bash
+# `devbox ci matrix`: the GitHub Actions matrix of this checkout's gate, from
+# .devbox/steps (docs/specs/2026-11-14-learned-selection-design.md, D10 and
+# section 9).
+#
+# Every consumer's CI wrote its step list a second time, with its own path
+# filters and shard tables, and ran no client, so CI and the gate drifted
+# apart. This prints one matrix entry per step, and one per shard for a step
+# with shards=:
+#
+#   {"include":[{"step":"lint","shard":"1/1"},{"step":"test","shard":"1/4"},...]}
+#
+# A CI job runs `devbox verify --local --step <step> --shard <shard>` per entry.
+#
+# Exit 0, 2 for a usage error, a directory outside a git checkout, or a steps
+# file that is missing, broken or names no step, the refusals of verify.
+set -euo pipefail
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source=client/libexec/devbox-steps-file
+source "$_here/devbox-steps-file"
+
+usage() {
+  echo "usage: devbox ci matrix" >&2
+  exit 2
+}
+[ "$#" -eq 1 ] || usage
+[ "$1" = matrix ] || usage
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "devbox ci: $PWD is not inside a git checkout" >&2
+  exit 2
+}
+[ -f "$root/.devbox/steps" ] || {
+  echo "devbox ci: $root/.devbox/steps does not exist, and the matrix is made from it" >&2
+  exit 2
+}
+# Declared before the load, so a parser that does not fill STEP_SHARDS leaves
+# an empty associative array. An undeclared name read as ${STEP_SHARDS[$s]}
+# is an indexed array, and bash evaluates the step name as arithmetic there:
+# `test:unit` is a syntax error.
+declare -A STEP_SHARDS=()
+devbox_steps_load "$root/.devbox/steps" "$root" || exit 2
+# A CI matrix of no entry fails the workflow with a message about the matrix,
+# far from the file that caused it, so the refusal names the file here.
+if [ "${#STEP_NAMES[@]}" -eq 0 ]; then
+  echo "devbox ci: $root/.devbox/steps names no step, so there is no matrix to print" >&2
+  exit 2
+fi
+
+out='{"include":['
+sep=""
+for step in "${STEP_NAMES[@]}"; do
+  shards="${STEP_SHARDS[$step]-}"
+  [ -n "$shards" ] || shards=1
+  [[ "$shards" =~ ^[1-9][0-9]*$ ]] || {
+    echo "devbox ci: step $step has shards=$shards, which is not a whole number of at least 1" >&2
+    exit 2
+  }
+  # A step name is [a-z0-9:_-]* (devbox-steps-file), so it needs no JSON
+  # escape.
+  for ((i = 1; i <= shards; i++)); do
+    out+="$sep{\"step\":\"$step\",\"shard\":\"$i/$shards\"}"
+    sep=","
+  done
+done
+printf '%s]}\n' "$out"

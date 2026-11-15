@@ -118,6 +118,7 @@ cp "$REPO/client/bin/devbox" "$TMP/client/client/bin/"
 cp "$REPO/client/libexec/devbox-verify" "$REPO/client/libexec/devbox-run" "$REPO/client/libexec/devbox-config" \
   "$REPO/client/libexec/devbox-transport" "$REPO/client/libexec/devbox-targets" "$REPO/client/libexec/devbox-askpass" "$REPO/client/libexec/devbox-sync" \
   "$REPO/client/libexec/devbox-steps-file" "$REPO/client/libexec/devbox-plan" "$REPO/client/libexec/devbox-record" "$REPO/client/libexec/devbox-cancel" \
+  "$REPO/client/libexec/devbox-services" "$REPO/client/libexec/devbox-map" \
   "$TMP/client/client/libexec/"
 cp "$REPO/lib/devbox-lib.sh" "$TMP/client/lib/"
 # The plan keys every step by the client version, and the step runner crosses

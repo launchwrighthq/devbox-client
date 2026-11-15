@@ -1,7 +1,9 @@
 #!/bin/bash
 # The plan of a gate (docs/specs/2026-11-14-client-owns-the-gate-design.md,
-# D5, D5a, D6, D12, D13, D14 and R1, plan half): client/libexec/devbox-plan
-# keys each step, then carries, narrows, selects or runs it.
+# D5, D5a, D6, D12, D13 and R1, plan half, and the plan file of
+# docs/specs/2026-11-14-learned-selection-design.md, section 5.6):
+# client/libexec/devbox-plan keys each step, then carries, narrows or runs it.
+# The selection by learned reads has its own file, tests/test-select.sh.
 #
 # Each consumer planned its gate from changed paths with its own global-input
 # list, and reran every passed step after a one-file change. This file fills
@@ -61,7 +63,7 @@ manifest() {
 no_steps() {
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
-    STEP_SELECT=() STEP_RERUN=() STEP_CMD=() STEP_SOURCE=()
+    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=()
 }
 
 # Add one step: $1 name, $2 inputs (one per line), then key=value attributes.
@@ -75,7 +77,6 @@ add_step() {
     case "$kv" in
       runner=*) STEP_RUNNER[$name]="${kv#*=}" ;;
       narrow=*) STEP_NARROW[$name]="${kv#*=}" ;;
-      select=*) STEP_SELECT[$name]="${kv#*=}" ;;
       rerun=*) STEP_RERUN[$name]="${kv#*=}" ;;
       after=*) STEP_AFTER[$name]="${kv#*=}" ;;
       cmd=*) STEP_CMD[$name]="${kv#*=}" ;;
@@ -117,7 +118,7 @@ gate() {
     while IFS=$'\t' read -r kind name action key _; do
       [ "$kind" = step ] || continue
       outcome=pass code=0 mode=full
-      case "$action" in carry) outcome=carried ;; narrow) mode=narrowed ;; related) mode=related ;; esac
+      case "$action" in carry) outcome=carried ;; narrow) mode=narrowed ;; select) mode=selected ;; esac
       for o in "$@"; do
         case "$o" in "$name="*) v="${o#*=}"; outcome="${v%%:*}"; code="${v#*:}" ;; esac
       done
@@ -187,7 +188,7 @@ gate
 printf 'DEVBOX_LANES=2\n' >>.devbox/config.env
 plan changed
 assert_eq "lint=run typecheck=run pytest=run guards=run" "$(actions)" "a change to .devbox/config.env runs every step"
-assert_ok "and says what else the key holds" contains "config, client version, step line or forwarded env changed" "$(reason_of lint)"
+assert_ok "and says what else the key holds" contains "config, client version, step line, setup or forwarded env changed" "$(reason_of lint)"
 
 echo "-- a step line is part of its key"
 gate
@@ -220,13 +221,15 @@ add_step e2e "" "after=build test" $'cmd=printf \'a\tb\'\necho two'
 plan changed
 assert_eq 3 "$(grep -c '^step' "$P")" "every step gets a line"
 line="$(grep $'^step\te2e\t' "$P")"
-IFS=$'\t' read -r f1 f2 f3 f4 f5 f6 f7 f8 <<<"$line"
+IFS=$'\t' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 <<<"$line"
 assert_eq "step e2e run" "$f1 $f2 $f3" "a step line opens with step, the name and the action"
 assert_ok "the key is a sha256" grep -qE '^[0-9a-f]{64}$' <<<"$f4"
 assert_eq "-" "$f5" "a step with no runner says -"
 assert_eq "build,test" "$f6" "after names are comma separated"
 assert_eq $'printf \'a\tb\'\necho two' "$(printf '%s' "$f7" | base64 -d)" "the command is base64, with its tab and newline"
-assert_eq "" "${f8-}" "and the line has seven fields"
+assert_eq "-" "$f8" "a step with no dir= says -"
+assert_eq "1" "$f9" "a step with no inputs= that runs asks for a trace"
+assert_eq "" "${f10-}" "and the line has nine fields"
 assert_eq "vitest" "$(awk -F'\t' '$2 == "test" { print $5 }' "$P")" "a runner is named"
 plan changed test e2e
 assert_eq "test=run e2e=run" "$(actions)" "named steps alone are planned"
@@ -319,52 +322,45 @@ GATE_COMPLETE=0 gate test=fail:1 file=test:pytest:apps/worker/tests/test_a.py:fa
 plan changed
 assert_eq "test=run" "$(actions)" "a complete 0 failure is never the last result"
 
-echo "-- D14: a select=related step after a pass"
-new_repo d14
+echo "-- the plan never says related"
+new_repo norelated
 no_steps
 add_step test:web "apps/web/" runner=vitest select=related
-add_step test:api "apps/api/" runner=vitest
 plan changed
 gate
 edit apps/web/src/w.ts
-printf 'new\n' >apps/web/src/new.ts
 plan changed
-assert_eq "test:web=related test:api=carry" "$(actions)" "a changed input selects the related tests"
-assert_eq "apps/web/src/new.ts
-apps/web/src/w.ts" "$(files_of test:web)" "of exactly the changed and new input files"
-assert_eq "related to 2 changed files" "$(reason_of test:web)" "and says so"
-rm apps/web/src/w.test.ts
-plan changed
-assert_eq "test:web=run test:api=carry" "$(actions)" "a deleted input runs the step in full"
+assert_eq "test:web=run" "$(actions)" "a select=related step with no map runs in full"
 assert_eq "" "$(files_of test:web)" "with no file line"
-printf 'w\n' >apps/web/src/w.test.ts
-edit package-lock.json
-plan changed
-assert_eq "test:web=run test:api=run" "$(actions)" "a changed shared input runs it in full"
-printf 'package-lock.json v1\n' >package-lock.json
-printf 'apps/web/src/w.test.ts v1\n' >apps/web/src/w.test.ts
-plan changed
-assert_eq "test:web=related test:api=carry" "$(actions)" "back to the passed lock file and test file, it selects again"
-printf 'DEVBOX_LANES=1\n' >>.devbox/config.env
-plan changed
-assert_eq "test:web=run test:api=run" "$(actions)" "a changed config runs it in full, though only inputs differ from its pass otherwise"
+assert_fail "and no plan line says related" grep -q related "$P"
+assert_fail "devbox-plan writes no vitest related command" grep -q 'related --run' "$REPO/client/libexec/devbox-plan"
 
-new_repo d14-nomanifest
+echo "-- a step with inputs= and no runner asks for no trace"
+new_repo trace
 no_steps
-add_step test:web "apps/web/" runner=vitest select=related
+add_step lint "apps/api/"
+add_step test "apps/worker/" runner=pytest
+add_step all ""
 plan changed
+assert_eq "lint=0 test=1 all=1" "$(awk -F'\t' '$1 == "step" { printf "%s%s=%s", sep, $2, $9; sep = " " }' "$P")" \
+  "inputs= turns the trace off, and a runner step traces for its selection anyway"
 gate
-rm "$(devbox_record_dir)/$LAST_RUN.files"
-edit apps/web/src/w.ts
 plan changed
-assert_eq "test:web=run" "$(actions)" "a pass without its manifest never selects"
+assert_eq "lint=0 test=0 all=0" "$(awk -F'\t' '$1 == "step" { printf "%s%s=%s", sep, $2, $9; sep = " " }' "$P")" \
+  "a carried step asks for no trace"
+STEP_DIR[test]="apps/worker/"
+plan full
+assert_eq "apps/worker/" "$(awk -F'\t' '$1 == "step" && $2 == "test" { print $8 }' "$P")" "dir= reaches the plan"
+assert_eq "apps/worker/tests/test_a.py
+apps/worker/tests/test_b.py
+apps/worker/tests/test_c.py" "$(awk -F'\t' '$1 == "test" && $2 == "test" { print $3 }' "$P")" \
+  "a runner step that runs lists its test files under its folder, in path order"
 
 echo "-- R1: --plan prints each step's plan and reason"
 new_repo r1
 no_steps
 add_step lint "apps/api/"
 add_step test "apps/worker/" runner=pytest narrow=failed
-add_step web "apps/web/" runner=vitest select=related
 add_step guards "" rerun=always
 plan changed
 gate test=fail:1 file=test:pytest:apps/worker/tests/test_a.py:fail file=test:pytest:apps/worker/tests/test_b.py:fail
@@ -373,8 +369,9 @@ edit apps/web/src/w.ts
 plan changed
 assert_eq "lint  carry  carried from run $r1_run
 test  narrow 2 files  narrowed to 2 failed files
-web  related 1 files  related to 1 changed files
-guards  run  rerun=always" "$(devbox_plan_print)" "one line per step: name, action and reason"
+  apps/worker/tests/test_a.py  failed
+  apps/worker/tests/test_b.py  failed
+guards  run  rerun=always" "$(devbox_plan_print)" "one line per step: name, action and reason, and the reason of each file"
 
 echo "-- a forwarded value enters the key as a hash, and never an output"
 new_repo forward

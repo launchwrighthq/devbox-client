@@ -9,6 +9,13 @@
 #   devbox result                         one line per step, then the verdict
 #   devbox result --failed-files [<step>] the failed test files, one per line
 #   devbox result --log <step>            the saved log section of one step
+#   devbox result --failed-steps          the failed steps, one per line
+#   devbox result --json                  the whole record as one JSON object
+#
+# A landing script parsed the `devbox: red (...)` text for the failed steps,
+# and each copy broke on another wording. --failed-steps and --json are the
+# machine-readable forms (learned-selection spec, D9 and section 9). The JSON
+# is built with awk's printf, so the client needs no jq.
 #
 # Exit 0, 1 when there is no record (or no log of that step), 2 for a usage
 # error or a directory outside a git checkout.
@@ -30,7 +37,7 @@ source "$_here/devbox-record"
 DEVBOX_GUARD_WHO="devbox result"
 
 usage() {
-  echo "usage: devbox result [--failed-files [<step>] | --log <step>]" >&2
+  echo "usage: devbox result [--failed-steps | --failed-files [<step>] | --log <step> | --json]" >&2
   exit 2
 }
 
@@ -39,6 +46,8 @@ case "${1-}" in
   "") [ "$#" -eq 0 ] || usage ;;
   --failed-files) [ "$#" -le 2 ] || usage; mode=failed step="${2-}" ;;
   --log) [ "$#" -eq 2 ] || usage; mode=log step="$2" ;;
+  --failed-steps) [ "$#" -eq 1 ] || usage; mode=failed-steps ;;
+  --json) [ "$#" -eq 1 ] || usage; mode=json ;;
   *) usage ;;
 esac
 # A step name of section 4.2. Anything else names no step of any record.
@@ -68,6 +77,54 @@ case "$mode" in
     ;;
   failed)
     devbox_record_failed_files "$run" "$step"
+    ;;
+  failed-steps)
+    awk -F'\t' '$1 == "step" && $4 == "fail" { print $2 }' "$record"
+    ;;
+  json)
+    # One object on one line. A string is escaped by the rules of RFC 8259:
+    # the backslash, the quote and every control character below 0x20. A path
+    # may hold any byte but a tab or a newline, which the record itself
+    # cannot carry. A number field that does not read as an integer is null,
+    # so a reader never meets a number that is a string on one run and a
+    # number on the next. Each step lists its failed test files in record
+    # order.
+    LC_ALL=C awk -F'\t' '
+      BEGIN { for (i = 1; i < 32; i++) ctl[sprintf("%c", i)] = sprintf("\\u%04x", i) }
+      function js(s,   out, i, c) {
+        out = ""
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c == "\\") out = out "\\\\"
+          else if (c == "\"") out = out "\\\""
+          else if (c in ctl) out = out ctl[c]
+          else out = out c
+        }
+        return "\"" out "\""
+      }
+      # The digits as written, not v + 0: an awk may print a large number in
+      # its %.6g form, and an epoch second would arrive as 1.7e+09.
+      function num(v) {
+        if (v !~ /^[0-9]+$/) return "null"
+        sub(/^0+/, "", v)
+        return v == "" ? "0" : v
+      }
+      function hdr(k) { return (k in h) ? js(h[k]) : "null" }
+      $1 == "run" || $1 == "client" || $1 == "branch" || $1 == "commit" || $1 == "target" || $1 == "scope" || $1 == "at" || $1 == "complete" { h[$1] = $2 }
+      $1 == "step" {
+        n++; name[n] = $2
+        line[n] = "{\"name\":" js($2) ",\"key\":" js($3) ",\"outcome\":" js($4) ",\"seconds\":" num($5) ",\"code\":" num($6) ",\"mode\":" js($7)
+      }
+      $1 == "file" && $5 == "fail" {
+        if ($2 in failed) failed[$2] = failed[$2] "," js($4)
+        else failed[$2] = js($4)
+      }
+      END {
+        printf "{\"run\":%s,\"at\":%s,\"client\":%s,\"branch\":%s,\"commit\":%s,\"target\":%s,\"scope\":%s,\"complete\":%s,\"steps\":[",
+          hdr("run"), num(h["at"]), hdr("client"), hdr("branch"), hdr("commit"), hdr("target"), hdr("scope"), (h["complete"] == "1" ? "true" : "false")
+        for (i = 1; i <= n; i++) printf "%s%s,\"failed_files\":[%s]}", (i > 1 ? "," : ""), line[i], failed[name[i]]
+        printf "]}\n"
+      }' "$record"
     ;;
   log)
     log="${record%.record}.log"

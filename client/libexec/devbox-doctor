@@ -300,6 +300,12 @@ doctor_target() {
   # host's reason, or FAIL for a line that is missing or that this client
   # cannot read: a FAIL of an unread line rather than an ok, for the reason the
   # DEVBOX_REQUIRES check below gives.
+  #
+  # The admission line is the exception in two places. Its ok row prints the
+  # host's own text: the rule, the idle CPU share and the two pressure
+  # readings. And a host
+  # without the line is a skip, not a FAIL: the line came with no protocol
+  # change, so a host of this protocol that predates it is no fault to repair.
   host_limit() {
     local label="$1" key="$2" what="$3" l line="" rest word bytes
     if [ "$reachable" -eq 0 ]; then
@@ -313,6 +319,11 @@ doctor_target() {
     word="${rest%% *}"
     case "$word" in
       ok)
+        if [ "$key" = admission ]; then
+          rest="${rest#ok}"; rest="${rest# }"
+          ok "$label on $TARGET: ${rest:-the host gave no readings}"
+          return 0
+        fi
         if [ "$key" != swap ]; then
           ok "$label on $TARGET: $what"
           return 0
@@ -331,7 +342,15 @@ doctor_target() {
       skipped)
         rest="${rest#skipped}"; rest="${rest# }"
         skip "$label on $TARGET (${rest:-the host gave no reason})" ;;
+      failed)
+        rest="${rest#failed}"; rest="${rest# }"
+        bad "$label on $TARGET: ${rest:-the host gave no reason}"
+        say "fix: the key the line names in /etc/devbox/config on $TARGET, then devbox server install for $TARGET ($TARGET_ADDR)" ;;
       *)
+        if [ -z "$line" ] && [ "$key" = admission ]; then
+          skip "$label on $TARGET (its doctor answer has no admission line, so the host predates admission on pressure)"
+          return 0
+        fi
         if [ -z "$line" ]; then
           bad "$label on $TARGET: its doctor answer has no $key line, so it predates protocol $DEVBOX_PROTOCOL_VERSION"
         else
@@ -512,6 +531,16 @@ doctor_target() {
   host_limit "CPU limit" cpu-limit "a grant caps its workspace's cpu.max at the granted tokens"
   host_limit "soft memory limit" memory-high "every workspace has memory.high below its cap"
   host_limit "swap" swap "active"
+  # ── the admission rule ───────────────────────────────────────────────────────
+  #
+  # MEASURED: hosts held every token with a run queued while they used a
+  # fraction of their cores. A host now admits on its idle cores and its
+  # memory and I/O pressure, and this row names the rule it runs and the
+  # readings it judges by (prep-throughput spec, section 4). A host without
+  # pressure readings admits on tokens, and a host whose /proc/stat it cannot
+  # read refuses every pass with a job running: each row is a skip with its
+  # reason, never an ok.
+  host_limit "admission" admission ""
 
   # ── the memory budget ────────────────────────────────────────────────────────
   #

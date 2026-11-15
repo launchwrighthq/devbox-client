@@ -54,6 +54,14 @@ case "$GATE_CMD" in
   "lock "*) _hold_lock ;;
   "run "*) _hold_run; _hold_gate ;;
   "ledger "*) _hold_ledger ;;
+  # The seed verb of the prep-throughput spec. FAKE_SEED=old answers as a
+  # devbox-gate older than the verb does, and FAKE_SEED=fault as a host fault.
+  "seed "*)
+    case "${FAKE_SEED-}" in
+      old) echo "devbox-gate: unknown verb 'seed'. This account runs devbox gate verbs only: a client older than protocol 3 sends raw commands, so update the devbox client" >&2; exit 2 ;;
+      fault) echo "devbox-runner seed: docker names no mountpoint for ws-laptop-app-main-a1b2c3-home" >&2; exit 1 ;;
+      *) printf 'seed copied laptop-app-main-7c209c 1024 30\n' ;;
+    esac ;;
   "cancel "*) echo "gate-root: no running gate of this run belongs to this machine"; exit 1 ;;
 esac
 exit 0
@@ -288,6 +296,39 @@ assert_eq "2" "$rc" "D2: a broken line exits 2"
 assert_ok "D2: by its line number" contains "devbox verify: .devbox/steps line 5: " "$out"
 assert_eq "" "$(cat "$SSH_LOG")" "D2: before any target is asked"
 cp "$TMP/steps.good" "$CO/.devbox/steps"
+
+# ═══ requires=: the tokens of the steps that run join DEVBOX_REQUIRES ════════
+# (learned-selection spec, section 4.2)
+sed -i 's|^test       after=lint |test       after=lint requires=cmd:fixture-tool |' "$CO/.devbox/steps"
+verify --target lan1 --full
+assert_ok "requires: a running step's token is asked of the target" grep -q 'check-requires cmd:fixture-tool' "$SSH_LOG"
+assert_ok "requires: and named with the image requirements" contains "==> image requirements: cmd:fixture-tool" "$out"
+printf 'six\n' >"$CO/types/t.d.ts"
+verify --target lan1
+assert_eq "typecheck" "$(ran)" "requires: with test carried, typecheck alone runs"
+assert_fail "requires: and the carried step's token is not asked" grep -q 'check-requires' "$SSH_LOG"
+cp "$TMP/steps.good" "$CO/.devbox/steps"
+
+# ═══ D4 of the prep-throughput spec: a seed never stops a gate ═══════════════
+# The verb's place: after ensure-workspace, before the sync's finish.
+verb_line() { grep -n " devbox-gate@$A_LAN1 $1 " "$SSH_LOG" | sed -n '1s/:.*//p'; }
+verify --target lan1 --full
+assert_eq "0" "$rc" "D4: a host that seeds runs the gate"
+assert_ok "D4: the answer is one ==> seed: line" grep -qx '==> seed: copied laptop-app-main-7c209c 1024 30' <<<"$out"
+assert_ok "D4: the seed carries the slug, the machine id and the project" \
+  grep -qE " seed [a-z0-9-]+ [0-9a-f]+ app$" "$SSH_LOG"
+assert_ok "D4: it follows ensure-workspace and precedes the sync's finish" \
+  test "$(verb_line ensure-workspace)" -lt "$(verb_line seed)" -a "$(verb_line seed)" -lt "$(verb_line sync-finish)"
+FAKE_SEED=old verify --target lan1 --full
+assert_eq "0" "$rc" "D4: a host without the verb still runs the gate"
+assert_ok "D4: with one skipped line naming the target" grep -qx '==> seed: skipped, lan1 predates seed' <<<"$out"
+assert_eq "lint test typecheck" "$(sort "$STEP_LOG" | tr '\n' ' ' | sed 's/ $//')" "D4: and every step ran"
+assert_fail "D4: the refusal itself stays off the terminal" contains "unknown verb" "$out"
+FAKE_SEED=fault verify --target lan1 --full
+assert_eq "0" "$rc" "D4: a seed that exits 1 still runs the gate"
+assert_ok "D4: read as cold" grep -qx '==> seed: cold, lan1 gave no seed answer (exit 1)' <<<"$out"
+assert_ok "D4: with the host's own stderr" contains "devbox verify: seed: devbox-runner seed: docker names no mountpoint" "$out"
+assert_eq "lint test typecheck" "$(sort "$STEP_LOG" | tr '\n' ' ' | sed 's/ $//')" "D4: and every step ran"
 
 # The display shows each step line as it arrives. Through mawk, a real gate's
 # step lines reached the terminal only when the gate ended.

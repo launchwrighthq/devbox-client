@@ -18,9 +18,20 @@
 //
 // With DEVBOX_LEDGER unset the reporter writes nothing and passedFiles() is
 // empty, so the same config also runs outside devbox.
+//
+// With DEVBOX_TRACE_DIR set, the reporter also writes the module graph of each
+// test file when the run ends, as section 5.6 of
+// docs/specs/2026-11-14-learned-selection-design.md defines the trace lines.
+// devbox-trace-hook.mjs writes what each worker reads; the graph adds what each
+// test file imports, because a worker fetches every module from the main
+// process and never opens its source. Each of the two variables works alone.
 
 import fs from 'node:fs';
-import { FileRecorder, excludePatterns, findProjectRoot } from './ledger-core.mjs';
+import path from 'node:path';
+import {
+  FileRecorder, TraceWriter, excludePatterns, findProjectRoot, graphTraceLines, moduleIdPath,
+  readModuleReads, traceFileName, traceRoot,
+} from './ledger-core.mjs';
 
 const RUNNER = 'vitest';
 
@@ -59,15 +70,35 @@ export default class DevboxLedgerReporter {
     this.recorder = null;
     this.ctx = null;
     this.moduleHooks = false;
+    this.traceDir = null;
+    this.traced = false;
   }
 
   onInit(ctx) {
     this.ctx = ctx;
+    this.traceDir = process.env.DEVBOX_TRACE_DIR || null;
     const ledger = process.env.DEVBOX_LEDGER;
     if (!ledger) return;
     const root = findProjectRoot(ctx?.config?.root ?? process.cwd());
     this.recorder = new FileRecorder({ ledger, runner: RUNNER, root });
     this.moduleHooks = majorOf(ctx?.version) >= 3;
+  }
+
+  // vitest 3 and later: the TestModules of the run. vitest 3 calls
+  // onFinished too, and the graph is written once.
+  onTestRunEnd(testModules) {
+    if (!this.traceDir || this.traced) return;
+    this.traced = true;
+    writeGraph(this.ctx, this.traceDir, (testModules ?? []).map((m) => [m.moduleId, m.project]));
+  }
+
+  // vitest 2: the File tasks of the run, each naming its project by name.
+  onFinished(files) {
+    if (!this.traceDir || this.traced) return;
+    this.traced = true;
+    const projects = this.ctx?.projects ?? [];
+    const byName = (name) => projects.find((p) => (typeof p.getName === 'function' ? p.getName() : p.name) === name);
+    writeGraph(this.ctx, this.traceDir, (files ?? []).map((f) => [f.filepath, byName(f.projectName ?? '')]));
   }
 
   // vitest 3 and later.
@@ -116,4 +147,70 @@ export default class DevboxLedgerReporter {
 
 function moduleKey(testModule) {
   return `${testModule.moduleId}\0${testModule.project?.name ?? ''}`;
+}
+
+// The Vite server of a vitest 2 project or Vitest instance is `server`, and of
+// vitest 3 and 4 `vite`. Its `moduleGraph` answers for every environment the
+// tests ran in: MEASURED with vitest 2, 3 and 4, the importedModules of
+// a test file there named the helper it imports, in the forks and the threads
+// pools.
+function viteOf(x) {
+  return x?.vite ?? x?.server ?? null;
+}
+
+function importedOf(graph) {
+  return (abs) => {
+    const out = [];
+    const mods = new Set();
+    const byId = graph?.getModuleById?.(abs);
+    if (byId) mods.add(byId);
+    for (const m of graph?.getModulesByFile?.(abs) ?? []) mods.add(m);
+    for (const m of mods) {
+      for (const dep of m.importedModules ?? []) {
+        const p = moduleIdPath(dep.id ?? dep.file);
+        if (p !== null) out.push(p);
+      }
+    }
+    return out;
+  };
+}
+
+// The files every test file of a project loads before its own imports: the
+// project's config and the files the config imported, the root config and
+// the workspace file of the Vitest instance, the setup files and the global
+// setup files. A change to any of them can change every test of the project.
+function projectEntries(ctx, project) {
+  const out = [];
+  for (const v of [viteOf(ctx), viteOf(project)]) {
+    const c = v?.config;
+    if (typeof c?.configFile === 'string') out.push(c.configFile);
+    for (const dep of c?.configFileDependencies ?? []) out.push(path.resolve(dep));
+  }
+  // vitest 2 and 3 keep the workspace file they found in _workspaceConfigPath,
+  // and config.workspace only when the command line named one.
+  for (const workspace of [ctx?._workspaceConfigPath, ctx?.config?.workspace]) {
+    if (typeof workspace === 'string') out.push(path.resolve(ctx.config?.root ?? process.cwd(), workspace));
+  }
+  const tc = project?.config ?? ctx?.config;
+  for (const key of ['setupFiles', 'globalSetup']) {
+    const v = tc?.[key];
+    for (const f of Array.isArray(v) ? v : typeof v === 'string' ? [v] : []) {
+      if (typeof f === 'string') out.push(path.resolve(tc.root ?? process.cwd(), f));
+    }
+  }
+  return out;
+}
+
+function writeGraph(ctx, dir, runs) {
+  const root = traceRoot(ctx?.config?.root ?? process.cwd());
+  const writer = new TraceWriter(path.join(dir, traceFileName('vitest', process.pid, 0)));
+  const moduleReads = readModuleReads(dir);
+  for (const [file, project] of runs) {
+    if (typeof file !== 'string' || file === '') continue;
+    const graph = viteOf(project ?? ctx)?.moduleGraph ?? viteOf(ctx)?.moduleGraph;
+    const lines = graphTraceLines({
+      root, testFile: path.resolve(file), entries: projectEntries(ctx, project), importedOf: importedOf(graph), moduleReads,
+    });
+    for (const line of lines) writer.write(line);
+  }
 }

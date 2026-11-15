@@ -39,9 +39,15 @@ usage: devbox <command> [args]
                          can; --fresh is --full and discards the ledger of a stopped
                          gate; --step runs only that step; --plan prints the plan
                          and runs nothing
-  result [--failed-files [<step>] | --log <step>]
-                         print this checkout's newest gate record, its failed test
-                         files, or the saved log of one step
+  result [--failed-steps | --failed-files [<step>] | --log <step> | --json]
+                         print this checkout's newest gate record, its failed
+                         steps, its failed test files, the saved log of one step,
+                         or the whole record as one JSON object
+  probe [--local] <rev>  run the failed test files of the newest record at <rev>
+                         in a temporary worktree, through devbox run or here with
+                         --local, and print one line per file
+  ci matrix              print the GitHub Actions matrix of .devbox/steps: one
+                         entry per step, and one per shard of a step with shards=
   cancel                 cancel this checkout's running gate, here and on its target
   run [--target <name>] -- <command>
                          run one command in this checkout's workspace on a target, never here
@@ -101,6 +107,8 @@ case "${1:-}" in
   verify)  shift; runnable "$LIBEXEC/devbox-verify" "$@"; exec "$LIBEXEC/devbox-verify" "$@" ;;
   run)     shift; runnable "$LIBEXEC/devbox-run" "$@"; exec "$LIBEXEC/devbox-run" "$@" ;;
   result)  shift; runnable "$LIBEXEC/devbox-result" "$@"; exec "$LIBEXEC/devbox-result" "$@" ;;
+  probe)   shift; runnable "$LIBEXEC/devbox-probe" "$@"; exec "$LIBEXEC/devbox-probe" "$@" ;;
+  ci)      shift; runnable "$LIBEXEC/devbox-ci" "$@"; exec "$LIBEXEC/devbox-ci" "$@" ;;
   cancel)  shift; runnable "$LIBEXEC/devbox-cancel" "$@"; exec "$LIBEXEC/devbox-cancel" "$@" ;;
   runpod) shift; runnable "$LIBEXEC/devbox-runpod" "$@"; exec "$LIBEXEC/devbox-runpod" "$@" ;;
   hetzner) shift; runnable "$LIBEXEC/devbox-hetzner" "$@"; exec "$LIBEXEC/devbox-hetzner" "$@" ;;

@@ -3,6 +3,16 @@
 # data, and build the hooks a workspace runs.
 # shellcheck shell=bash
 
+# The services of DEVBOX_SERVICES, loaded by the first function that needs
+# them: the infra tools source this file for devbox_kv_parse alone, and carry
+# no devbox-services beside it.
+DEVBOX_SERVICES_LIB="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-services"
+devbox_services_load() {
+  declare -F devbox_services_hook >/dev/null && return 0
+  # shellcheck source=client/libexec/devbox-services
+  source "$DEVBOX_SERVICES_LIB" || { echo "devbox: could not load $DEVBOX_SERVICES_LIB; reinstall the devbox client" >&2; return 1; }
+}
+
 # Parse a file as DATA and never source it: one KEY=value per line, `#`
 # comment lines, one pair of matching outer quotes stripped, nothing expanded.
 # A sourced profile made every value code, which is why devbox-verify carries a
@@ -65,7 +75,8 @@ devbox_kv_parse() {
 DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
 DEVBOX_FORWARD_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR DEVBOX_RUNPOD_IMAGE \
 DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_VERIFY DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
-DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS DEVBOX_LOCAL_GATE "
+DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS DEVBOX_LOCAL_GATE \
+DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_WORKER_MEMORY "
 
 # A path of DEVBOX_SETUP_INPUTS or DEVBOX_SHARED_INPUTS, relative to the
 # checkout root. The laptop hashes each one, and the steps hand them to other
@@ -166,6 +177,153 @@ devbox_config_parse() {
       esac ;;
     *) DEVBOX_LOCAL_GATE=always ;;
   esac
+  devbox_config_services "$file"
+}
+
+# The services of D8 (learned-selection spec, section 8). devbox-services
+# carries what runs them, and loads only when a gate declares one.
+DEVBOX_SERVICE_NAMES="postgres redis rabbitmq minio"
+
+# The names DEVBOX_SERVICE_ENV may set, one per exported variable. minio
+# exports four variables, so it has four names: `minio` is its endpoint.
+DEVBOX_SERVICE_SLOTS="postgres redis rabbitmq minio minio-bucket minio-access-key minio-secret-key"
+
+# The default variable of a slot (section 8).
+devbox_service_default_var() {
+  case "$1" in
+    postgres) echo DATABASE_URL ;;
+    redis) echo REDIS_URL ;;
+    rabbitmq) echo AMQP_URL ;;
+    minio) echo S3_ENDPOINT_URL ;;
+    minio-bucket) echo S3_BUCKET ;;
+    minio-access-key) echo AWS_ACCESS_KEY_ID ;;
+    minio-secret-key) echo AWS_SECRET_ACCESS_KEY ;;
+    *) return 1 ;;
+  esac
+}
+
+# The variable a slot is exported under: its DEVBOX_SERVICE_ENV pair, else the
+# default. devbox_config_parse has checked the pairs.
+devbox_service_var() {
+  local slot="$1" pair
+  for pair in ${DEVBOX_SERVICE_ENV:-}; do
+    [ "${pair%%=*}" != "$slot" ] || { printf '%s\n' "${pair#*=}"; return 0; }
+  done
+  devbox_service_default_var "$slot"
+}
+
+# The service a slot belongs to.
+devbox_service_of_slot() {
+  case "$1" in minio-*) echo minio ;; *) echo "$1" ;; esac
+}
+
+# DEVBOX_SERVICES, DEVBOX_SERVICE_ENV and DEVBOX_WORKER_MEMORY (learned-selection
+# spec, section 4.1), from the committed file alone, as DEVBOX_LANES is: an
+# exported DEVBOX_SERVICES would start a server the project never declared.
+# DEVBOX_NEEDS_POSTGRES and DEVBOX_DB_URL_VAR, the older keys, are read from the
+# file alone too, and the two forms are made one here:
+#
+#   - DEVBOX_NEEDS_POSTGRES=1 adds postgres to DEVBOX_SERVICES, and a
+#     DEVBOX_DB_URL_VAR becomes its DEVBOX_SERVICE_ENV name;
+#   - postgres in DEVBOX_SERVICES sets DEVBOX_NEEDS_POSTGRES=1 and
+#     DEVBOX_DB_URL_VAR to its name, which devbox-verify and devbox-runpod read
+#     to send the DSN.
+#
+# DEVBOX_NEEDS_POSTGRES=1 with no DEVBOX_DB_URL_VAR keeps DEVBOX_DB_URL_VAR
+# empty, so devbox-runpod and the queue fallback refuse it by name, as before.
+#
+# Sets DEVBOX_WORKER_MEMORY_BYTES, which the hooks export to the workspace as
+# DEVBOX_WORKER_MEMORY.
+# shellcheck disable=SC2034  # DEVBOX_WORKER_MEMORY_BYTES is read by devbox_hooks_script
+devbox_config_services() {
+  local file="$1" key s pair slot name seen=" " names=" " n declared=0
+  for key in DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_NEEDS_POSTGRES DEVBOX_DB_URL_VAR; do
+    case "$DEVBOX_KV_SEEN" in *" $key "*) ;; *) printf -v "$key" '%s' "" ;; esac
+  done
+  for s in $DEVBOX_SERVICES; do
+    case " $DEVBOX_SERVICE_NAMES " in *" $s "*) ;; *)
+      echo "devbox: $file: refusing DEVBOX_SERVICES '$DEVBOX_SERVICES': '$s' is no service; write some of $DEVBOX_SERVICE_NAMES, separated by spaces" >&2
+      return 2 ;;
+    esac
+    case "$seen" in *" $s "*)
+      echo "devbox: $file: DEVBOX_SERVICES names $s twice" >&2; return 2 ;;
+    esac
+    seen="$seen$s "
+  done
+  case "$DEVBOX_NEEDS_POSTGRES" in
+    ""|0|1) ;;
+    *) echo "devbox: $file: refusing DEVBOX_NEEDS_POSTGRES '$DEVBOX_NEEDS_POSTGRES': write 1, or postgres in DEVBOX_SERVICES" >&2; return 2 ;;
+  esac
+  if [ "$DEVBOX_NEEDS_POSTGRES" = 0 ] && [[ "$seen" == *" postgres "* ]]; then
+    echo "devbox: $file: DEVBOX_SERVICES names postgres, and DEVBOX_NEEDS_POSTGRES=0 says no database; remove DEVBOX_NEEDS_POSTGRES" >&2
+    return 2
+  fi
+  # 1 when DEVBOX_SERVICES itself names postgres, so its name is DEVBOX_DB_URL_VAR.
+  if [[ "$seen" == *" postgres "* ]]; then declared=1; fi
+  if [ "$DEVBOX_NEEDS_POSTGRES" = 1 ] && [ "$declared" = 0 ]; then
+    DEVBOX_SERVICES="postgres${DEVBOX_SERVICES:+ $DEVBOX_SERVICES}"
+    seen="$seen postgres "
+  fi
+  # A DEVBOX_DB_URL_VAR beside a declared postgres is its name, whichever key
+  # declared it.
+  if [ -n "$DEVBOX_DB_URL_VAR" ] && [[ "$seen" == *" postgres "* ]]; then
+    (require_env_name "$DEVBOX_DB_URL_VAR" "$file") || return 2
+    for pair in $DEVBOX_SERVICE_ENV; do
+      [ "${pair%%=*}" = postgres ] || continue
+      [ "${pair#*=}" != "$DEVBOX_DB_URL_VAR" ] || continue
+      echo "devbox: $file: DEVBOX_DB_URL_VAR=$DEVBOX_DB_URL_VAR and DEVBOX_SERVICE_ENV $pair name two variables for one database; keep $pair and remove DEVBOX_DB_URL_VAR" >&2
+      return 2
+    done
+    [[ " $DEVBOX_SERVICE_ENV " == *" postgres="* ]] || DEVBOX_SERVICE_ENV="postgres=$DEVBOX_DB_URL_VAR${DEVBOX_SERVICE_ENV:+ $DEVBOX_SERVICE_ENV}"
+  fi
+  for pair in $DEVBOX_SERVICE_ENV; do
+    slot="${pair%%=*}"
+    name="${pair#*=}"
+    if [ "$slot" = "$pair" ] || [[ " $DEVBOX_SERVICE_SLOTS " != *" $slot "* ]]; then
+      echo "devbox: $file: refusing DEVBOX_SERVICE_ENV '$pair': write <name>=<VARIABLE>, where <name> is one of $DEVBOX_SERVICE_SLOTS" >&2
+      return 2
+    fi
+    if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "devbox: $file: refusing DEVBOX_SERVICE_ENV '$pair': '$name' is not an environment variable name" >&2
+      return 2
+    fi
+    if [[ "$seen" != *" $(devbox_service_of_slot "$slot") "* ]]; then
+      echo "devbox: $file: DEVBOX_SERVICE_ENV names $slot, and DEVBOX_SERVICES does not name $(devbox_service_of_slot "$slot")" >&2
+      return 2
+    fi
+    case "$names" in *" $slot="*)
+      echo "devbox: $file: DEVBOX_SERVICE_ENV names $slot twice" >&2; return 2 ;;
+    esac
+    names="$names$slot= "
+  done
+  # Two slots on one variable: the second export would replace the first URL.
+  names=" "
+  for slot in $DEVBOX_SERVICE_SLOTS; do
+    [[ "$seen" == *" $(devbox_service_of_slot "$slot") "* ]] || continue
+    name="$(devbox_service_var "$slot")"
+    case "$names" in *" $name "*)
+      echo "devbox: $file: two services export $name; give one another name in DEVBOX_SERVICE_ENV" >&2; return 2 ;;
+    esac
+    names="$names$name "
+  done
+  if [[ "$seen" == *" postgres "* ]]; then
+    DEVBOX_NEEDS_POSTGRES=1
+    [ "$declared" = 0 ] || DEVBOX_DB_URL_VAR="$(devbox_service_var postgres)"
+  else
+    DEVBOX_NEEDS_POSTGRES=0
+  fi
+  # DEVBOX_WORKER_MEMORY, the memory one test worker needs (section 7). The
+  # runner divides by it in bash arithmetic, which evaluates whatever text it
+  # is given, so the value is checked here and crosses as a byte count. Nine
+  # digits keep 999999999G inside a 64-bit integer.
+  case "$DEVBOX_KV_SEEN" in *" DEVBOX_WORKER_MEMORY "*) ;; *) DEVBOX_WORKER_MEMORY=1536M ;; esac
+  if [[ ! "$DEVBOX_WORKER_MEMORY" =~ ^([1-9][0-9]{0,8})([KMG]?)$ ]]; then
+    echo "devbox: $file: refusing DEVBOX_WORKER_MEMORY '$DEVBOX_WORKER_MEMORY': write a whole number with K, M or G, such as 1536M" >&2
+    return 2
+  fi
+  n="${BASH_REMATCH[1]}"
+  case "${BASH_REMATCH[2]}" in K) n=$((n * 1024)) ;; M) n=$((n * 1048576)) ;; G) n=$((n * 1073741824)) ;; esac
+  DEVBOX_WORKER_MEMORY_BYTES="$n"
 }
 
 # Whether a checkout with no .devbox.env may run its gate on this machine
@@ -512,6 +670,15 @@ SETUP
   # server in the gate's stdin, a RunPod pod in its run script, and this
   # machine for --local.
   [ -z "${DEVBOX_STEPS_HOOKS:-}" ] || printf '%s\n' "$DEVBOX_STEPS_HOOKS"
+  # The memory one test worker needs, for the runner's worker cap (learned-
+  # selection spec, section 7), as a byte count devbox_config_services checked.
+  [ -z "${DEVBOX_WORKER_MEMORY_BYTES:-}" ] || printf 'export DEVBOX_WORKER_MEMORY=%s\n' "$DEVBOX_WORKER_MEMORY_BYTES"
+  # devbox_services, which the step runner's devbox_verify calls before the
+  # first step (D8), on all three remote paths. RUN_ID is devbox-verify's run
+  # id, which names the run's vhost and bucket.
+  if [ -n "${DEVBOX_SERVICES:-}" ]; then
+    devbox_services_load && devbox_services_hook "${RUN_ID:-}" || return 1
+  fi
 }
 
 # Print the setup key: the sha256 of the DEVBOX_SETUP text and of each
@@ -552,7 +719,7 @@ devbox_setup_key() {
 # The tools of section 4.1, the files of client/share/ledger/ that the hooks
 # write into a workspace. With DEVBOX_QUEUE_FULL_ACTION=local, or --local, the
 # gate reads them from this directory itself.
-DEVBOX_LEDGER_TOOL_NAMES="devbox-ledger vitest-ledger.mjs ledger-core.mjs devbox_ledger.py"
+DEVBOX_LEDGER_TOOL_NAMES="devbox-ledger vitest-ledger.mjs ledger-core.mjs devbox-trace-hook.mjs devbox_ledger.py"
 DEVBOX_LEDGER_TOOLS_DIR="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/..")/share/ledger"
 
 # Print the bytes the ledger key hashes, in the order of section 3.2: the
@@ -678,6 +845,11 @@ devbox_steps_hooks() {
     # shellcheck disable=SC2016  # expanded by the bash that runs the gate, never here
     printf '  mkdir -p "$_d/logs" || { echo "devbox: could not create $_d/logs, so the gate did not run" >&2; return 2; }\n'
   fi
+  # The declared services answer before the first step, and a service that
+  # does not fails the gate with its own code, 3 (learned-selection spec, D8).
+  # A project with no service gets no devbox_services, and a gate on this
+  # machine got them from devbox_services_local_up.
+  printf '  if declare -F devbox_services >/dev/null; then devbox_services || return; fi\n'
   # shellcheck disable=SC2016  # expanded by the workspace bash, never here
   printf '  for _o in "$_d"/logs/*; do [ "$_o" = "$_d/logs/%s" ] || rm -rf -- "$_o"; done\n' "$run"
   if [ "$mode" = remote ]; then

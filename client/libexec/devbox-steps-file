@@ -1,7 +1,8 @@
 #!/bin/bash
 # Parse and check a project's .devbox/steps into the STEP_* variables that the
 # plan and the runner read (docs/specs/2026-11-14-client-owns-the-gate-design.md,
-# sections 4.2 and 6.7).
+# sections 4.2 and 6.7, and docs/specs/2026-11-14-learned-selection-design.md,
+# sections 4.2 and 5.6, for dir=, shards= and requires=).
 # shellcheck shell=bash
 
 # Every rule of section 4.2 is checked here, on the laptop, before any target is
@@ -21,7 +22,8 @@ _devbox_steps_refuse() {
 _devbox_steps_reset() {
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
-    STEP_SELECT=() STEP_RERUN=() STEP_CMD=() STEP_SOURCE=()
+    STEP_SELECT=() STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() \
+    STEP_DIR=() STEP_SHARDS=() STEP_REQUIRES=()
 }
 
 # Print the directories under <root> that the `each` pattern <pattern> names,
@@ -58,28 +60,47 @@ _devbox_steps_sub() {
   printf '%s' "$s"
 }
 
+# Check the folder of a dir= attribute after expansion, against the checkout
+# <root>. The runner starts the command there and maps every path between it
+# and the root (learned-selection spec, D6), so a folder outside the checkout
+# or missing from it would run the step somewhere no file of the plan names.
+_devbox_steps_dir_ok() {
+  local n="$1" dir="$2" root="$3" part
+  local -a parts
+  case "$dir" in
+    */) ;;
+    *) _devbox_steps_refuse "$n" "dir=$dir must end in \"/\""; return 2 ;;
+  esac
+  case "$dir" in /*|*//*)
+    _devbox_steps_refuse "$n" "dir=$dir must be a folder of the checkout, written relative to its root"; return 2 ;;
+  esac
+  IFS=/ read -ra parts <<<"$dir"
+  for part in "${parts[@]}"; do
+    case "$part" in .|..)
+      _devbox_steps_refuse "$n" "dir=$dir must not hold \"$part\""; return 2 ;;
+    esac
+  done
+  if [ ! -d "$root/$dir" ]; then
+    _devbox_steps_refuse "$n" "dir=$dir is not a folder of the checkout"; return 2
+  fi
+}
+
 # Add one expanded step. Runs inside devbox_steps_load and writes its locals
 # _line_of, _after_raw and _tmpl.
 #   $1 line  $2 name  $3 after (comma list)  $4 inputs (comma list)  $5 command
 #   $6 runner  $7 narrow  $8 select  $9 rerun  $10 the template name of an
-#   `each` line, or empty
+#   `each` line, or empty  $11 dir  $12 shards  $13 requires (comma list)
+#   $14 the checkout root
 _devbox_steps_add() {
-  local n="$1" name="$2" after="$3" inputs="$4" cmd="$5" stripped count
+  local n="$1" name="$2" after="$3" inputs="$4" cmd="$5"
   if [[ ! "$name" =~ ^[a-z0-9][a-z0-9:_-]*$ ]]; then
     _devbox_steps_refuse "$n" "step name \"$name\" is not [a-z0-9][a-z0-9:_-]*"; return 2
   fi
   if [ -n "${_line_of[$name]+x}" ]; then
     _devbox_steps_refuse "$n" "step name \"$name\" is already used on line ${_line_of[$name]}"; return 2
   fi
-  # select=related rewrites `vitest run` into `vitest related --run`
-  # (section 6.4), so the command must name it once: with none there is nothing
-  # to rewrite, and with two the client cannot know which run to narrow.
-  if [ "$8" = related ]; then
-    stripped="${cmd//vitest run/}"
-    count=$(( (${#cmd} - ${#stripped}) / 10 ))
-    if [ "$count" -ne 1 ]; then
-      _devbox_steps_refuse "$n" "select=related needs \"vitest run\" exactly once in the command, and it holds $count"; return 2
-    fi
+  if [ -n "${11}" ]; then
+    _devbox_steps_dir_ok "$n" "${11}" "${14}" || return 2
   fi
   _line_of[$name]="$n"
   _after_raw[$name]="$after"
@@ -91,16 +112,20 @@ _devbox_steps_add() {
   STEP_RERUN[$name]="$9"
   STEP_CMD[$name]="$cmd"
   STEP_AFTER[$name]=""
+  STEP_DIR[$name]="${11}"
+  STEP_SHARDS[$name]="${12:-1}"
+  STEP_REQUIRES[$name]="${13//,/ }"
   [ -z "${10}" ] || _tmpl[${10}]+="$name "
 }
 
 # Parse one line that is neither blank nor a comment. Runs inside
 # devbox_steps_load. $1 the line number, $2 the trimmed line, $3 the root.
 _devbox_steps_line() {
-  local n="$1" line="$2" root="$3" head rest cmd name w key val given=" "
+  local n="$1" line="$2" root="$3" head rest cmd name w key val given=" " tok
   local a_each="" a_after="" a_inputs="" a_runner="" a_narrow="" a_select="" a_rerun=""
+  local a_dir="" a_shards="" a_requires=""
   local dirs dir mod
-  local -a words
+  local -a words toks
   case "$line" in --|--[[:space:]]*)
     _devbox_steps_refuse "$n" "the line names no step before \" -- \""; return 2 ;;
   esac
@@ -125,7 +150,7 @@ _devbox_steps_line() {
     esac
     key="${w%%=*}"
     val="${w#*=}"
-    case "$key" in each|after|inputs|runner|narrow|select|rerun) ;; *)
+    case "$key" in each|after|inputs|runner|narrow|select|rerun|dir|shards|requires) ;; *)
       _devbox_steps_refuse "$n" "unknown attribute \"$key\""; return 2 ;;
     esac
     case "$given" in *" $key "*)
@@ -150,25 +175,54 @@ _devbox_steps_line() {
   case "$a_rerun" in ""|always) ;; *)
     _devbox_steps_refuse "$n" "rerun must be always, not \"$a_rerun\""; return 2 ;;
   esac
-  for key in after inputs; do
+  # shards= splits a runner step's test files across CI jobs (learned-selection
+  # spec, D10), so a step with no runner has no files to split.
+  if [ -n "$a_shards" ]; then
+    if [[ ! "$a_shards" =~ ^[1-9][0-9]{0,3}$ ]]; then
+      _devbox_steps_refuse "$n" "shards must be a whole number from 1, not \"$a_shards\""; return 2
+    fi
+    if [ -z "$a_runner" ]; then
+      _devbox_steps_refuse "$n" "shards=$a_shards needs runner=vitest or runner=pytest"; return 2
+    fi
+  fi
+  for key in after inputs requires; do
     val="a_$key"
     [ -n "${!val}" ] || continue
     case ",${!val}," in *,,*)
       _devbox_steps_refuse "$n" "$key=${!val} holds an empty entry"; return 2 ;;
     esac
   done
-  # narrow=failed needs the runner's ledger to know which files failed, and
-  # select=related needs vitest's own import graph (section 6.4, D14).
+  # A requires= token joins DEVBOX_REQUIRES for target selection, and crosses
+  # as one word of the check-requires verb, so it meets the rule
+  # require_safe_token applies to every DEVBOX_REQUIRES token: here, by line
+  # number, before any target is asked.
+  if [ -n "$a_requires" ]; then
+    IFS=, read -ra toks <<<"$a_requires"
+    for tok in "${toks[@]}"; do
+      case "$tok" in
+        -*|*[!A-Za-z0-9._:/+~=-]*) ;;
+        *) [ -z "${tok//./}" ] || continue ;;
+      esac
+      _devbox_steps_refuse "$n" "requires token \"$tok\" may hold only A-Za-z0-9._:/+~=-, may not be all dots and may not start with a dash"
+      return 2
+    done
+  fi
+  # narrow=failed needs the runner's ledger to know which files failed.
   if [ -n "$a_narrow" ] && [ -z "$a_runner" ]; then
     _devbox_steps_refuse "$n" "narrow=failed needs runner=vitest or runner=pytest"; return 2
   fi
-  if [ -n "$a_select" ] && [ "$a_runner" != vitest ]; then
-    _devbox_steps_refuse "$n" "select=related needs runner=vitest"; return 2
+  # select=related is read and ignored (learned-selection spec, section 4.2):
+  # every runner step now selects its test files by what they read, and
+  # `vitest related` answered "No test files found" with exit 0, a pass of no
+  # test. One warning line per file, after the whole file is read.
+  if [ -n "$a_select" ]; then
+    _select_lines+="${_select_lines:+, }$n"
+    a_select=""
   fi
 
   if [ -z "$a_each" ]; then
     _devbox_steps_add "$n" "$name" "$a_after" "$a_inputs" "$cmd" \
-      "$a_runner" "$a_narrow" "$a_select" "$a_rerun" "" || return 2
+      "$a_runner" "$a_narrow" "$a_select" "$a_rerun" "" "$a_dir" "$a_shards" "$a_requires" "$root" || return 2
     return 0
   fi
   case "$a_each" in */) ;; *)
@@ -190,7 +244,8 @@ _devbox_steps_line() {
       "$(_devbox_steps_sub "$a_after" "$dir" "$mod")" \
       "$(_devbox_steps_sub "$a_inputs" "$dir" "$mod")" \
       "$(_devbox_steps_sub "$cmd" "$dir" "$mod")" \
-      "$a_runner" "$a_narrow" "$a_select" "$a_rerun" "$name" || return 2
+      "$a_runner" "$a_narrow" "$a_select" "$a_rerun" "$name" \
+      "$(_devbox_steps_sub "$a_dir" "$dir" "$mod")" "$a_shards" "$a_requires" "$root" || return 2
   done <<<"$dirs"
 }
 
@@ -220,7 +275,9 @@ _devbox_steps_visit() {
 # name, then each attribute that is set in a fixed order with its list sorted,
 # then ` -- ` and the command. Two spellings of one step, attributes in another
 # order or extra blanks between words, give one string, so a cosmetic edit of
-# the file does not throw away every carried pass.
+# the file does not throw away every carried pass. shards= stays out: it only
+# splits CI jobs, and the step runs the same files either way. select= stays
+# out too, because it is ignored.
 _devbox_steps_source() {
   local name="$1" src="$1" list="" item
   local -a items
@@ -236,10 +293,17 @@ _devbox_steps_source() {
       < <(printf '%s\n' "${STEP_INPUTS[$name]}" | LC_ALL=C sort -u)
     src+=" inputs=$list"
   fi
+  [ -z "${STEP_DIR[$name]}" ] || src+=" dir=${STEP_DIR[$name]}"
   [ -z "${STEP_NARROW[$name]}" ] || src+=" narrow=${STEP_NARROW[$name]}"
+  list=""
+  if [ -n "${STEP_REQUIRES[$name]}" ]; then
+    read -ra items <<<"${STEP_REQUIRES[$name]}"
+    while IFS= read -r item; do list+="${list:+,}$item"; done \
+      < <(printf '%s\n' "${items[@]}" | LC_ALL=C sort -u)
+    src+=" requires=$list"
+  fi
   [ -z "${STEP_RERUN[$name]}" ] || src+=" rerun=${STEP_RERUN[$name]}"
   [ -z "${STEP_RUNNER[$name]}" ] || src+=" runner=${STEP_RUNNER[$name]}"
-  [ -z "${STEP_SELECT[$name]}" ] || src+=" select=${STEP_SELECT[$name]}"
   STEP_SOURCE[$name]="$src -- ${STEP_CMD[$name]}"
 }
 
@@ -248,7 +312,7 @@ _devbox_steps_source() {
 # line on stderr. <root> is the checkout that `each` patterns match against,
 # the parent of the file's directory when it is not given.
 devbox_steps_load() {
-  local file="$1" root="${2:-}" n=0 line name tok resolved t
+  local file="$1" root="${2:-}" n=0 line name tok resolved t _select_lines=""
   local -a toks list
   local -A _line_of=() _after_raw=() _tmpl=() _color=()
   [ -n "$root" ] || root="$(dirname "$(dirname "$file")")"
@@ -263,6 +327,7 @@ devbox_steps_load() {
     case "$line" in ""|"#"*) continue ;; esac
     _devbox_steps_line "$n" "$line" "$root" || return 2
   done <"$file"
+  [ -z "$_select_lines" ] || echo "devbox verify: .devbox/steps line $_select_lines: select=related is ignored, because every runner step selects its test files by what they read; release 2 refuses it" >&2
 
   # `after` resolves only once the whole file is read, so a step may name one
   # defined below it. A name that holds {name} on a line without each= waits
@@ -310,8 +375,13 @@ devbox_steps_from_verify() {
   STEP_INPUTS[verify]=""
   STEP_RUNNER[verify]=""
   STEP_NARROW[verify]=""
+  # shellcheck disable=SC2034 # a 3.3 array, kept empty: select=related is ignored
   STEP_SELECT[verify]=""
   STEP_RERUN[verify]=""
+  STEP_DIR[verify]=""
+  # shellcheck disable=SC2034 # read by devbox ci matrix, which sources this file
+  STEP_SHARDS[verify]=1
+  STEP_REQUIRES[verify]=""
   STEP_CMD[verify]="$1"
   # shellcheck disable=SC2034 # read by the plan, which the caller sources beside this file
   STEP_SOURCE[verify]="verify -- $1"

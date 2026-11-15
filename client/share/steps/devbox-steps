@@ -2,17 +2,23 @@
 # devbox-steps: run the steps of one gate by their graph, in the workspace, or
 # on this machine for `devbox verify --local`.
 # docs/specs/2026-11-14-client-owns-the-gate-design.md section 6.3 holds the
-# design and section 6.7 the plan format and this program's output.
+# design. docs/specs/2026-11-14-learned-selection-design.md section 5.6 holds
+# the plan format, the trace files and this program's output, section 5.3 the
+# trace of a step command and section 7 the worker count.
 #
 # Environment:
-#   DEVBOX_STEPS_PLAN    the plan file (section 6.7), required
-#   DEVBOX_STEPS_LOGS    the directory of the step logs, <name>.log, required
+#   DEVBOX_STEPS_PLAN    the plan file (learned-selection spec, section 5.6),
+#                        required
+#   DEVBOX_STEPS_LOGS    the directory of the step logs, <name>.log, required;
+#                        the traces of a run go under its trace/<name>/
 #   DEVBOX_LEDGER        the ledger of the resumable-gates spec, section 3.3;
-#                        unset, no ledger line is written and no plug-in wired
-#   DEVBOX_RESUME        1 skips a step whose last ledger record is `pass`
-#   DEVBOX_LEDGER_TOOLS  the directory of vitest-ledger.mjs, ledger-core.mjs and
-#                        devbox_ledger.py; required when DEVBOX_LEDGER is set
-#                        and the plan holds a runner step
+#                        unset, no ledger line is written
+#   DEVBOX_RESUME        1 skips a step whose last ledger record is `pass`, and
+#                        gives a runner step only its files not yet passed
+#   DEVBOX_LEDGER_TOOLS  the directory of vitest-ledger.mjs, ledger-core.mjs,
+#                        devbox_ledger.py and devbox-trace-hook.mjs; required
+#                        when DEVBOX_LEDGER is set and the plan holds a runner
+#                        step
 #   DEVBOX_STEPS_STEP_LINES  0 writes no `step` line of this program's own. The
 #                        one step of a DEVBOX_VERIFY gate writes its own ledger
 #                        (resumable-gates spec, section 4.2), and a `verify`
@@ -20,16 +26,23 @@
 #                        open at every stop, it was named as a hang at both
 #                        stops, and it hid the warning for a gate that wrote no
 #                        ledger at all.
+#   DEVBOX_TOKENS        the grant; unset on a laptop and in CI, where the
+#                        cores of nproc stand for it
+#   DEVBOX_WORKER_MEMORY the memory one test worker needs, 1536M by default
+#   DEVBOX_CGROUP_ROOT   the cgroup v2 directory of this workspace, whose
+#                        memory.max caps the workers; /sys/fs/cgroup by default
 # The project directory is the current directory.
 #
 # Exit status: 0 when no step failed, 1 when one did, 2 for a refused plan or
 # environment before any step starts, or a ledger or a log that cannot be
 # written once steps run, 143 after SIGTERM and 130 after SIGINT.
 #
-# stdout: one line when a step starts, ends, carries or resumes, then a summary
-# table, the full log of each failed step after `== <name>: <log path>`, and
-# last one `devbox-steps: result <name> <pass|fail|resumed|carried> <seconds>
-# <code>` line per step, in plan order.
+# stdout: one line when a step starts, ends, carries or resumes, one
+# `devbox-steps: untraced <name> <reason>` line for a step whose trace cannot
+# run, then a summary table, the full log of each failed step after
+# `== <name>: <log path>`, the `devbox-steps: trace <name> <seq> <chunk>` lines
+# of each traced step, and last one `devbox-steps: result <name>
+# <pass|fail|resumed|carried> <seconds> <code>` line per step, in plan order.
 set -euo pipefail
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
@@ -52,7 +65,7 @@ VITEST_DIR=node_modules/.devbox-ledger
 # ── the plan ─────────────────────────────────────────────────────────────────
 
 NAMES=()
-declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=()
+declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=() TESTS=() DIR=() TRACE=()
 
 n=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -64,27 +77,32 @@ while IFS= read -r line || [ -n "$line" ]; do
   IFS=$'\t' read -r -a fields <<<"$line"
   case "${fields[0]-}" in
     step)
-      if [ "${#tabs}" -ne 6 ] || [ "${#fields[@]}" -ne 7 ]; then
-        plan_die "$n" "a step line has 7 non-empty fields separated by one tab"
+      if [ "${#tabs}" -ne 8 ] || [ "${#fields[@]}" -ne 9 ]; then
+        plan_die "$n" "a step line has 9 non-empty fields separated by one tab"
       fi
       name="${fields[1]}"
       [[ "$name" =~ ^[a-z0-9][a-z0-9:_-]*$ ]] || plan_die "$n" "the step name $(printf '%q' "$name") is not [a-z0-9][a-z0-9:_-]*"
       [ -z "${MODE[$name]+x}" ] || plan_die "$n" "the step $name is planned twice"
-      case "${fields[2]}" in run | carry | narrow | related) ;; *) plan_die "$n" "the plan of $name is $(printf '%q' "${fields[2]}"), not run, carry, narrow or related" ;; esac
+      case "${fields[2]}" in run | carry | narrow | select) ;; *) plan_die "$n" "the plan of $name is $(printf '%q' "${fields[2]}"), not run, carry, narrow or select" ;; esac
       case "${fields[4]}" in vitest | pytest | -) ;; *) plan_die "$n" "the runner of $name is $(printf '%q' "${fields[4]}"), not vitest, pytest or -" ;; esac
-      [ "${fields[2]}" != narrow ] || [ "${fields[4]}" != - ] || plan_die "$n" "the narrow step $name names no runner"
-      [ "${fields[2]}" != related ] || [ "${fields[4]}" = vitest ] || plan_die "$n" "the related step $name is not a vitest step"
+      case "${fields[2]}" in narrow | select) [ "${fields[4]}" != - ] || plan_die "$n" "the ${fields[2]} step $name names no runner" ;; esac
       # The decode runs in this shell, so a command that is not base64 stops
       # the plan here rather than running as an empty string. base64's own
       # message names no plan line, and plan_die does.
       cmd="$(printf '%s' "${fields[6]}" | base64 -d 2>/dev/null)" || plan_die "$n" "the command of $name is not base64"
       [ -n "$cmd" ] || plan_die "$n" "the command of $name is empty"
-      if [ "${fields[2]}" = related ]; then
-        rest="${cmd#*vitest run}"
-        if [ "$rest" = "$cmd" ] || [ "${rest#*vitest run}" != "$rest" ]; then
-          plan_die "$n" "the related step $name must hold \`vitest run\` exactly once"
-        fi
+      dir="${fields[7]}"
+      if [ "$dir" != - ]; then
+        # The folder joins the project directory as a prefix of every file the
+        # runner passes, so an absolute path or a .. would run the step, and
+        # map its files, outside the synced tree.
+        [ "${dir%/}" != "$dir" ] || plan_die "$n" "the dir of $name, $(printf '%q' "$dir"), does not end in /"
+        case "/$dir" in
+          //* | *//* | */./* | */../*) plan_die "$n" "the dir of $name, $(printf '%q' "$dir"), is not a relative folder without . or .." ;;
+        esac
+        [ -d "$dir" ] || plan_die "$n" "the dir of $name, $(printf '%q' "$dir"), is not a folder of $PWD"
       fi
+      case "${fields[8]}" in 0 | 1) ;; *) plan_die "$n" "the trace of $name is $(printf '%q' "${fields[8]}"), not 0 or 1" ;; esac
       NAMES+=("$name")
       MODE[$name]="${fields[2]}"
       RUNNER[$name]="${fields[4]}"
@@ -93,30 +111,43 @@ while IFS= read -r line || [ -n "$line" ]; do
       CMD[$name]="$cmd"
       LINE[$name]="$n"
       FILES[$name]=""
+      TESTS[$name]=""
+      DIR[$name]=""
+      [ "$dir" = - ] || DIR[$name]="$dir"
+      TRACE[$name]="${fields[8]}"
       ;;
-    file)
+    file | test)
+      kind="${fields[0]}"
       if [ "${#tabs}" -ne 2 ] || [ "${#fields[@]}" -ne 3 ]; then
-        plan_die "$n" "a file line has 3 non-empty fields separated by one tab"
+        plan_die "$n" "a $kind line has 3 non-empty fields separated by one tab"
       fi
       name="${fields[1]}" path="${fields[2]}"
-      [ -n "${MODE[$name]+x}" ] || plan_die "$n" "a file line names $(printf '%q' "$name"), which no step line above it plans"
-      case "${MODE[$name]}" in narrow | related) ;; *) plan_die "$n" "a file line names $name, whose plan is ${MODE[$name]}, not narrow or related" ;; esac
+      [ -n "${MODE[$name]+x}" ] || plan_die "$n" "a $kind line names $(printf '%q' "$name"), which no step line above it plans"
+      if [ "$kind" = file ]; then
+        case "${MODE[$name]}" in narrow | select) ;; *) plan_die "$n" "a file line names $name, whose plan is ${MODE[$name]}, not narrow or select" ;; esac
+      else
+        [ "${RUNNER[$name]}" != - ] || plan_die "$n" "a test line names $name, which names no runner"
+      fi
       # A runner reads a word that starts with - as one of its options, so the
       # file would become a flag of the test run instead of its filter.
       [ "${path#-}" = "$path" ] || plan_die "$n" "the file $(printf '%q' "$path") starts with -, which $name's runner would read as an option"
-      FILES[$name]+="$path"$'\n'
+      # A dir= step's runner gets each file relative to its folder, and a file
+      # outside that folder has no such name.
+      if [ -n "${DIR[$name]}" ] && [ "${path#"${DIR[$name]}"}" = "$path" ]; then
+        plan_die "$n" "the file $(printf '%q' "$path") is outside ${DIR[$name]}, the dir of $name"
+      fi
+      if [ "$kind" = file ]; then FILES[$name]+="$path"$'\n'; else TESTS[$name]+="$path"$'\n'; fi
       ;;
-    *) plan_die "$n" "a line starts with step or file, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
+    *) plan_die "$n" "a line starts with step, file or test, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
   esac
 done <"$DEVBOX_STEPS_PLAN"
 [ "${#NAMES[@]}" -gt 0 ] || die "the plan $DEVBOX_STEPS_PLAN holds no step"
 
 for name in "${NAMES[@]}"; do
   case "${MODE[$name]}" in
-    narrow | related)
-      # A narrow or a related step with no file runs the whole suite under a
-      # plan that says it ran a part, and `vitest related --run` with no file
-      # runs no test at all and passes.
+    narrow | select)
+      # A narrow or a select step with no file would run the whole suite
+      # under a plan that says it ran a part.
       [ -n "${FILES[$name]}" ] || plan_die "${LINE[$name]}" "the ${MODE[$name]} step $name has no file line"
       ;;
   esac
@@ -168,33 +199,144 @@ if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ "$STEP_LINES" != 0 ] && [ -f "$LED
   done < <(awk -F '\t' '$1 == "step" { last[$2] = $3 } END { for (s in last) if (last[s] == "pass") print s }' "$LEDGER")
 fi
 
-if [ -n "$LEDGER" ]; then
-  # The shell's message names the path alone; die names the path and the cause.
-  { : >>"$LEDGER"; } 2>/dev/null || die "cannot append to the ledger $LEDGER"
-  need_vitest=0 need_pytest=0
-  for name in "${NAMES[@]}"; do
-    case "${MODE[$name]}" in carry) continue ;; esac
-    [ -z "${LEDGER_PASSED[$name]+x}" ] || continue
-    case "${RUNNER[$name]}" in vitest) need_vitest=1 ;; pytest) need_pytest=1 ;; esac
+[ -z "$LEDGER" ] || { : >>"$LEDGER"; } 2>/dev/null || die "cannot append to the ledger $LEDGER"
+
+# The files of each runner whose LAST ledger record is `pass`, as
+# passedFiles() of ledger-core.mjs and devbox_ledger.py read them: a `start`
+# after a `pass` means a later run began the file and did not finish it.
+declare -A PASSED_FILES=()
+if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ -f "$LEDGER" ]; then
+  for r in vitest pytest; do
+    PASSED_FILES[$r]="$(RUNNER_NAME="$r" awk -F '\t' '
+      $1 == "file" && $2 == ENVIRON["RUNNER_NAME"] && NF >= 4 { last[$3] = $4 }
+      END { for (f in last) if (last[f] == "pass") print f }' "$LEDGER")" || die "cannot read the ledger $LEDGER"
   done
-  if [ "$need_vitest" = 1 ] || [ "$need_pytest" = 1 ]; then
-    [ -n "${DEVBOX_LEDGER_TOOLS-}" ] || die "DEVBOX_LEDGER is set and a runner step runs, but DEVBOX_LEDGER_TOOLS names no directory"
+fi
+
+# The files each runner step is given, repository-relative, one per line
+# (section 5.6, D7). A narrow or a select step runs its file lines. A run step
+# on a resume runs its test lines less the files that passed, so a project's
+# own `exclude` cannot hide the client's choice: a vitest 2 release ignored an
+# `--exclude` from the command line in a project that set its own, and ran
+# every passed file again. A step that is given no list runs its whole suite.
+declare -A RUNLIST=() HASLIST=() RESUMED_ALL=()
+for name in "${NAMES[@]}"; do
+  [ "${RUNNER[$name]}" != - ] || continue
+  [ "${MODE[$name]}" != carry ] || continue
+  [ -z "${LEDGER_PASSED[$name]+x}" ] || continue
+  base=""
+  case "${MODE[$name]}" in
+    narrow | select) base="${FILES[$name]}" ;;
+    run) [ "$RESUME" != 1 ] || [ -z "$LEDGER" ] || base="${TESTS[$name]}" ;;
+  esac
+  [ -n "$base" ] || continue
+  list="$base"
+  if [ -n "${PASSED_FILES[${RUNNER[$name]}]-}" ]; then
+    list="$(awk 'NR == FNR { passed[$0] = 1; next } !($0 in passed)' \
+      <(printf '%s\n' "${PASSED_FILES[${RUNNER[$name]}]}") <(printf '%s' "$base"))" || die "cannot subtract the passed files of $name"
+    [ -z "$list" ] || list+=$'\n'
   fi
-  if [ "$need_pytest" = 1 ]; then
-    [ -f "$DEVBOX_LEDGER_TOOLS/devbox_ledger.py" ] || die "DEVBOX_LEDGER_TOOLS holds no devbox_ledger.py, so a pytest step would write no file line"
+  HASLIST[$name]=1
+  RUNLIST[$name]="$list"
+  # Every file this step would run passed in an earlier run of this gate. An
+  # empty list would reach the runner as no file filter at all, and run the
+  # whole suite.
+  [ -n "$list" ] || RESUMED_ALL[$name]=1
+done
+
+# The trace of each step with `trace 1` (section 5.3 and 5.6). A step that
+# cannot be traced runs as it ran before traces, untraced, and one line names
+# the reason: the plan then keeps the step's earlier inputs or every synced
+# file, so a trace that cannot run never carries a step.
+declare -A TRACED=() UNTRACED=()
+
+# -y prints the path of each file descriptor, AT_FDCWD's included, so a path
+# relative to a directory descriptor or to the cwd resolves without a second
+# pass. getdents64 is how a directory is listed, fchdir and clone carry the
+# cwd from a process to its children, and `?` lets a syscall this architecture
+# does not have pass.
+STRACE_SET='%file,getdents64,?getdents,fchdir,clone,?clone3,?fork,?vfork'
+STRACE_OPTS=()
+STRACE_OK="" STRACE_WHY=""
+strace_probe() {
+  local err
+  [ -z "$STRACE_OK" ] || return 0
+  if ! command -v strace >/dev/null 2>&1; then
+    STRACE_OK=0 STRACE_WHY="strace is not installed"
+    return 0
   fi
-  if [ "$need_vitest" = 1 ]; then
-    # vitest 3 refuses a reporter path outside the project folder, so the
-    # reporter is copied into it (resumable-gates spec, section 4.2). It imports
-    # ./ledger-core.mjs, so both files land side by side. The copy happens once,
-    # before any step, so two vitest steps never read a half-written file.
-    for f in vitest-ledger.mjs ledger-core.mjs; do
-      [ -f "$DEVBOX_LEDGER_TOOLS/$f" ] || die "DEVBOX_LEDGER_TOOLS holds no $f, so a vitest step would write no file line"
-    done
-    mkdir -p "$VITEST_DIR" || die "cannot create $PWD/$VITEST_DIR for the vitest reporter"
-    cp "$DEVBOX_LEDGER_TOOLS/vitest-ledger.mjs" "$DEVBOX_LEDGER_TOOLS/ledger-core.mjs" "$VITEST_DIR/" \
-      || die "cannot copy the vitest reporter into $PWD/$VITEST_DIR"
+  # --seccomp-bpf stops the tracee only at the traced syscalls. Without it
+  # every syscall stops, and a type check ran more than twice as long
+  # under strace as without it (MEASURED in section 14,
+  # P3). An strace or a kernel without seccomp filters refuses the option, and
+  # the plain form is the next best.
+  for bpf in --seccomp-bpf ""; do
+    STRACE_OPTS=(-f -qq -y ${bpf:+"$bpf"} -e "trace=$STRACE_SET")
+    if err="$(strace "${STRACE_OPTS[@]}" -o /dev/null true 2>&1)"; then
+      STRACE_OK=1
+      return 0
+    fi
+  done
+  # A container whose seccomp profile or capabilities forbid ptrace makes
+  # strace exit 1 before it runs the command, so the step itself would fail.
+  STRACE_OK=0 STRACE_WHY="strace cannot attach: $(printf '%s' "$err" | tail -1)"
+}
+need_vitest=0 need_pytest=0
+for name in "${NAMES[@]}"; do
+  [ "${MODE[$name]}" != carry ] || continue
+  [ -z "${LEDGER_PASSED[$name]+x}" ] || continue
+  [ -z "${RESUMED_ALL[$name]+x}" ] || continue
+  if [ "${TRACE[$name]}" = 1 ]; then
+    case "${RUNNER[$name]}" in
+      -)
+        strace_probe
+        if [ "$STRACE_OK" = 1 ]; then TRACED[$name]=1; else UNTRACED[$name]="$STRACE_WHY"; fi
+        ;;
+      vitest | pytest)
+        why=""
+        if [ -z "${DEVBOX_LEDGER_TOOLS-}" ]; then
+          why="DEVBOX_LEDGER_TOOLS names no directory"
+        else
+          tools="devbox_ledger.py"
+          [ "${RUNNER[$name]}" = pytest ] || tools="vitest-ledger.mjs ledger-core.mjs devbox-trace-hook.mjs"
+          for f in $tools; do
+            [ -f "$DEVBOX_LEDGER_TOOLS/$f" ] || { why="DEVBOX_LEDGER_TOOLS holds no $f"; break; }
+          done
+        fi
+        if [ -z "$why" ]; then TRACED[$name]=1; else UNTRACED[$name]="$why"; fi
+        ;;
+    esac
   fi
+  if [ -n "$LEDGER" ] || [ -n "${TRACED[$name]+x}" ]; then
+    case "${RUNNER[$name]}" in vitest) need_vitest=1 ;; pytest) need_pytest=1 ;; esac
+  fi
+done
+
+if [ "$need_vitest" = 1 ] || [ "$need_pytest" = 1 ]; then
+  [ -n "${DEVBOX_LEDGER_TOOLS-}" ] || die "DEVBOX_LEDGER is set and a runner step runs, but DEVBOX_LEDGER_TOOLS names no directory"
+fi
+if [ "$need_pytest" = 1 ]; then
+  [ -f "$DEVBOX_LEDGER_TOOLS/devbox_ledger.py" ] || die "DEVBOX_LEDGER_TOOLS holds no devbox_ledger.py, so a pytest step would write no file line"
+fi
+if [ "$need_vitest" = 1 ]; then
+  # vitest 3 refuses a reporter path outside the project folder, so the
+  # reporter is copied into it (resumable-gates spec, section 4.2). It imports
+  # ./ledger-core.mjs, so both files land side by side. The copy happens once,
+  # before any step, so two vitest steps never read a half-written file. A
+  # dir= step's vitest root is its folder, so its copy goes under that folder.
+  for f in vitest-ledger.mjs ledger-core.mjs; do
+    [ -f "$DEVBOX_LEDGER_TOOLS/$f" ] || die "DEVBOX_LEDGER_TOOLS holds no $f, so a vitest step would write no file line"
+  done
+  declare -A COPIED=()
+  for name in "${NAMES[@]}"; do
+    [ "${RUNNER[$name]}" = vitest ] || continue
+    dest="${DIR[$name]}$VITEST_DIR"
+    [ -z "${COPIED[$dest]+x}" ] || continue
+    COPIED[$dest]=1
+    mkdir -p "$dest" || die "cannot create $PWD/$dest for the vitest reporter"
+    cp "$DEVBOX_LEDGER_TOOLS/vitest-ledger.mjs" "$DEVBOX_LEDGER_TOOLS/ledger-core.mjs" "$dest/" \
+      || die "cannot copy the vitest reporter into $PWD/$dest"
+  done
 fi
 
 # ── the steps ────────────────────────────────────────────────────────────────
@@ -208,78 +350,407 @@ for name in "${NAMES[@]}"; do STATUS[$name]=pending; done
 log_of() { printf '%s/%s.log' "$DEVBOX_STEPS_LOGS" "$1"; }
 stamp() { printf '[%d s]' "$SECONDS"; }
 
-# The final command of one step, with the runner's plug-in and the file
-# filters appended. Every appended word goes through printf %q, because the
-# command runs under bash -c and a file name may hold a space or a quote.
+trace_dir_of() { printf '%s/trace/%s' "$DEVBOX_STEPS_LOGS" "$1"; }
+
+# ── workers (section 7) ──────────────────────────────────────────────────────
+#
+# A container shows every core of its host, so a runner that sizes its pool
+# from the cores it sees starts one worker per host core on a grant of a few
+# tokens: consumers pinned vitest to the granted cores with taskset because
+# tests that pass on a laptop timed out at 5 s on a devbox. The worker count is
+# the step's share of the grant, capped by the workspace's memory and by the
+# number of files the step runs.
+
+# The bytes of a size such as 1536M, 2G or 1048576, or a refusal.
+size_bytes() {
+  local num="${1%[KkMmGg]}" unit
+  unit="${1#"$num"}"
+  [[ "$num" =~ ^[0-9]+$ ]] || return 1
+  case "$unit" in
+    "") printf '%s\n' "$num" ;;
+    [Kk]) printf '%s\n' "$((num * 1024))" ;;
+    [Mm]) printf '%s\n' "$((num * 1048576))" ;;
+    [Gg]) printf '%s\n' "$((num * 1073741824))" ;;
+  esac
+}
+
+if [ -n "${DEVBOX_TOKENS-}" ]; then
+  [[ "$DEVBOX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "DEVBOX_TOKENS is $(printf '%q' "$DEVBOX_TOKENS"), not a token count"
+  TOKENS="$DEVBOX_TOKENS"
+else
+  TOKENS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" || die "neither nproc nor getconf names this machine's cores, and DEVBOX_TOKENS is unset"
+fi
+if ! WORKER_MEMORY="$(size_bytes "${DEVBOX_WORKER_MEMORY:-1536M}")" || [ "$WORKER_MEMORY" -eq 0 ]; then
+  die "DEVBOX_WORKER_MEMORY is $(printf '%q' "${DEVBOX_WORKER_MEMORY-}"), not a size such as 1536M"
+fi
+# The workspace's own limit, then the machine's memory. `max` in memory.max
+# means no limit, and the soft limit memory.high is the next best figure.
+MEMORY_MAX=""
+for f in memory.max memory.high; do
+  v=""
+  # An absent file is a host without cgroup v2 or without that controller, the
+  # case the meminfo fallback below covers.
+  [ ! -r "${DEVBOX_CGROUP_ROOT:-/sys/fs/cgroup}/$f" ] || read -r v <"${DEVBOX_CGROUP_ROOT:-/sys/fs/cgroup}/$f" || v=""
+  if [[ "$v" =~ ^[0-9]+$ ]]; then MEMORY_MAX="$v"; break; fi
+done
+if [ -z "$MEMORY_MAX" ] && [ -r /proc/meminfo ]; then
+  v="$(awk '$1 == "MemTotal:" { print $2 * 1024; exit }' /proc/meminfo)" || v=""
+  [[ "$v" =~ ^[0-9]+$ ]] && MEMORY_MAX="$v"
+fi
+MEMORY_CAP=""
+if [ -n "$MEMORY_MAX" ]; then
+  MEMORY_CAP=$(((MEMORY_MAX - 4 * 1073741824) / WORKER_MEMORY))
+  [ "$MEMORY_CAP" -ge 1 ] || MEMORY_CAP=1
+fi
+
+# The number of files each runner step runs: its list, or its test lines.
+declare -A FILE_COUNT=()
+for name in "${NAMES[@]}"; do
+  files=""
+  if [ -n "${HASLIST[$name]+x}" ]; then files="${RUNLIST[$name]}"; else files="${TESTS[$name]}"; fi
+  FILE_COUNT[$name]=0
+  [ -z "$files" ] || FILE_COUNT[$name]="$(printf '%s' "$files" | awk 'END { print NR }')"
+done
+
+# step_workers <name> <runner steps that run at the same time>
+step_workers() {
+  local name="$1" n
+  n=$((TOKENS / ($2 > 0 ? $2 : 1)))
+  [ -z "$MEMORY_CAP" ] || [ "$n" -le "$MEMORY_CAP" ] || n="$MEMORY_CAP"
+  [ "${FILE_COUNT[$name]}" = 0 ] || [ "$n" -le "${FILE_COUNT[$name]}" ] || n="${FILE_COUNT[$name]}"
+  [ "$n" -ge 1 ] || n=1
+  printf '%s\n' "$n"
+}
+
+# Whether the command already sets the runner's worker count, which it keeps.
+own_workers() {
+  local word
+  local -a words=()
+  read -r -a words <<<"$2"
+  for word in "${words[@]}"; do
+    case "$1:$word" in
+      vitest:--maxWorkers | vitest:--maxWorkers=* | vitest:--pool-options* | vitest:--poolOptions*) return 0 ;;
+      pytest:-n | pytest:-n[0-9]* | pytest:-nauto | pytest:-nlogical | pytest:--numprocesses | pytest:--numprocesses=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# The major version of the vitest a step in folder $1 resolves, from the
+# nearest node_modules/vitest/package.json up to the project root, or nothing.
+vitest_major() {
+  local d="$1" v
+  while :; do
+    if [ -r "$d/node_modules/vitest/package.json" ]; then
+      v="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([0-9][0-9]*\)\..*/\1/p' "$d/node_modules/vitest/package.json" | head -n1)"
+      printf '%s' "$v"
+      return 0
+    fi
+    [ "$d" = . ] || [ "$d" = ./ ] && return 0
+    d="$(dirname -- "$d")"
+  done
+}
+
+# Whether pytest-xdist loads in the step's own pytest: the command up to its
+# pytest word, run with -VV, which lists every plug-in that pytest registers.
+# A step whose pytest cannot load xdist would fail on `-n` as an unknown
+# option. Prints the words it ran.
+pytest_xdist() {
+  local word prefix="" out
+  local -a words=()
+  read -r -a words <<<"$1"
+  for word in "${words[@]}"; do
+    prefix+="${prefix:+ }$word"
+    case "${word##*/}" in
+      pytest | py.test)
+        printf '%s -VV\n' "$prefix"
+        # The exit status is not the answer: pytest -VV exits 0 with or without
+        # plug-ins, and the list it prints is.
+        out="$(bash -c "$prefix -VV" </dev/null 2>&1)" || true
+        [[ "$out" == *xdist* ]]
+        return
+        ;;
+    esac
+  done
+  printf '%s\n' "no pytest word in the command"
+  return 1
+}
+
+# ── the trace of a step command (section 5.3) ────────────────────────────────
+
+# The `-` lines of section 5.6 from one strace log, unsorted. The awk
+# variables: start, the directory the command started in; root, the project
+# directory; proot, the same directory with its symlinks resolved, which is
+# what -y prints.
+# shellcheck disable=SC2016  # awk code: the $ fields are awk's, never the shell's
+STRACE_AWK='
+function norm(p,    n, a, i, k, out) {
+  n = split(p, a, "/"); k = 0
+  for (i = 1; i <= n; i++) {
+    if (a[i] == "" || a[i] == ".") continue
+    if (a[i] == "..") { if (k > 0) k--; continue }
+    seg[++k] = a[i]
+  }
+  out = ""
+  for (i = 1; i <= k; i++) out = out "/" seg[i]
+  return out == "" ? "/" : out
+}
+function resolve(base, p) { return substr(p, 1, 1) == "/" ? norm(p) : norm(base "/" p) }
+function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+# The C string that opens at the first double quote of s, unescaped; STR_OK
+# says whether s held one.
+function cstring(s,    q, rest, e, out, i, n, c, d, j) {
+  STR_OK = 0
+  q = index(s, "\""); if (q == 0) return ""
+  rest = substr(s, q + 1)
+  e = index(rest, "\""); if (e == 0) return ""
+  if (index(substr(rest, 1, e - 1), "\\") == 0) { STR_OK = 1; return substr(rest, 1, e - 1) }
+  out = ""; n = length(rest)
+  for (i = 1; i <= n; i++) {
+    c = substr(rest, i, 1)
+    if (c == "\"") { STR_OK = 1; return out }
+    if (c != "\\") { out = out c; continue }
+    c = substr(rest, ++i, 1)
+    if (c == "n") out = out "\n"
+    else if (c == "t") out = out "\t"
+    else if (c == "r") out = out "\r"
+    else if (c == "v") out = out "\v"
+    else if (c == "f") out = out "\f"
+    else if (c == "x") { d = hexval(substr(rest, i + 1, 1)) * 16 + hexval(substr(rest, i + 2, 1)); i += 2; out = out sprintf("%c", d) }
+    else if (c ~ /[0-7]/) {
+      d = c + 0
+      for (j = 0; j < 2 && substr(rest, i + 1, 1) ~ /[0-7]/; j++) d = d * 8 + substr(rest, ++i, 1)
+      out = out sprintf("%c", d)
+    } else out = out c
+  }
+  return ""
+}
+# The path -y printed for the descriptor that opens s, as in 3</a/b>, or "".
+function fdpath(s,    e) {
+  if (s !~ /^[0-9]+</ && s !~ /^AT_FDCWD</) return ""
+  s = substr(s, index(s, "<") + 1)
+  e = index(s, ">, "); if (e == 0) e = index(s, ">)"); if (e == 0) return ""
+  s = substr(s, 1, e - 1)
+  return substr(s, 1, 1) == "/" ? norm(s) : ""
+}
+function emit(kind, a,    rel) {
+  if (a == root || a == proot) rel = ""
+  else if (substr(a, 1, length(root) + 1) == root "/") rel = substr(a, length(root) + 2)
+  else if (substr(a, 1, length(proot) + 1) == proot "/") rel = substr(a, length(proot) + 2)
+  else return
+  # The repository database is not synced and changes with every commit.
+  if (rel ~ /^\.git(\/|$)/) return
+  if (rel ~ /(^|\/)(node_modules|\.venv)(\/|$)/) { if (!setup) print "setup\t-"; setup = 1; return }
+  if (rel ~ /[\t\n]/) { if (!badpath) print "partial\t-\ta path holds a tab or a newline"; badpath = 1; return }
+  if (kind == "list") print "list\t-\t" (rel == "" ? "." : rel) "/"
+  else if (rel != "") print "read\t-\t" rel
+}
+BEGIN { start = norm(start); root = norm(root); proot = norm(proot); lastclone = "" }
+{
+  if (!match($0, /^[0-9]+ +/)) next
+  pid = substr($0, 1, RLENGTH); sub(/ +$/, "", pid)
+  text = substr($0, RLENGTH + 1)
+  # A child can print before the clone that made it returns in its parent:
+  # it starts in the cwd of the newest clone still open.
+  if (!(pid in cwd)) cwd[pid] = lastclone != "" ? lastclone : start
+  if (substr(text, 1, 5) == "<... ") {
+    r = index(text, " resumed>")
+    if (r == 0 || !(pid in pend)) next
+    text = pend[pid] substr(text, r + 9)
+    delete pend[pid]
+  } else if ((u = index(text, " <unfinished ...>")) > 0) {
+    pend[pid] = substr(text, 1, u - 1)
+    if (pend[pid] ~ /^(clone|clone3|fork|vfork)\(/) lastclone = cwd[pid]
+    next
+  }
+  p = index(text, "(")
+  if (p < 2) next
+  call = substr(text, 1, p - 1)
+  args = substr(text, p + 1)
+  ret = ""; rest = text; off = 0
+  while ((i = index(rest, " = ")) > 0) { off += i + 2; rest = substr(rest, i + 3) }
+  if (off > 0) ret = substr(text, off + 1)
+  if (call ~ /^(clone|clone3|fork|vfork)$/) {
+    if (ret + 0 > 0) cwd[ret + 0] = cwd[pid]
+    lastclone = ""
+    next
+  }
+  if (call ~ /^getdents(64)?$/) { d = fdpath(args); if (d != "") emit("list", d); next }
+  if (call == "fchdir") { d = fdpath(args); if (d != "" && ret + 0 == 0) cwd[pid] = d; next }
+  base = cwd[pid]
+  if (call ~ /^(openat|openat2|newfstatat|fstatat64|statx|faccessat|faccessat2|readlinkat|execveat)$/) {
+    if (args ~ /^AT_FDCWD/) { d = fdpath(args); if (d != "") { cwd[pid] = d; base = d } }
+    else { base = fdpath(args); if (base == "") next }
+  } else if (call !~ /^(open|stat|lstat|stat64|lstat64|access|readlink|execve|chdir)$/) next
+  path = cstring(args)
+  if (!STR_OK || path == "") next
+  if (call == "chdir") { if (ret + 0 == 0) cwd[pid] = resolve(base, path); next }
+  # A file opened only to be written is an output of the step, not an input.
+  if (call ~ /^open/ && index(args, "O_WRONLY")) next
+  emit("read", resolve(base, path))
+}'
+
+# strace_trace <strace log> <start dir> <trace file>: the trace file of a
+# step command. A read of a path that is a folder now is a stat, and its
+# listing, when there was one, is its own `list` line.
+strace_trace() {
+  local log="$1" start="$2" out="$3" line kind path lines
+  lines="$(LC_ALL=C awk -v start="$start" -v root="$PWD" -v proot="$(pwd -P)" "$STRACE_AWK" "$log" | LC_ALL=C sort -u)" || return 1
+  {
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      IFS=$'\t' read -r kind _ path <<<"$line"
+      if [ "$kind" = read ] && [ -d "$path" ]; then continue; fi
+      printf '%s\n' "$line"
+    done <<<"$lines"
+    # A log whose last line has no newline was cut short.
+    [ -z "$(tail -c 1 "$log")" ] || printf 'partial\t-\ttrace cut short\n'
+  } >"$out"
+}
+
+# setuid_run <strace log>: the first program the traced command ran that is
+# setuid or setgid. A tracer that is not root drops that bit, so `sudo` under
+# strace answers "effective uid is not 0" and the step fails.
+setuid_run() {
+  local prog
+  while IFS= read -r prog; do
+    if [ -u "$prog" ] || [ -g "$prog" ]; then printf '%s\n' "$prog"; return 0; fi
+  done < <(LC_ALL=C awk 'match($0, /execve\("\/[^"]*"/) { print substr($0, RSTART + 8, RLENGTH - 9) }' "$1" | LC_ALL=C sort -u)
+  return 1
+}
+
+# ── a step ───────────────────────────────────────────────────────────────────
+
+# The final command of one step, with the runner's plug-in, its worker option
+# and its files appended. Every appended word goes through printf %q, because
+# the command runs under bash and a file name may hold a space or a quote. $2
+# is the step's worker count. The notes go to stderr, which run_step writes
+# to the step log.
 compose() {
-  local name="$1" cmd="${CMD[$1]}" f passed
-  local -a files=() excludes=()
-  [ -z "${FILES[$name]}" ] || mapfile -t files <<<"${FILES[$name]%$'\n'}"
-  [ "${MODE[$name]}" != related ] || cmd="${cmd/vitest run/vitest related --run}"
+  local name="$1" workers="$2" cmd="${CMD[$1]}" f dir="${DIR[$1]}" plugin=0 probe
+  local -a files=()
+  [ -z "${RUNLIST[$name]-}" ] || mapfile -t files <<<"${RUNLIST[$name]%$'\n'}"
+  [ -z "$LEDGER" ] && [ -z "${TRACED[$name]+x}" ] || plugin=1
   case "${RUNNER[$name]}" in
     vitest)
-      if [ -n "$LEDGER" ]; then
-        cmd+=" --reporter=default --reporter=./$VITEST_DIR/vitest-ledger.mjs"
-        if [ "$RESUME" = 1 ]; then
-          # passedFiles() of the copied reporter is the exclusion helper of the
-          # resumable-gates spec, so the files left out here are the files the
-          # config form would leave out: the last record of each is `pass`.
-          passed="$(node --input-type=commonjs -e '
-            import(require("node:url").pathToFileURL(process.argv[1]).href)
-              .then((m) => { for (const f of m.passedFiles(process.cwd())) process.stdout.write(f + "\n"); })
-              .catch((err) => { console.error(err); process.exit(1); });
-          ' "$PWD/$VITEST_DIR/vitest-ledger.mjs")" || return 1
-          [ -z "$passed" ] || mapfile -t excludes <<<"$passed"
-          for f in "${excludes[@]}"; do cmd+=" --exclude $(printf '%q' "$f")"; done
-        fi
+      [ "$plugin" = 0 ] || cmd+=" --reporter=default --reporter=./$VITEST_DIR/vitest-ledger.mjs"
+      if own_workers vitest "$cmd"; then
+        echo "devbox-steps: the command sets its own vitest workers, and keeps them" >&2
+      else
+        cmd+=" --maxWorkers=$workers"
+        # vitest 2 takes its minimum worker count from the cores, and a lower
+        # --maxWorkers alone stopped the run with "RangeError: options.minThreads
+        # and options.maxThreads must not conflict" on a many-core machine. vitest
+        # 4 removed --minWorkers, so the option goes to 2 and 3 alone.
+        case "$(vitest_major "./$dir")" in
+          2 | 3) [[ " $cmd " == *" --minWorkers"* ]] || cmd+=" --minWorkers=1" ;;
+        esac
       fi
       ;;
     pytest)
-      [ -z "$LEDGER" ] || cmd+=" -p devbox_ledger"
+      [ "$plugin" = 0 ] || cmd+=" -p devbox_ledger"
+      if own_workers pytest "$cmd"; then
+        echo "devbox-steps: the command sets its own pytest workers, and keeps them" >&2
+      elif probe="$(cd "./$dir" && pytest_xdist "${CMD[$name]}")"; then
+        echo "devbox-steps: pytest-xdist loads in \`$probe\`, so the step runs with -n $workers" >&2
+        cmd+=" -n $workers"
+      else
+        echo "devbox-steps: pytest-xdist does not load in \`$probe\`, so the step runs with no -n" >&2
+      fi
       ;;
   esac
-  for f in "${files[@]}"; do cmd+=" $(printf '%q' "$f")"; done
+  # The plan names files from the project directory, and a dir= step's runner
+  # runs in its folder, so each file loses that folder's prefix.
+  for f in "${files[@]}"; do cmd+=" $(printf '%q' "${f#"$dir"}")"; done
   printf '%s\n' "$cmd"
+}
+
+# run_command <name> <script> <log>: the command of one step in its folder,
+# its output into its log, and streamed when it is the one step that runs.
+# Prints nothing; the status is the command's.
+run_command() {
+  local name="$1" script="$2" log="$3" rc=0
+  shift 3
+  if [ "$name" = "$STREAM" ]; then
+    # pipefail is on, so the status is the command's unless tee itself fails.
+    (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null 2>&1 | tee -a "$log" || rc=$?
+  else
+    (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null >>"$log" 2>&1 || rc=$?
+  fi
+  return "$rc"
 }
 
 # The body of one background job. Its result reaches the main loop through a
 # file written by rename, because `wait -n` before bash 5.1 does not say which
-# job ended.
+# job ended. $2 is the step's worker count.
 run_step() {
-  local name="$1" log started="$SECONDS" rc=0 cmd
+  local name="$1" workers="$2" log started="$SECONDS" rc=0 cmd script tdir prog
   log="$(log_of "$name")"
-  if cmd="$(compose "$name" 2>>"$log")"; then
+  script="$STATE_DIR/$name.sh"
+  tdir="$(trace_dir_of "$name")"
+  export DEVBOX_WORKERS="$workers"
+  # A command of a few thousand file arguments is longer than the 128 KiB one
+  # argument may hold, so it runs from a file rather than bash -c.
+  if ! cmd="$(compose "$name" "$workers" 2>>"$log")" || ! printf '%s\n' "$cmd" >"$script"; then
+    rc=2
+    printf 'devbox-steps: could not compose the command of %s, so it did not run\n' "$name" >>"$log"
+  elif [ -n "${TRACED[$name]+x}" ] && ! { rm -rf "$tdir" && mkdir -p "$tdir"; }; then
+    rc=2
+    printf 'devbox-steps: cannot create the trace folder %s, so %s did not run\n' "$tdir" "$name" >>"$log"
+  elif [ -n "${TRACED[$name]+x}" ] && [ "${RUNNER[$name]}" = - ]; then
     printf 'devbox-steps: %s\n' "$cmd" >>"$log"
-    if [ "${RUNNER[$name]}" = pytest ] && [ -n "$LEDGER" ]; then
+    run_command "$name" "$script" "$log" strace "${STRACE_OPTS[@]}" -o "$tdir/strace.log" || rc=$?
+    if [ "$rc" != 0 ] && prog="$(setuid_run "$tdir/strace.log")"; then
+      # The trace made the step fail, so the step runs again untraced, as it
+      # ran before traces.
+      echo "devbox-steps: untraced $name it runs $prog, which strace stops from gaining its privilege"
+      printf 'devbox-steps: %s failed with code %s under strace and runs %s, so it runs again untraced\n' "$name" "$rc" "$prog" >>"$log"
+      rm -rf "$tdir"
+      rc=0
+      run_command "$name" "$script" "$log" || rc=$?
+    elif [ ! -f "$tdir/strace.log" ]; then
+      printf 'partial\t-\ttrace cut short\n' >"$tdir/strace-$BASHPID.trace"
+    elif ! strace_trace "$tdir/strace.log" "$PWD/${DIR[$name]}" "$tdir/strace-$BASHPID.trace"; then
+      # A trace file half written would reach the client as a whole one.
+      rm -f "$tdir/strace-$BASHPID.trace"
+      printf 'devbox-steps: could not read the strace log of %s, so it has no trace this run\n' "$name" >>"$log"
+    fi
+    rm -f "$tdir/strace.log"
+  else
+    printf 'devbox-steps: %s\n' "$cmd" >>"$log"
+    if [ "${RUNNER[$name]}" = pytest ] && { [ -n "$LEDGER" ] || [ -n "${TRACED[$name]+x}" ]; }; then
       export PYTHONPATH="$DEVBOX_LEDGER_TOOLS${PYTHONPATH:+:$PYTHONPATH}"
     fi
-    if [ "$name" = "$STREAM" ]; then
-      # pipefail is on, so the status is the command's unless tee itself fails.
-      bash -c "$cmd" </dev/null 2>&1 | tee -a "$log" || rc=$?
-    else
-      bash -c "$cmd" </dev/null >>"$log" 2>&1 || rc=$?
+    if [ -n "${TRACED[$name]+x}" ]; then
+      export DEVBOX_TRACE_DIR="$tdir" DEVBOX_TRACE_ROOT="$PWD"
+      # Node splits NODE_OPTIONS on spaces outside double quotes.
+      [ "${RUNNER[$name]}" != vitest ] \
+        || export NODE_OPTIONS="--import=\"$DEVBOX_LEDGER_TOOLS/devbox-trace-hook.mjs\"${NODE_OPTIONS:+ $NODE_OPTIONS}"
     fi
-  else
-    rc=$?
-    printf 'devbox-steps: could not read the passed files of the ledger %s for --exclude, so %s did not run\n' "$LEDGER" "$name" >>"$log"
+    run_command "$name" "$script" "$log" || rc=$?
   fi
   printf '%s %s\n' "$rc" "$((SECONDS - started))" >"$STATE_DIR/$name.tmp"
   mv -f "$STATE_DIR/$name.tmp" "$STATE_DIR/$name.done"
 }
 
 start_step() {
-  local name="$1"
+  local name="$1" workers
+  workers="$(step_workers "$name" "$2")"
   : >"$(log_of "$name")" || fatal "cannot write the log $(log_of "$name")"
   ledger_step "$name" start
   # Before the fork, so a streamed step's first line never comes before its
   # header.
   echo "$(stamp) $name started"
+  if [ -n "${UNTRACED[$name]+x}" ]; then
+    echo "devbox-steps: untraced $name ${UNTRACED[$name]}"
+    echo "devbox-steps: $name runs untraced: ${UNTRACED[$name]}" >>"$(log_of "$name")"
+  fi
   [ "$name" != "$STREAM" ] || echo "== $name: $(log_of "$name")"
   # Monitor mode for the fork alone gives the job its own process group, so a
   # signal to this program reaches every process of a step through that group.
   # Left on, it would print a job notice on stderr for every step that ends.
   set -m
-  run_step "$name" &
+  run_step "$name" "$workers" &
   PID[$name]=$!
   set +m
   STATUS[$name]=running
@@ -347,6 +818,9 @@ for name in "${NAMES[@]}"; do
   elif [ -n "${LEDGER_PASSED[$name]+x}" ]; then
     STATUS[$name]=ended OUTCOME[$name]=resumed SECS[$name]=0 CODE[$name]=0
     echo "$(stamp) $name resumed: it passed in an earlier run of this gate"
+  elif [ -n "${RESUMED_ALL[$name]+x}" ]; then
+    STATUS[$name]=ended OUTCOME[$name]=resumed SECS[$name]=0 CODE[$name]=0
+    echo "$(stamp) $name resumed: every file it runs passed in an earlier run of this gate"
   fi
 done
 
@@ -382,12 +856,23 @@ finish_step() {
 }
 
 while :; do
+  # The steps that start in one pass share the grant with the runner steps
+  # already running, so two suites that start together get half each, not
+  # all of it for the first and half for the second.
+  starting=()
+  runners=0
   for name in "${NAMES[@]}"; do
+    if [ "${STATUS[$name]}" = running ]; then
+      [ "${RUNNER[$name]}" = - ] || runners=$((runners + 1))
+      continue
+    fi
     [ "${STATUS[$name]}" = pending ] || continue
     ready=1
     for dep in ${AFTER[$name]}; do [ "${STATUS[$dep]}" = ended ] || ready=0; done
-    [ "$ready" = 0 ] || start_step "$name"
+    [ "$ready" = 0 ] || starting+=("$name")
   done
+  for name in "${starting[@]}"; do [ "${RUNNER[$name]}" = - ] || runners=$((runners + 1)); done
+  for name in "${starting[@]}"; do start_step "$name" "$runners"; done
   [ "$(running_names)" != nothing ] || break
   # The status is read from each step's result file below; wait -n only blocks
   # until one job ends, and returns 127 when that job was already reaped.
@@ -431,6 +916,34 @@ for name in "${failed[@]}"; do
   echo "== $name: $(log_of "$name")"
   cat "$(log_of "$name")"
 done
+
+# The trace of each traced step that ran, sorted, de-duplicated, gzipped and
+# in base64 chunks (section 5.6). The host keeps nothing, so the trace reaches
+# the client on the same stdout as the result lines. gzip's own length and
+# checksum tell the client that a chunk is missing.
+for name in "${NAMES[@]}"; do
+  [ -n "${TRACED[$name]+x}" ] || continue
+  case "${OUTCOME[$name]}" in pass | fail) ;; *) continue ;; esac
+  tdir="$(trace_dir_of "$name")"
+  # A step that ran again untraced removed its folder, and said so.
+  [ -d "$tdir" ] || continue
+  traces=()
+  for f in "$tdir"/*.trace; do [ ! -f "$f" ] || traces+=("$f"); done
+  if [ "${#traces[@]}" -eq 0 ]; then
+    echo "devbox-steps: $name wrote no trace file under $tdir, so it has no trace this run" >&2
+    continue
+  fi
+  if ! packed="$(cat -- "${traces[@]}" | LC_ALL=C sort -u | gzip -cn | base64 | tr -d '\n')"; then
+    echo "devbox-steps: could not pack the trace of $name, so it has no trace this run" >&2
+    continue
+  fi
+  seq=0
+  for ((i = 0; i < ${#packed}; i += 65536)); do
+    seq=$((seq + 1))
+    echo "devbox-steps: trace $name $seq ${packed:i:65536}"
+  done
+done
+
 for name in "${NAMES[@]}"; do
   echo "devbox-steps: result $name ${OUTCOME[$name]} ${SECS[$name]} ${CODE[$name]}"
 done

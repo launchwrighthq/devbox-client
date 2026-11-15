@@ -196,7 +196,7 @@ assert_eq "$(key_of "$WS_LAN1/ledger/app.ledger")" "$(run_field 2 key)" "D1: DEV
 assert_eq "$WS_LAN1/ledger-tools" "$(run_field 1 tools)" "D1: DEVBOX_LEDGER_TOOLS names the tools directory of the workspace"
 assert_eq "$WS_LAN1/ledger/app.ledger" "$(run_field 1 ledger)" "D1: DEVBOX_LEDGER names the ledger of the project in the workspace"
 assert_ok "D1: the step helper is in the workspace, mode 0755" test "$(stat -c %a "$WS_LAN1/ledger-tools/devbox-ledger")" = 755
-for t in devbox-ledger vitest-ledger.mjs ledger-core.mjs devbox_ledger.py; do
+for t in devbox-ledger vitest-ledger.mjs ledger-core.mjs devbox-trace-hook.mjs devbox_ledger.py; do
   assert_ok "D1: $t in the workspace is this client's own" cmp -s "$REPO/client/share/ledger/$t" "$WS_LAN1/ledger-tools/$t"
 done
 assert_eq $'resume\t1' "$(sed -n 2p "$WS_LAN1/ledger/app.ledger")" "D1: the resumed ledger's resume line was raised by one"

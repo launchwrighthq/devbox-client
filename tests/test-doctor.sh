@@ -95,6 +95,11 @@ case "$GATE_CMD" in
     if [ "${FAKE_NO_LIMITS-0}" -eq 0 ]; then
       printf 'cpu-limit %s\nmemory-high %s\nswap %s\n' "${FAKE_CPU_LIMIT-ok}" "${FAKE_MEMORY_HIGH-ok}" "${FAKE_SWAP-ok 17179869184}"
     fi
+    # The admission line of the prep-throughput spec. A host before it answers
+    # none.
+    if [ "${FAKE_NO_ADMISSION-0}" -eq 0 ]; then
+      printf 'admission %s\n' "${FAKE_ADMISSION-ok pressure: cpu idle 62.40 (at least 25), memory some 0.00 (limit 5), io full 0.00 (limit 10), settle 30s}"
+    fi
     exit 0 ;;
   version)           printf '%s\n' "${FAKE_VERSION-}"; exit 0 ;;
   pool-status)       printf '%s\n' "${FAKE_POOL_OUT-0/20 0/4}"; exit "${FAKE_POOL_STATUS_RC-0}" ;;
@@ -563,6 +568,44 @@ assert_ok "a word that is neither ok nor skipped is a FAIL" \
   contains "FAIL CPU limit on fixture: an answer this client cannot read: cpu-limit maybe[2J" "$out"
 assert_fail "and the control byte the host sent never reaches the terminal" contains $'\033' "$out"
 unset FAKE_CPU_LIMIT
+
+# ── the admission rule (prep-throughput spec, R4) ────────────────────────────
+#
+# A host admits on pressure, and doctor names the rule, its idle CPU share and
+# its two pressure readings. A host without pressure readings admits on tokens,
+# and a host whose /proc/stat cannot be read refuses every pass with a job
+# running: each is a skip with its reason, never an ok.
+doctor
+assert_ok "the admission rule is an ok row with the host's readings" \
+  contains "ok   admission on fixture: pressure: cpu idle 62.40 (at least 25), memory some 0.00 (limit 5), io full 0.00 (limit 10), settle 30s" "$out"
+export FAKE_ADMISSION="skipped /proc/stat holds no cpu line this program reads, so every pass with a job running refuses"
+doctor
+assert_ok "an idle share the host cannot read is a skip row with its reason" \
+  contains "skip admission on fixture (/proc/stat holds no cpu line this program reads, so every pass with a job running refuses)" "$out"
+assert_fail "never an ok row" has_line_matching '^  ok   admission' "$out"
+export FAKE_ADMISSION="skipped no pressure readings in /proc/pressure, so the pool admits on tokens"
+doctor
+assert_eq "0" "$rc" "a host that admits on tokens is not a failure: exit 0"
+assert_ok "and its admission is a skip row with the host's reason" \
+  contains "skip admission on fixture (no pressure readings in /proc/pressure, so the pool admits on tokens)" "$out"
+assert_fail "never an ok row" has_line_matching '^  ok   admission' "$out"
+export FAKE_ADMISSION="skipped tokens, from DEVBOX_ADMISSION in /etc/devbox/config"
+doctor
+assert_ok "DEVBOX_ADMISSION=tokens is a skip that names the key" \
+  contains "skip admission on fixture (tokens, from DEVBOX_ADMISSION in /etc/devbox/config)" "$out"
+export FAKE_ADMISSION="failed devbox-pool admission exited 2: devbox-pool: refusing 'x' as DEVBOX_ADMISSION"
+doctor
+assert_eq "1" "$rc" "a pool that refuses its admission key fails the run"
+assert_ok "and the row names the refusal" \
+  contains "FAIL admission on fixture: devbox-pool admission exited 2: devbox-pool: refusing 'x' as DEVBOX_ADMISSION" "$out"
+unset FAKE_ADMISSION
+export FAKE_NO_ADMISSION=1
+doctor
+assert_eq "0" "$rc" "a host that predates the admission line still passes, because no protocol changed"
+assert_ok "and its admission is a skip row that says so" \
+  contains "skip admission on fixture (its doctor answer has no admission line, so the host predates admission on pressure)" "$out"
+assert_eq "" "$(strays "$out")" "and every line is still ok, FAIL or skip"
+unset FAKE_NO_ADMISSION
 
 # ── one block per target ─────────────────────────────────────────────────────
 #

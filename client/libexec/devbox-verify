@@ -191,8 +191,10 @@ source "$_here/devbox-cancel"
 # `--full` and `--changed` set DEVBOX_RERUN for this run alone, above the
 # environment and the config (client-owns-the-gate spec, D13); `--fresh` is
 # `--full` too. `--step <name>` runs only the named steps, as a CI shard does,
-# and its record is partial. `--plan` prints what each step would do and runs
-# nothing. `devbox cancel` arrives as `--cancel`.
+# and its record is partial. `--shard <i>/<n>` with one `--step` of a runner
+# step runs shard <i> of <n> of its test files (learned-selection spec, D10).
+# `--plan` prints what each step would do and runs nothing. `devbox cancel`
+# arrives as `--cancel`.
 #
 # The arguments are kept whole, because a grant released before the gate
 # starts this script again with them (refuse_prep_limit).
@@ -206,6 +208,7 @@ FORCE_TARGET=""
 FRESH=0
 RERUN_FLAG=""
 STEPS_ASKED=()
+SHARD_ARG=""
 PLAN_ONLY=0
 CANCEL_MODE=0
 refuse_args() { echo "devbox verify: $*" >&2; devbox_die 2; }
@@ -228,6 +231,11 @@ while [ "$#" -gt 0 ]; do
     --step=*)
       [ -n "${1#--step=}" ] || refuse_args "--step needs the name of a step of this gate"
       STEPS_ASKED+=("${1#--step=}"); shift ;;
+    --shard)
+      [ -n "${2:-}" ] || refuse_args "--shard needs <i>/<n>, such as 1/4"
+      SHARD_ARG="$2"; shift 2 ;;
+    --shard=*)
+      SHARD_ARG="${1#--shard=}"; shift ;;
     --runpod-action)
       RUNPOD_ACTION="${2:-status}"
       FORCE_TARGET=runpod
@@ -251,7 +259,7 @@ while [ "$#" -gt 0 ]; do
     --) shift; break ;;
     *)
       [ "$RUN_MODE" = "1" ] && break
-      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--plan]" ;;
+      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--shard <i>/<n>] [--plan]" ;;
   esac
 done
 if [ "$RUN_MODE" = "1" ]; then
@@ -259,11 +267,21 @@ if [ "$RUN_MODE" = "1" ]; then
   [ "$LOCAL_ONLY" = "0" ] || { echo "devbox run: a run never runs on this machine, so it takes no --local" >&2; devbox_die 2; }
   [ "$FRESH" = "0" ] || { echo "devbox run: a run keeps no ledger, so it takes no --fresh" >&2; devbox_die 2; }
   # A run is one command, so it has no steps to plan, carry or name.
-  if [ -n "$RERUN_FLAG" ] || [ "${#STEPS_ASKED[@]}" -gt 0 ] || [ "$PLAN_ONLY" = 1 ]; then
-    echo "devbox run: a run is one command with no steps, so it takes no --full, --changed, --step or --plan" >&2
+  if [ -n "$RERUN_FLAG" ] || [ "${#STEPS_ASKED[@]}" -gt 0 ] || [ "$PLAN_ONLY" = 1 ] || [ -n "$SHARD_ARG" ]; then
+    echo "devbox run: a run is one command with no steps, so it takes no --full, --changed, --step, --shard or --plan" >&2
     devbox_die 2
   fi
   RUN_SCRIPT="$(printf '%q ' "$@")"
+fi
+# A shard is one part of one runner step, so it names that step once. The
+# plan checks that the step has a runner, once the steps file is read.
+PLAN_SHARD=""
+if [ -n "$SHARD_ARG" ]; then
+  if [[ ! "$SHARD_ARG" =~ ^([1-9][0-9]{0,3})/([1-9][0-9]{0,3})$ ]] || [ "${BASH_REMATCH[1]}" -gt "${BASH_REMATCH[2]}" ]; then
+    refuse_args "--shard takes <i>/<n> with 1 <= i <= n, such as 1/4, not '$SHARD_ARG'"
+  fi
+  [ "${#STEPS_ASKED[@]}" -eq 1 ] || refuse_args "--shard splits one step: name it once with --step"
+  PLAN_SHARD="${STEPS_ASKED[0]} ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
 fi
 if [ "$CANCEL_MODE" = 1 ] && [ "${#DEVBOX_VERIFY_ARGS[@]}" -ne 1 ]; then
   refuse_args "devbox cancel takes no argument: it cancels this checkout's running gate"
@@ -333,13 +351,14 @@ STEPS_GATE_CODE=0
 STEPS_MARKED=0
 STEPS_NO_MANIFEST=0
 STEPS_JOB_PID=""
+STEPS_SERVICES_UP=0
 declare -A STEPS_RESULT=()
 
 # Plan the gate, before any target is asked (spec section 6.1). --plan prints
 # the plan and exits 0, and a plan whose every step carries writes its record
 # and exits 0, both with no ssh at all.
 steps_prepare() {
-  local rerun rc=0 step all=1
+  local rerun rc=0 step all=1 tok
   [ "$STEPS_ACTIVE" = 0 ] && [ "$RUN_MODE" = 0 ] || return 0
   run_identity
   if [ -f "$ROOT/.devbox/steps" ]; then
@@ -374,6 +393,16 @@ steps_prepare() {
   devbox_plan_build "$rerun" "$STEPS_DIR/manifest" ${STEPS_ASKED[@]+"${STEPS_ASKED[@]}"} >"$STEPS_DIR/plan" || rc=$?
   [ "$rc" = 0 ] || devbox_die "$rc"
   STEPS_ACTIVE=1
+  # The requires= tokens of the steps that will run join DEVBOX_REQUIRES, so
+  # the targets are asked for what this gate needs: a carried step needs
+  # nothing of a host. The steps file checked each token by the rule of
+  # require_safe_token, before any target is asked.
+  for step in "${PLAN_STEPS[@]}"; do
+    [ "${PLAN_ACTION[$step]}" != carry ] || continue
+    for tok in ${STEP_REQUIRES[$step]-}; do
+      case " ${REQUIRES[*]-} " in *" $tok "*) ;; *) REQUIRES+=("$tok") ;; esac
+    done
+  done
   if [ "$PLAN_ONLY" = 1 ]; then
     devbox_plan_print
     devbox_die 0
@@ -456,6 +485,11 @@ steps_stop_job() {
 # shellcheck disable=SC2317  # reached through the EXIT traps here and in devbox-runpod
 steps_exit() {
   [ "$STEPS_MARKED" = 0 ] || devbox_gate_marker_remove "$HISTORY_SLUG" || true
+  if [ "$STEPS_SERVICES_UP" = 1 ]; then
+    STEPS_SERVICES_UP=0
+    # It names each container it could not remove, one line each.
+    devbox_services_local_down "$RUN_ID" || true
+  fi
   [ -z "$STEPS_DIR" ] || rm -rf "$STEPS_DIR"
 }
 
@@ -467,8 +501,9 @@ steps_before_exec() {
 }
 
 # Copy the gate's stdout to the file $1 byte for byte, and pass it on without
-# the runner's `devbox-steps: result` lines, which are for the record and not
-# for the reader.
+# the runner's `devbox-steps: result` and `devbox-steps: trace` lines, which
+# are for the record and the map, and not for the reader. A trace chunk is up
+# to 65536 characters of base64 (learned-selection spec, section 5.6).
 #
 # grep, never awk: Debian's awk is mawk, which fills a block of its input before
 # it handles a line. MEASURED on a real gate: every step line of a long
@@ -478,13 +513,14 @@ steps_before_exec() {
 # shellcheck disable=SC2317  # started in a process substitution
 steps_display() {
   local rc=0
-  tee -- "$1" | grep --line-buffered -v '^devbox-steps: result ' || rc=$?
+  tee -- "$1" | grep --line-buffered -v -e '^devbox-steps: result ' -e '^devbox-steps: trace ' || rc=$?
   [ "$rc" -le 1 ] || return "$rc"
 }
 
 # Fill STEPS_RESULT[<step>] with `<outcome> <seconds> <code>` from the result
 # lines the runner printed last in the file $1. Only the trailing block counts:
-# a streamed step's own output may hold a line that looks like one.
+# a streamed step's own output may hold a line that looks like one. The trace
+# lines the runner prints after every step ended neither end nor break it.
 steps_results() {
   local name outcome secs code
   STEPS_RESULT=()
@@ -494,7 +530,57 @@ steps_results() {
     case "$outcome" in pass|fail|resumed|carried) ;; *) continue ;; esac
     if ! is_uint "$secs" || ! is_uint "$code"; then continue; fi
     STEPS_RESULT[$name]="$outcome $secs $code"
-  done < <(awk '/^devbox-steps: result / { block[++n] = $0; next } /./ { n = 0 } END { for (i = 1; i <= n; i++) print block[i] }' "$1")
+  done < <(awk '/^devbox-steps: result / { block[++n] = $0; next } /^devbox-steps: trace / { next } /./ { n = 0 } END { for (i = 1; i <= n; i++) print block[i] }' "$1")
+}
+
+# Join the trace chunks in the gate output $1 into <dir>/<step>.trace for
+# each step, with <dir> $2: the lines `devbox-steps: trace <step> <seq>
+# <chunk>`, the base64 of the gzip of that step's trace lines (section 5.6).
+# A later line for one step and seq wins. The seqs must run on from 0 or 1
+# with no gap, and the gzip must end whole: a step whose chunks are
+# incomplete has no trace this run, and its map keeps the last one. A step the
+# runner named in `devbox-steps: untraced <step> <reason>`, because strace was
+# missing or could not attach, and that sent no trace, gets a trace of one
+# `partial` line with that reason, which its map keeps for `--plan`.
+steps_traces() {
+  local raw="$1" dir="$2" b64 step reason
+  mkdir -p -- "$dir" || return 1
+  [ -r "$raw" ] || return 0
+  awk -v dir="$dir" '
+    $1 == "devbox-steps:" && $2 == "trace" && NF == 5 && $3 ~ /^[a-z0-9][a-z0-9:_-]*$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[A-Za-z0-9+\/=]+$/ {
+      if (!($3 in seen)) { seen[$3] = 1; order[++n] = $3 }
+      chunk[$3, $4 + 0] = $5
+      if (!($3 in top) || $4 + 0 > top[$3]) top[$3] = $4 + 0
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        s = order[i]; f = dir "/" s ".b64"
+        first = ((s, 0) in chunk) ? 0 : 1
+        ok = 1
+        for (k = first; k <= top[s]; k++) if (!((s, k) in chunk)) ok = 0
+        if (!ok) { print s > (dir "/" s ".gap"); close(dir "/" s ".gap"); continue }
+        printf "" > f
+        for (k = first; k <= top[s]; k++) printf "%s", chunk[s, k] > f
+        close(f)
+      }
+    }' "$raw" || return 1
+  for b64 in "$dir"/*.gap "$dir"/*.b64; do
+    [ -e "$b64" ] || continue
+    step="${b64##*/}"; step="${step%.*}"
+    if [[ "$b64" == *.b64 ]] && base64 -d <"$b64" 2>/dev/null | gzip -dc >"$dir/$step.trace" 2>/dev/null; then
+      rm -f -- "$b64"
+      continue
+    fi
+    # The decode's own message names no step; this line does.
+    rm -f -- "$b64" "$dir/$step.trace"
+    printf 'partial\t-\tthe trace arrived incomplete\n' >"$dir/$step.trace"
+    echo "devbox verify: the trace of step $step arrived incomplete, so its map keeps its earlier reads" >&2
+  done
+  while IFS=$'\t' read -r step reason; do
+    if [ -z "$step" ] || [ -e "$dir/$step.trace" ]; then continue; fi
+    printf 'partial\t-\t%s\n' "${reason:-the runner could not trace it}" >"$dir/$step.trace"
+  done < <(awk '$1 == "devbox-steps:" && $2 == "untraced" && $3 ~ /^[a-z0-9][a-z0-9:_-]*$/ {
+      r = $0; sub(/^devbox-steps: untraced [^ ]+ ?/, "", r); gsub(/\t/, " ", r); print $3 "\t" r }' "$raw")
 }
 
 # Set STEPS_GATE_CODE: the code of the first failed step in plan order, 0 when
@@ -541,20 +627,21 @@ steps_tree_unchanged() {
 }
 
 # The `file` lines of the record from the ledger STEPS_LEDGER: each test file's
-# last state, `open` for a `start` with no end. The ledger names a file's runner
-# and not its step, so a file goes to the steps of its runner that ran, and of
-# several, to those whose inputs hold it. A file of no running step's runner
-# goes to the one step that ran, the DEVBOX_VERIFY gate that writes its own
-# ledger.
+# last state, `open` for a `start` with no end, and its seconds, `-` when open.
+# The ledger names a file's runner and not its step, so a file goes to the
+# steps of its runner that ran, and of several, to those whose `file` or
+# `test` lines in the plan name it, else to those whose inputs hold it. A file
+# of no running step's runner goes to the one step that ran, the DEVBOX_VERIFY
+# gate that writes its own ledger.
 steps_file_lines() {
-  local runner path state step
+  local runner path state secs step
   local -a ran=() cands=() matched=()
   [ -n "$STEPS_LEDGER" ] && [ -r "$STEPS_LEDGER" ] || return 0
   for step in "${PLAN_STEPS[@]}"; do
     [ "${PLAN_ACTION[$step]}" = carry ] || ran+=("$step")
   done
   [ "${#ran[@]}" -gt 0 ] || return 0
-  while IFS=$'\t' read -r runner path state; do
+  while IFS=$'\t' read -r runner path state secs; do
     cands=()
     for step in "${ran[@]}"; do
       [ "${STEP_RUNNER[$step]-}" != "$runner" ] || cands+=("$step")
@@ -566,23 +653,32 @@ steps_file_lines() {
     if [ "${#cands[@]}" -gt 1 ]; then
       matched=()
       for step in "${cands[@]}"; do
-        if [ -z "${STEP_INPUTS[$step]-}" ] \
-          || [ -n "$(printf '%064d  %s\n' 0 "$path" | _devbox_plan_match /dev/stdin "${STEP_INPUTS[$step]}")" ]; then
+        if grep -Fxq -- "file"$'\t'"$step"$'\t'"$path" "$STEPS_DIR/plan" \
+          || grep -Fxq -- "test"$'\t'"$step"$'\t'"$path" "$STEPS_DIR/plan"; then
           matched+=("$step")
         fi
       done
+      if [ "${#matched[@]}" -eq 0 ]; then
+        for step in "${cands[@]}"; do
+          if [ -z "${STEP_INPUTS[$step]-}" ] \
+            || [ -n "$(printf '%064d  %s\n' 0 "$path" | _devbox_plan_match /dev/stdin "${STEP_INPUTS[$step]}")" ]; then
+            matched+=("$step")
+          fi
+        done
+      fi
       [ "${#matched[@]}" -eq 0 ] || cands=("${matched[@]}")
     fi
     for step in "${cands[@]}"; do
-      printf 'file\t%s\t%s\t%s\t%s\n' "$step" "$runner" "$path" "$state"
+      printf 'file\t%s\t%s\t%s\t%s\t%s\n' "$step" "$runner" "$path" "$state" "$secs"
     done
   done < <(awk -F'\t' '
     $1 == "file" && NF >= 4 {
       id = $2 FS $3
       if (!(id in st)) order[++n] = id
       st[id] = ($4 == "start") ? "open" : $4
+      sec[id] = ($4 != "start" && $5 ~ /^[0-9]+$/) ? $5 : "-"
     }
-    END { for (i = 1; i <= n; i++) if (st[order[i]] ~ /^(open|pass|fail)$/) print order[i] FS st[order[i]] }' "$STEPS_LEDGER")
+    END { for (i = 1; i <= n; i++) if (st[order[i]] ~ /^(open|pass|fail)$/) print order[i] FS st[order[i]] FS sec[order[i]] }' "$STEPS_LEDGER")
 }
 
 # Write the record of section 7, and with $4 = 1 print its verdict last. $1 is
@@ -595,6 +691,7 @@ steps_file_lines() {
 steps_record_finish() {
   local raw="$1" complete="$2" verdict="$3" rec="$STEPS_DIR/record" dir scope=full manifest="$STEPS_DIR/manifest"
   local kind step action key outcome secs code mode version branch commit
+  local -a learn=()
   [ -z "$raw" ] || steps_results "$raw"
   if [ "$STEPS_NO_MANIFEST" = 1 ]; then complete=0 manifest=""; fi
   if [ "$complete" = 1 ]; then
@@ -612,13 +709,16 @@ steps_record_finish() {
       "$RUN_ID" "$(date +%s)" "${version:--}" "$branch" "$commit" "$STEPS_TARGET" "$scope" "$complete"
     while IFS=$'\t' read -r kind step action key _; do
       [ "$kind" = step ] || continue
-      case "$action" in narrow) mode=narrowed ;; related) mode=related ;; *) mode=full ;; esac
+      mode="${PLAN_MODE[$step]:-full}"
       if [ "$action" = carry ]; then
         printf 'step\t%s\t%s\tcarried\t0\t0\t%s\n' "$step" "$key" "$mode"
         continue
       fi
       [ -n "${STEPS_RESULT[$step]+x}" ] || continue
       read -r outcome secs code <<<"${STEPS_RESULT[$step]}"
+      # A step that ran in this attempt sent the trace its map learns from. A
+      # resumed one ran before the stop, and its trace went with that gate.
+      [ "$outcome" = resumed ] || learn+=("$step")
       # A resumed step passed earlier in this same gate, on the tree the ledger
       # key names, so its step key passed too.
       [ "$outcome" != resumed ] || outcome=pass
@@ -631,7 +731,15 @@ steps_record_finish() {
       { cp -- "$raw" "$dir/.$RUN_ID.log.$$" && mv -f -- "$dir/.$RUN_ID.log.$$" "$dir/$RUN_ID.log"; } \
         || echo "devbox verify: could not save the gate's output as $dir/$RUN_ID.log, so devbox result --log has nothing for this gate" >&2
     fi
-    devbox_record_write "$RUN_ID" "$rec" "$manifest" || true  # it named what it could not write
+    # The maps learn only from a complete gate: a stopped one's traces miss
+    # the files it never reached, and its tree may not be the one it hashed.
+    # Then each passed step's record line takes the key over the inputs it
+    # just learned, and the record is written again.
+    if devbox_record_write "$RUN_ID" "$rec" "$manifest" && [ "$complete" = 1 ] && [ -n "$raw" ] \
+      && [ "${#learn[@]}" -gt 0 ] && steps_traces "$raw" "$STEPS_DIR/trace"; then
+      DEVBOX_PLAN_RESUMED="${LEDGER_RESUME:-0}" devbox_plan_learn "$RUN_ID" "$manifest" "$STEPS_DIR/trace" "$rec" "${learn[@]}"
+      devbox_record_write "$RUN_ID" "$rec" "$manifest" || true  # it named what it could not write
+    fi
   else
     echo "devbox verify: could not create the record directory under the git common dir, so this gate left no record" >&2
   fi
@@ -660,6 +768,19 @@ steps_run_local() {
   priv="$(devbox_gate_private_dir)" || devbox_die 1
   root_sum="$(printf '%s' "$ROOT" | sha256sum)" || { echo "devbox verify: sha256sum failed, so the gate has no log directory and did not run" >&2; devbox_die 1; }
   DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks local "$priv/steps/local-${root_sum:0:16}" "$STEPS_DIR/plan" "$RUN_ID" "$((1 - STEPS_FROM_VERIFY))")"
+  # The declared services start in docker before the first step and stop at
+  # the exit, as a workspace's do (learned-selection spec, D8 and D10).
+  # devbox_services_load sources devbox-services. Before the hooks script:
+  # devbox_services_local_up exports each service's URL, which the gate below
+  # inherits, and sets DEVBOX_SERVICES_LOCAL=1, so the hooks start no
+  # workspace service. Its refusal names itself: 2 when docker is absent, 3
+  # when a service did not answer, 1 for another docker failure, and that code
+  # is this run's.
+  if [ -n "${DEVBOX_SERVICES:-}" ] && declare -F devbox_services_load >/dev/null; then
+    devbox_services_load || devbox_die 1
+    STEPS_SERVICES_UP=1
+    devbox_services_local_up "$RUN_ID" || devbox_die "$?"
+  fi
   hooks="$(devbox_hooks_script)" || { echo "devbox verify: could not build the hooks of the gate, so it did not run" >&2; devbox_die 1; }
   STEPS_TARGET=local
   STEPS_RAW="$STEPS_DIR/local.out"
@@ -1606,7 +1727,10 @@ GATE_MODE=verify
 GATE_STDIN="$HOOKS"
 if [ "$RUN_MODE" = "1" ]; then
   GATE_MODE="command"
-  GATE_STDIN="$HOOKS"$'\n'"devbox_environment && $RUN_SCRIPT"
+  # A run never calls devbox_verify, whose hooks start the declared services
+  # (learned-selection spec, D8), so the command starts them first when the
+  # hooks define devbox_services.
+  GATE_STDIN="$HOOKS"$'\n''{ ! declare -F devbox_services >/dev/null || devbox_services; } && '"devbox_environment && $RUN_SCRIPT"
 fi
 GATE_ENV=()
 
@@ -2416,6 +2540,38 @@ if [ "$TARGET" != hetzner ]; then
   devbox_affinity_write "$TARGET" || echo "devbox verify: could not record $TARGET as this worktree's last target; the next run may choose another" >&2
 fi
 held_or_die
+
+# ── the seed ─────────────────────────────────────────────────────────────────
+#
+# docs/specs/2026-11-15-prep-throughput-design.md, section 3. MEASURED: each
+# agent worktree got a new, empty workspace on every target, and its first run
+# sent the whole git common dir and ran the whole setup. The seed verb copies a
+# warm idle workspace of this owner and project on the same host into a new
+# one, so the sync below sends only the difference and the setup key matches.
+#
+# A seed never fails the gate. Every outcome is one `==> seed:` line, and the
+# run prepares as before. A host older than the verb refuses it with exit 2 and
+# `unknown verb`. Any other failure, exit 1 for a host fault among them, reads
+# as cold, and the host's own stderr follows. The rented Hetzner server holds
+# one workspace, so it has no sibling to copy, and the RunPod path never
+# reaches this point.
+seed_workspace() {
+  local answer="" rc=0 err="$WIN_DIR/seed.err"
+  answer="$(devbox_gate seed "$SLUG" "$MACHINE_ID" "$DEVBOX_PROJECT" 2>"$err")" || rc=$?
+  answer="${answer%%$'\n'*}"
+  if [ "$rc" -eq 0 ] && [[ "$answer" == "seed "?* ]]; then
+    echo "==> seed: ${answer#seed }"
+  elif [ "$rc" -eq 2 ] && grep -q 'unknown verb' "$err"; then
+    echo "==> seed: skipped, $TARGET predates seed"
+  else
+    echo "==> seed: cold, $TARGET gave no seed answer (exit $rc)"
+    [ ! -s "$err" ] || sed 's/^/devbox verify: seed: /' "$err" >&2
+  fi
+}
+if [ "$TARGET" != hetzner ]; then
+  seed_workspace
+  held_or_die
+fi
 
 # ── the workspace's OOM counter, before the gate ─────────────────────────────
 #

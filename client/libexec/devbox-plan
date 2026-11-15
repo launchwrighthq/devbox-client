@@ -1,29 +1,37 @@
 #!/bin/bash
-# The plan of a gate: each step's key, then carry, narrow, related or run
+# The plan of a gate: each step's key, then carry, narrow, select or run
 # (docs/specs/2026-11-14-client-owns-the-gate-design.md, sections 6.2, 6.4 and
-# 6.7). Sourced by devbox-verify, after lib/devbox-lib.sh and the parsed steps
+# 6.7, and docs/specs/2026-11-14-learned-selection-design.md, sections 5.6 and
+# 6). Sourced by devbox-verify, after lib/devbox-lib.sh and the parsed steps
 # of devbox-steps-file.
 # shellcheck shell=bash
 #
 # Each consumer planned its gate from changed paths with its own global-input
 # list, and the copies disagreed. A step's key here is the hash of what it
 # reads, so a step whose inputs did not change carries a pass from any complete
-# record of the git common dir and runs nothing.
+# record of the git common dir and runs nothing. What it reads comes from the
+# map of devbox-map, learned from the traces of earlier runs, unless the step
+# writes `inputs=`.
 #
 # What the caller sets:
-#   STEP_NAMES, STEP_INPUTS, STEP_RUNNER, STEP_NARROW, STEP_SELECT, STEP_RERUN,
-#   STEP_CMD, STEP_SOURCE, STEP_AFTER   the parsed steps of section 6.7
+#   STEP_NAMES, STEP_INPUTS, STEP_RUNNER, STEP_NARROW, STEP_RERUN,
+#   STEP_CMD, STEP_SOURCE, STEP_AFTER, STEP_DIR   the parsed steps
 #   DEVBOX_CONFIG          the path of .devbox/config.env
 #   DEVBOX_FORWARD_ENV     the forwarded names, separated by spaces
 #   DEVBOX_SHARED_INPUTS   the shared input paths, separated by spaces
+#   DEVBOX_SETUP_INPUTS    the files the setup installs from, separated by spaces
 #   RERUN_FLAG             `full` or `changed` from --full, --fresh or --changed
 #   DEVBOX_RERUN_ENV       DEVBOX_RERUN as the environment held it when the
 #                          process started, read before the config parser
 #                          sets DEVBOX_RERUN from .devbox/config.env
 #   DEVBOX_RERUN_CONFIG    DEVBOX_RERUN as .devbox/config.env sets it
+#   PLAN_SHARD             `<step> <i> <n>` for `--step <step> --shard <i>/<n>`,
+#                          or empty
 
 # shellcheck source=client/libexec/devbox-record
 declare -F devbox_record_find_pass >/dev/null || source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-record"
+# shellcheck source=client/libexec/devbox-map
+declare -F devbox_map_select >/dev/null || source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devbox-map"
 
 # The client's VERSION, the first part of every key: a new client may run a
 # step another way, so its passes start over.
@@ -48,31 +56,32 @@ devbox_rerun_setting() {
   esac
 }
 
-# A test file of the runner $2, for the changed test files that a narrowed
-# step adds to its failed files (section 6.4). The client reads no runner
-# configuration, so a name rule stands in for it: `test` or `spec` in the path
-# covers test_x.py, x_test.py, tests/, x.test.ts and x.spec.ts. The extension
-# keeps a changed fixture or snapshot out of the runner's file filters, where
-# pytest stops on a path it cannot collect.
-devbox_plan_is_test_file() {
-  local path="$1" runner="$2"
-  case "$path" in *test*|*spec*) ;; *) return 1 ;; esac
-  case "$runner" in
-    pytest) case "$path" in *.py) return 0 ;; esac ;;
-    vitest) case "$path" in *.ts|*.tsx|*.mts|*.cts|*.js|*.jsx|*.mjs|*.cjs) return 0 ;; esac ;;
-  esac
-  return 1
+_DEVBOX_PLAN_AWK_PATH="$_DEVBOX_MAP_AWK_PATH"
+
+# Print the paths of the manifest $1 that are test files of the runner $2
+# under the folder $3 (empty for the root), one per line. The client reads no
+# runner configuration, so the runners' default name rule stands in for it, by
+# file name: test_*.py and *_test.py for pytest, *.test.* and *.spec.* with a
+# script extension for vitest. A test file the rule misses still runs once a
+# trace of a full run puts it in the map. The extension keeps a changed fixture
+# or snapshot out of the runner's file filters, where pytest stops on a path it
+# cannot collect.
+_devbox_plan_test_paths() {
+  PLAN_RUNNER="$2" PLAN_DIR="$3" awk "$_DEVBOX_PLAN_AWK_PATH"'
+    function is_test(p, runner,   b, c, n) {
+      n = split(p, c, "/"); b = c[n]
+      if (runner == "pytest") return b ~ /^test_.*\.py$/ || b ~ /_test\.py$/
+      if (runner == "vitest") return b ~ /\.(test|spec)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/
+      return 0
+    }
+    BEGIN { d = ENVIRON["PLAN_DIR"]; r = ENVIRON["PLAN_RUNNER"] }
+    { p = path_of($0); if ((d == "" || substr(p, 1, length(d)) == d) && is_test(p, r)) print p }' "$1"
 }
 
-# The path of one manifest line, as awk reads it: `<sha256>  <path>`, or
-# `\<sha256>  <path>` for a name sha256sum escapes, or `link <path> -> <target>`.
-_DEVBOX_PLAN_AWK_PATH='
-function path_of(l,   p, k) {
-  if (substr(l, 1, 5) == "link ") { p = substr(l, 6); k = index(p, " -> "); return k ? substr(p, 1, k - 1) : p }
-  if (substr(l, 1, 1) == "\\") return substr(l, 68)
-  return substr(l, 67)
+# True when the path $1 is a test file of the runner $2 by the name rule.
+devbox_plan_is_test_file() {
+  [ -n "$(printf '%064d  %s\n' 0 "$1" | _devbox_plan_test_paths /dev/stdin "$2" "")" ]
 }
-'
 
 # Print the lines of the manifest $1 whose path matches one of the patterns
 # in $2, one per line. A pattern that ends in `/` is that directory and
@@ -113,13 +122,37 @@ _devbox_plan_match() {
     { p = path_of($0); for (i = 1; i <= m; i++) if (p ~ res[i]) { print; next } }' "$1"
 }
 
-# The manifest lines of step $2's inputs in the manifest $1. Empty inputs are
-# every synced file.
+# Print, for the learned inputs on stdin (paths, and directories ending in
+# `/`), the manifest $1's line of each path it holds, and of every file under
+# each directory, `./` for the root. A step is traced only now and then
+# (D4), so a listed directory covers its whole tree: a new file, or a new
+# import inside it, changes the key between traces. A path the sync does not
+# send, such as a tool's own ignored cache, never enters a key (section 5.3).
+_devbox_plan_learned_lines() {
+  awk "$_DEVBOX_PLAN_AWK_PATH"'
+    FNR == NR { if ($0 ~ /\/$/) wdir[$0] = 1; else want[$0] = 1; next }
+    {
+      p = path_of($0)
+      if (p in want || "./" in wdir) { print; next }
+      k = split(p, c, "/"); d = ""
+      for (i = 1; i < k; i++) { d = d c[i] "/"; if (d in wdir) { print; next } }
+    }' - "$1"
+}
+
+# The manifest lines of step $2's inputs in the manifest $1. With `inputs=`,
+# its patterns. Else its learned inputs, when the map holds a usable trace,
+# and for a runner step every test file of its runner under its folder, so a
+# new test file changes the key. Else every synced file.
 _devbox_plan_inputs_of() {
-  if [ -z "${STEP_INPUTS[$2]-}" ]; then
-    cat -- "$1"
-  else
+  if [ -n "${STEP_INPUTS[$2]-}" ]; then
     _devbox_plan_match "$1" "${STEP_INPUTS[$2]}"
+  elif [ -n "${PLAN_LEARNED[$2]+x}" ]; then
+    {
+      printf '%s' "${PLAN_LEARNED[$2]}"
+      [ -z "${STEP_RUNNER[$2]-}" ] || _devbox_plan_test_paths "$1" "${STEP_RUNNER[$2]}" "${STEP_DIR[$2]-}"
+    } | _devbox_plan_learned_lines "$1"
+  else
+    cat -- "$1"
   fi
 }
 
@@ -129,6 +162,26 @@ _devbox_plan_shared_of() {
   read -ra shared <<<"${DEVBOX_SHARED_INPUTS:-}"
   [ "${#shared[@]}" -gt 0 ] || return 0
   _devbox_plan_match "$1" "$(printf '%s\n' "${shared[@]}")"
+}
+
+# Print the setup key of the manifest $1: the hash of the lines of the files
+# the setup installs from. DEVBOX_SETUP_INPUTS names them; without it, every
+# package-lock.json and uv.lock, the two lock files whose outputs, node_modules/
+# and .venv/, the hooks script knows. The setup command itself is in
+# .devbox/config.env, which every key holds.
+_devbox_plan_setup_key() {
+  local -a paths
+  local sum
+  read -ra paths <<<"${DEVBOX_SETUP_INPUTS:-}"
+  sum="$(set -o pipefail; {
+    printf 'setup\n'
+    if [ "${#paths[@]}" -gt 0 ]; then
+      _devbox_plan_match "$1" "$(printf '%s\n' "${paths[@]}" | sed 's/[][*?\\]/\\&/g')"
+    else
+      awk "$_DEVBOX_PLAN_AWK_PATH"'{ p = path_of($0); n = split(p, c, "/"); if (c[n] == "package-lock.json" || c[n] == "uv.lock") print }' "$1"
+    fi
+  } | sha256sum)" || return 1
+  printf '%s\n' "${sum%% *}"
 }
 
 # Compare the manifest lines on stdin of file descriptor $1 (the earlier run)
@@ -166,29 +219,209 @@ _devbox_plan_forward() {
   done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
 }
 
-# Print step $2's key over the manifest $1, in the order of section 6.2. The
-# client version, the config and the forwarded hashes come from
-# devbox_plan_build, which reads each once.
+# Print the base of step $1's key: the client version, the config, the step
+# line and the forwarded hashes, which devbox_plan_build reads once each. The
+# map keeps it, because a test file's pass under another base proves nothing.
+_devbox_plan_base() {
+  local sum
+  sum="$(printf 'version\n%s\nconfig\n%s\nstep\n%s\nforward\n%s\n' \
+    "$_plan_version" "$_plan_config" "${STEP_SOURCE[$1]-}" "$_plan_forward" | sha256sum)" || return 1
+  printf '%s\n' "${sum%% *}"
+}
+
+# Print what step $1's own trace is taken under: the hash of the client
+# version, the config and the step line. A step without inputs= is traced again
+# when it differs from the one its map holds (D4).
+_devbox_plan_trace_base() {
+  local sum
+  sum="$(printf 'version\n%s\nconfig\n%s\nstep\n%s\n' "$_plan_version" "$_plan_config" "${STEP_SOURCE[$1]-}" | sha256sum)" || return 1
+  printf '%s\n' "${sum%% *}"
+}
+
+# Print step $2's key over the manifest $1: its base, the setup key when its
+# map says it read under a setup output (D4a), its inputs and the shared
+# inputs.
 _devbox_plan_key() {
   local manifest="$1" step="$2" sum
   sum="$(set -o pipefail; {
-    printf 'version\n%s\nconfig\n%s\nstep\n%s\nforward\n%s\n' \
-      "$_plan_version" "$_plan_config" "${STEP_SOURCE[$step]-}" "$_plan_forward"
+    printf 'base\n%s\n' "${PLAN_BASE[$step]}"
+    [ -z "${PLAN_SETUP_READ[$step]-}" ] || printf 'setup\n%s\n' "$PLAN_SETUP_KEY"
     printf 'inputs\n' && _devbox_plan_inputs_of "$manifest" "$step"
     printf 'shared\n' && _devbox_plan_shared_of "$manifest"
   } | sha256sum)" || return 1
   printf '%s\n' "${sum%% *}"
 }
 
-# Set _plan_files and _plan_reason when section 6.4 allows step $1 to run its
-# failed files only: a narrow=failed step with a runner, whose newest result
-# failed with code 1 (the runner's "tests failed", not a crash), with at least
-# one failed file and no open one. The files are the failed files that still
-# exist, then every test file of the runner that changed since that record.
-# That record's manifest is required, because without it the changed test
-# files are unknown. Returns 0 to narrow, 1 not to.
+# Fill PLAN_LEARNED[$1] and PLAN_SETUP_READ[$1] from step $1's map.
+_devbox_plan_learn() {
+  local step="$1" inputs
+  unset 'PLAN_LEARNED[$step]' 'PLAN_SETUP_READ[$step]'
+  if [ -z "${STEP_INPUTS[$step]-}" ] && inputs="$(devbox_map_step_inputs "$step")"; then
+    PLAN_LEARNED[$step]="${inputs:+$inputs$'\n'}"
+  fi
+  if devbox_map_reads_setup "$step"; then PLAN_SETUP_READ[$step]=1; fi
+}
+
+# devbox_plan_rekey <step> <manifest>
+# Print step <step>'s key again, after devbox_map_update learned its inputs
+# from this run, with the base and setup key devbox_plan_build computed. A
+# step that passed on the tree of <manifest> passed on every input the new
+# trace names, so its record carries under this key, and the next plan, which
+# reads the same map, computes the same key and carries.
+devbox_plan_rekey() {
+  _devbox_plan_learn "$1"
+  _devbox_plan_key "$2" "$1"
+}
+
+# devbox_plan_learn <run-id> <manifest> <trace dir> <record file> <step>...
+# After a complete gate whose record <record file> was written as <run-id>:
+# merge each named step's trace, <trace dir>/<step>.trace, into its map, then
+# give each of them that passed its key over the inputs it just learned, in
+# <record file>. Name only the steps that ran in this gate and asked for a
+# trace. A step whose trace is missing marks its map untraced and keeps its
+# earlier inputs. With DEVBOX_PLAN_RESUMED=1 the gate resumed a stopped one,
+# so a `run` step ran only the files the stop left, and its trace merges as a
+# part run: a test file that passed before the stop would otherwise read as
+# one the step never runs. The caller writes <record file> again afterwards. A
+# map that cannot be written names itself and changes no result: the gate's
+# result is the gate's.
+devbox_plan_learn() {
+  local run="$1" manifest="$2" tdir="$3" rec="$4" step mode trace key
+  shift 4
+  for step in "$@"; do
+    mode="${PLAN_ACTION[$step]-}"
+    [ "${PLAN_TRACE[$step]-0}" = 1 ] || continue
+    case "$mode" in run|select|narrow) ;; *) continue ;; esac
+    [ "$mode" != run ] || [ "${DEVBOX_PLAN_RESUMED:-0}" != 1 ] || mode=select
+    trace="$tdir/$step.trace"
+    if [ ! -r "$trace" ]; then
+      trace="$tdir/.$step.none"
+      printf 'partial\t-\tthe runner sent no trace of this step\n' >"$trace" || continue
+    fi
+    devbox_map_update "$step" "$run" "$trace" "$mode" "${PLAN_BASE[$step]}" "$PLAN_SETUP_KEY" "${PLAN_TRACE_BASE[$step]:--}" || continue
+    [ "${PLAN_MODE[$step]-}" != shard ] || continue
+    awk -F'\t' -v s="$step" '$1 == "step" && $2 == s && $4 == "pass" { f = 1 } END { exit !f }' "$rec" || continue
+    key="$(devbox_plan_rekey "$step" "$manifest")" || continue
+    PLAN_REKEY="$key" awk -F'\t' -v OFS='\t' -v s="$step" \
+      '$1 == "step" && $2 == s { $3 = ENVIRON["PLAN_REKEY"] } { print }' "$rec" >"$rec.new" \
+      && mv -f -- "$rec.new" "$rec" \
+      || echo "devbox verify: could not give step $step its learned key in the record, so its next plan runs it once more" >&2
+  done
+  return 0
+}
+
+# Set _plan_mapfiles[$1] to the test files of step $1's map, once per plan.
+_devbox_plan_mapfiles() {
+  [ -z "${_plan_mapfiles[$1]+x}" ] || return 0
+  if [ "$(devbox_map_state "$1")" = ok ]; then
+    _plan_mapfiles[$1]="$(devbox_map_test_files "$1")"
+  else
+    _plan_mapfiles[$1]=""
+  fi
+}
+
+# Set _plan_tests and _plan_new for the runner step $1 over the manifest $2.
+# _plan_tests, for its `test` lines: the test files of its map that still
+# exist, and every test file of its runner under its folder by the name rule
+# that no other step of that runner holds in its map. _plan_new: the files of
+# that rule in no step's map that this step claims. A file that existed at
+# this step's last full trace and did not run then belongs to another step or
+# to no step. A new one goes to the step of its runner whose known test files
+# share the deepest folder with it, to each on a tie, so a new test of one app
+# never reaches another app's runner, where vitest stops on "No test files
+# found".
+_devbox_plan_test_sets() {
+  local step="$1" manifest="$2" s runner="${STEP_RUNNER[$1]}" others="" srun rdir lastman=/dev/null out
+  for s in "${STEP_NAMES[@]}"; do
+    [ "${STEP_RUNNER[$s]-}" = "$runner" ] || continue
+    _devbox_plan_mapfiles "$s"
+    [ "$s" = "$step" ] || [ -z "${_plan_mapfiles[$s]}" ] || others+="${_plan_mapfiles[$s]}"$'\n'
+  done
+  # No map, or one that cannot be read, has no last full trace to compare with.
+  srun="$(devbox_map_step_run "$step")" || srun=""
+  if [ -n "$srun" ] && rdir="$(devbox_record_dir)" && [ -r "$rdir/$srun.files" ]; then lastman="$rdir/$srun.files"; fi
+  out="$(awk "$_DEVBOX_PLAN_AWK_PATH"'
+    function common(a, b,   x, y, n, m, i) {
+      n = split(a, x, "/"); m = split(b, y, "/")
+      for (i = 1; i < n && i < m; i++) if (x[i] != y[i]) break
+      return i - 1
+    }
+    phase == "names" { if ($0 != "") names[++nn] = $0; next }
+    phase == "own" { if ($0 != "") { own[$0] = 1; ownl[++no] = $0 }; next }
+    phase == "other" { if ($0 != "") { other[$0] = 1; otherl[++nt] = $0 }; next }
+    phase == "cur" { cur[path_of($0)] = 1; next }
+    phase == "old" { old[path_of($0)] = 1; next }
+    END {
+      for (i = 1; i <= no; i++) if (ownl[i] in cur) print "test\t" ownl[i]
+      for (i = 1; i <= nn; i++) {
+        t = names[i]
+        if (t in other) continue
+        if (!(t in own)) {
+          if (t in old) continue
+          ds = 0; dt = 0
+          for (j = 1; j <= no; j++) { d = common(t, ownl[j]); if (d > ds) ds = d }
+          for (j = 1; j <= nt; j++) { d = common(t, otherl[j]); if (d > dt) dt = d }
+          if (ds < dt) continue
+          print "new\t" t
+        }
+        print "test\t" t
+      }
+    }' phase=names <(_devbox_plan_test_paths "$manifest" "$runner" "${STEP_DIR[$step]-}") \
+      phase=own <(printf '%s\n' "${_plan_mapfiles[$step]}") phase=other <(printf '%s' "$others") \
+      phase=cur "$manifest" phase=old "$lastman")" || return 1
+  _plan_tests="$(awk -F'\t' '$1 == "test" { print $2 }' <<<"$out" | LC_ALL=C sort -u)"
+  _plan_new="$(awk -F'\t' '$1 == "new" { print $2 }' <<<"$out")"
+}
+
+# Set _plan_shard to shard <i> of <n> of the test files in _plan_tests (D10),
+# for step $1. By the seconds the records give each file, longest first, each
+# to the shard with the least time so far; a file no record timed weighs the
+# mean of those that were. With no file timed, by path: shard <i> holds the
+# <i>th of <n> runs of the sorted list. Every file lands in one shard, so the
+# shards are disjoint and their union is every test file.
+_devbox_plan_shard() {
+  local step="$1" i="$2" n="$3" durations
+  durations="$(devbox_record_durations "$step")" || return 1
+  _plan_shard="$(PLAN_I="$i" PLAN_N="$n" awk -F'\t' '
+    FNR == NR { if ($1 != "") { d[$1] = $2 }; next }
+    $0 != "" { f[++m] = $0; if ($0 in d) { known++; sum += d[$0] } }
+    END {
+      i = ENVIRON["PLAN_I"]; n = ENVIRON["PLAN_N"]
+      if (!known) {
+        for (k = 1; k <= m; k++) if (int((k - 1) * n / m) + 1 == i) print f[k]
+        exit
+      }
+      mean = int(sum / known); if (mean < 1) mean = 1
+      for (k = 1; k <= m; k++) { w = (f[k] in d) ? d[f[k]] : mean; if (w < 1) w = 1; print "W\t" w "\t" f[k] }
+    }' <(printf '%s\n' "$durations") <(printf '%s\n' "$_plan_tests") \
+    | PLAN_I="$i" PLAN_N="$n" awk -F'\t' '
+      $1 != "W" { print; next }
+      { w[++m] = $2; p[m] = $3 }
+      END {
+        if (!m) exit
+        cmd = "LC_ALL=C sort -t \"\t\" -k1,1nr -k2,2"
+        for (k = 1; k <= m; k++) print w[k] "\t" p[k] | cmd
+        close(cmd)
+      }' \
+    | PLAN_I="$i" PLAN_N="$n" awk -F'\t' '
+      NF < 2 { print; next }
+      {
+        best = 1
+        for (s = 2; s <= ENVIRON["PLAN_N"]; s++) if (load[s] + 0 < load[best] + 0) best = s
+        load[best] += $1
+        if (best == ENVIRON["PLAN_I"]) print $2
+      }' | LC_ALL=C sort)" || return 1
+}
+
+# Set _plan_files, _plan_reason and _plan_freason when section 6.4 allows step
+# $1 to run its failed files only: a narrow=failed step with a runner, whose
+# newest result failed with code 1 (the runner's "tests failed", not a crash),
+# with at least one failed file and no open one. The files are the failed
+# files that still exist, then every test file of the runner that changed
+# since that record. That record's manifest is required, because without it
+# the changed test files are unknown. Returns 0 to narrow, 1 not to.
 _devbox_plan_narrow() {
-  local step="$1" manifest="$2" last run outcome code failed f dir changed paths tests="" kept="" nf=0 nt=0
+  local step="$1" manifest="$2" last run outcome code failed f dir changed paths names tests="" kept="" nf=0 nt=0
   [ "${STEP_NARROW[$step]-}" = failed ] && [ -n "${STEP_RUNNER[$step]-}" ] || return 1
   last="$(devbox_record_last_of "$step")" || return 1
   [ -n "$last" ] || return 1
@@ -202,19 +435,22 @@ _devbox_plan_narrow() {
   changed="$(_devbox_plan_diff <(_devbox_plan_inputs_of "$dir/$run.files" "$step") \
     <(_devbox_plan_inputs_of "$manifest" "$step"))" || return 1
   paths="$(awk "$_DEVBOX_PLAN_AWK_PATH"'{ print path_of($0) }' "$manifest")" || return 1
+  names="$(_devbox_plan_test_paths "$manifest" "${STEP_RUNNER[$step]}" "${STEP_DIR[$step]-}")" || return 1
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     # A failed file that is gone has nothing to re-run, and vitest given only
     # a filter that matches no file fails with "No test files found".
     grep -Fxq -- "$f" <<<"$paths" || continue
     kept+="$f"$'\n'; nf=$((nf + 1))
+    _plan_freason[$f]=failed
   done <<<"$failed"
   while IFS= read -r f; do
     [[ "$f" == "changed "* ]] || continue
     f="${f#changed }"
-    devbox_plan_is_test_file "$f" "${STEP_RUNNER[$step]}" || continue
+    grep -Fxq -- "$f" <<<"$names" || continue
     case $'\n'"$kept" in *$'\n'"$f"$'\n'*) continue ;; esac
     tests+="$f"$'\n'; nt=$((nt + 1))
+    _plan_freason[$f]=changed
   done <<<"$changed"
   [ $((nf + nt)) -gt 0 ] || return 1
   _plan_files="$kept$tests"
@@ -222,33 +458,70 @@ _devbox_plan_narrow() {
   [ "$nt" -eq 0 ] || _plan_reason+=" and $nt changed test files"
 }
 
-# Set _plan_files and _plan_reason when D14 allows step $1 to run vitest's
-# related tests of its changed inputs: select=related, a pass to compare with
-# and that pass's manifest, at least one changed input, no deleted input and no
-# changed shared input. The key of this run's step over that pass's manifest
-# must also be a passed key: then the inputs are the one difference, and a
-# change of the config, the client, the step line or a forwarded value runs the
-# step in full. Returns 0 to select, 1 not to.
-_devbox_plan_related() {
-  local step="$1" manifest="$2" run dir changed shared old_key f n=0
-  [ "${STEP_SELECT[$step]-}" = related ] || return 1
-  run="$(devbox_record_last_pass_of "$step")" || return 1
-  [ -n "$run" ] || return 1
-  dir="$(devbox_record_dir)" || return 1
-  [ -r "$dir/$run.files" ] || return 1
-  changed="$(_devbox_plan_diff <(_devbox_plan_inputs_of "$dir/$run.files" "$step") \
-    <(_devbox_plan_inputs_of "$manifest" "$step"))" || return 1
-  [ -n "$changed" ] || return 1
-  ! grep -q '^deleted ' <<<"$changed" || return 1
-  shared="$(_devbox_plan_diff <(_devbox_plan_shared_of "$dir/$run.files") <(_devbox_plan_shared_of "$manifest"))" || return 1
-  [ -z "$shared" ] || return 1
-  old_key="$(_devbox_plan_key "$dir/$run.files" "$step")" || return 1
-  [ -n "$(devbox_record_find_pass "$step" "$old_key")" ] || return 1
-  _plan_files=""
+# Set _plan_files, _plan_reason and _plan_freason for the runner step $1 whose
+# key has no pass, by section 6: each test file that can see the change, with
+# its reason. Selection needs a map that reads, written under this run's base
+# and setup key, and a newest result that passed or failed in its test files
+# alone: a crash or a stop leaves files that never ran and that no reason
+# would select. Returns 0 to select, 10 when no file is selected, which
+# carries the step with the reason `no test read a changed file` (D3), and 1
+# not to select, with _plan_why set to why.
+_devbox_plan_select() {
+  local step="$1" manifest="$2" state last run outcome code failed="" sel rc=0 f r paths
+  local -A reason=()
+  state="$(devbox_map_state "$step")"
+  case "$state" in
+    none) _plan_why="no map"; return 1 ;;
+    bad)
+      echo "devbox verify: the map of step $step could not be read, so the step runs in full" >&2
+      _plan_why="its map could not be read"; return 1 ;;
+  esac
+  last="$(devbox_record_last_of "$step")" || return 2
+  if [ -n "$last" ]; then
+    read -r run outcome code <<<"$last"
+    if [ "$outcome" = fail ]; then
+      [ "$code" = 1 ] || return 1
+      failed="$(devbox_record_failed_files "$run" "$step")" || return 2
+      [ -n "$failed" ] || return 1
+      [ -z "$(devbox_record_open_files "$run" "$step")" ] || return 1
+    fi
+  fi
+  sel="$(devbox_map_select "$step" "$manifest" "${PLAN_BASE[$step]}" "$PLAN_SETUP_KEY")" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) _plan_why="its map was traced under another config, client, step line, forwarded value or setup"; return 1 ;;
+    *) echo "devbox verify: the map of step $step could not be read, so the step runs in full" >&2
+       _plan_why="its map could not be read"; return 1 ;;
+  esac
+  while IFS=$'\t' read -r f r; do
+    [ -z "$f" ] || reason[$f]="$r"
+  done <<<"$sel"
+  if [ -n "$failed" ]; then
+    paths="$(awk "$_DEVBOX_PLAN_AWK_PATH"'{ print path_of($0) }' "$manifest")" || return 2
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      grep -Fxq -- "$f" <<<"$paths" || continue
+      [ "${reason[$f]-}" = changed ] || reason[$f]=failed
+      case $'\n'"$_plan_tests"$'\n' in *$'\n'"$f"$'\n'*) ;; *) _plan_tests+="${_plan_tests:+$'\n'}$f" ;; esac
+    done <<<"$failed"
+  fi
   while IFS= read -r f; do
-    _plan_files+="${f#changed }"$'\n'; n=$((n + 1))
-  done <<<"$changed"
-  _plan_reason="related to $n changed files"
+    [ -z "$f" ] || [ -n "${reason[$f]+x}" ] || reason[$f]=new
+  done <<<"$_plan_new"
+  _plan_files=""
+  for f in "${!reason[@]}"; do
+    if [ -n "${_plan_shard+x}" ]; then
+      case $'\n'"$_plan_shard"$'\n' in *$'\n'"$f"$'\n'*) ;; *) continue ;; esac
+    fi
+    _plan_freason[$f]="${reason[$f]}"
+    _plan_files+="$f"$'\n'
+  done
+  if [ -z "$_plan_files" ]; then
+    _plan_reason="no test read a changed file"
+    return 10
+  fi
+  _plan_files="$(printf '%s' "$_plan_files" | LC_ALL=C sort)"$'\n'
+  _plan_reason="selected $(grep -c . <<<"$_plan_files") of $(grep -c . <<<"$_plan_tests") test files"
 }
 
 # Set _plan_reason for step $1 that runs in full under DEVBOX_RERUN=changed.
@@ -280,33 +553,42 @@ _devbox_plan_run_reason() {
   elif [ -n "$changed" ]; then
     _plan_reason="inputs changed: $(grep -c . <<<"$changed") files"
   else
-    _plan_reason="config, client version, step line or forwarded env changed since run $run"
+    _plan_reason="config, client version, step line, setup or forwarded env changed since run $run"
   fi
 }
 
-# Print the plan of section 6.7 for the rerun setting $1 (changed or full) over
+# Print the plan of section 5.6 for the rerun setting $1 (changed or full) over
 # the manifest $2 (devbox_sync_manifest's lines): one `step` line per step,
-# then the `file` lines. With step names after $2, only those are planned, and
-# an `after` name that is not planned is dropped, because that step never runs
-# and the runner would wait on it forever.
+# then the `file` and `test` lines. With step names after $2, only those are
+# planned, and an `after` name that is not planned is dropped, because that
+# step never runs and the runner would wait on it forever.
 #
-# It also fills PLAN_STEPS, PLAN_ACTION, PLAN_NFILES and PLAN_REASON for
-# devbox_plan_print, so call it with its stdout sent to a file, never inside
-# $( ), where those variables would end with the subshell.
+# A step line asks for a trace (`1` in its last field) when a runner step
+# runs, and when a step without `inputs=` runs with no valid trace (D2, D4). The plan never says `related`: `vitest related`
+# answered "No test files found" with exit 0, so a pass of no test could reach
+# a record (D3).
+#
+# It also fills PLAN_STEPS, PLAN_ACTION, PLAN_MODE, PLAN_TRACE, PLAN_NFILES,
+# PLAN_REASON, PLAN_FREASON (`<step><TAB><path>` to a file's reason), PLAN_BASE
+# and PLAN_SETUP_KEY for devbox_plan_print, the record and devbox_plan_rekey,
+# so call it with its stdout sent to a file, never inside $( ), where those
+# variables would end with the subshell.
 #
 # Returns 2 with a line for a rerun value or a step name it does not know, and
 # 1 with a line when a part of a key cannot be read: a key that left out what
 # it could not read would carry a pass written under other inputs.
 devbox_plan_build() {
-  local rerun="$1" manifest="$2" step var action key run after a b64 f
-  local _plan_version _plan_config _plan_forward _plan_files _plan_reason
-  local -a steps afters step_lines=() file_lines=()
+  local rerun="$1" manifest="$2" step var action key run after a b64 f mode trace rc
+  local _plan_version _plan_config _plan_forward _plan_files _plan_reason _plan_why _plan_tests _plan_new _plan_shard
+  local shard_step="" shard_i="" shard_n=""
+  local -a steps afters step_lines=() file_lines=() test_lines=()
+  local -A _plan_freason=() _plan_mapfiles=()
   shift 2
   case "$rerun" in
     changed|full) ;;
     *) echo "devbox verify: refusing DEVBOX_RERUN '$rerun': write changed or full" >&2; return 2 ;;
   esac
-  for var in STEP_INPUTS STEP_RUNNER STEP_NARROW STEP_SELECT STEP_RERUN STEP_CMD STEP_SOURCE STEP_AFTER; do
+  for var in STEP_INPUTS STEP_RUNNER STEP_NARROW STEP_RERUN STEP_CMD STEP_SOURCE STEP_AFTER STEP_DIR; do
     [[ "$(declare -p "$var" 2>/dev/null)" == "declare -A"* ]] || {
       echo "devbox verify: $var is not loaded, so no plan was made" >&2
       return 1
@@ -320,6 +602,20 @@ devbox_plan_build() {
   else
     steps=("${STEP_NAMES[@]}")
   fi
+  if [ -n "${PLAN_SHARD:-}" ]; then
+    read -r shard_step shard_i shard_n <<<"$PLAN_SHARD"
+    if [ "${#steps[@]}" -ne 1 ] || [ "${steps[0]}" != "$shard_step" ]; then
+      echo "devbox verify: --shard runs one step, named once with --step" >&2; return 2
+    fi
+    # `devbox ci matrix` gives a step with no runner the one shard 1/1, and CI
+    # passes each entry's shard as it stands, so every lint and type check job
+    # once exited 2 here. One shard of one is the whole step, as --step alone.
+    if [ -z "${STEP_RUNNER[$shard_step]-}" ]; then
+      [ "$shard_i/$shard_n" = 1/1 ] \
+        || { echo "devbox verify: --shard splits the test files of a runner step, and step $shard_step has no runner=" >&2; return 2; }
+      PLAN_SHARD="" shard_step=""
+    fi
+  fi
   [ -r "$manifest" ] || { echo "devbox verify: could not read the file list $manifest, so no plan was made" >&2; return 1; }
   _plan_version="$(cat -- "$DEVBOX_CLIENT_VERSION_FILE")" \
     || { echo "devbox verify: could not read $DEVBOX_CLIENT_VERSION_FILE, so no plan was made" >&2; return 1; }
@@ -328,11 +624,30 @@ devbox_plan_build() {
   _plan_forward="$(_devbox_plan_forward)" || return 1
 
   declare -ga PLAN_STEPS=("${steps[@]}")
-  declare -gA PLAN_ACTION=() PLAN_NFILES=() PLAN_REASON=()
+  declare -gA PLAN_ACTION=() PLAN_MODE=() PLAN_TRACE=() PLAN_NFILES=() PLAN_REASON=() PLAN_FREASON=() \
+    PLAN_BASE=() PLAN_TRACE_BASE=() PLAN_LEARNED=() PLAN_SETUP_READ=()
+  PLAN_SETUP_KEY="$(_devbox_plan_setup_key "$manifest")" \
+    || { echo "devbox verify: could not compute the setup key, so no plan was made" >&2; return 1; }
   for step in "${steps[@]}"; do
+    PLAN_TRACE_BASE[$step]="$(_devbox_plan_trace_base "$step")" \
+      || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
+    PLAN_BASE[$step]="$(_devbox_plan_base "$step")" \
+      || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
+    _devbox_plan_learn "$step"
     key="$(_devbox_plan_key "$manifest" "$step")" \
       || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
-    _plan_files="" _plan_reason=""
+    _plan_files="" _plan_reason="" _plan_why="" _plan_tests="" _plan_new="" mode=full
+    unset _plan_shard
+    _plan_freason=()
+    if [ -n "${STEP_RUNNER[$step]-}" ]; then
+      _devbox_plan_test_sets "$step" "$manifest" \
+        || { echo "devbox verify: could not list the test files of step $step, so no plan was made" >&2; return 1; }
+      if [ "$step" = "$shard_step" ]; then
+        _devbox_plan_shard "$step" "$shard_i" "$shard_n" \
+          || { echo "devbox verify: could not split the test files of step $step, so no plan was made" >&2; return 1; }
+        mode=shard
+      fi
+    fi
     if [ "$rerun" = full ]; then
       action=run _plan_reason="DEVBOX_RERUN=full"
     elif [ "${STEP_RERUN[$step]-}" = always ]; then
@@ -340,16 +655,50 @@ devbox_plan_build() {
     else
       run="$(devbox_record_find_pass "$step" "$key")" \
         || { echo "devbox verify: could not read the records, so no plan was made" >&2; return 1; }
+      rc=1
       if [ -n "$run" ]; then
         action=carry _plan_reason="carried from run $run"
-      elif _devbox_plan_narrow "$step" "$manifest"; then
-        action=narrow
-      elif _devbox_plan_related "$step" "$manifest"; then
-        action=related
+      elif [ -n "${STEP_RUNNER[$step]-}" ] && { _devbox_plan_select "$step" "$manifest"; rc=$?; [ "$rc" = 0 ] || [ "$rc" = 10 ]; }; then
+        if [ "$rc" = 0 ]; then action=select; else action=carry; fi
+        [ "$mode" = shard ] || mode=selected
+      elif [ "$rc" = 2 ]; then
+        echo "devbox verify: could not read the records, so no plan was made" >&2; return 1
+      elif [ "$mode" != shard ] && _devbox_plan_narrow "$step" "$manifest"; then
+        action=narrow mode=narrowed
       else
         action=run
         _devbox_plan_run_reason "$step" "$manifest" \
           || { echo "devbox verify: could not read the records, so no plan was made" >&2; return 1; }
+        case "$_plan_reason" in "no earlier pass"|"failed in run "*) ;; *) [ -z "$_plan_why" ] || _plan_reason+="; $_plan_why" ;; esac
+      fi
+    fi
+    if [ "$action" = run ] && [ -z "${STEP_INPUTS[$step]-}" ] && f="$(devbox_map_untraced "$step")" && [ -n "$f" ]; then
+      _plan_reason+="; no trace: $f"
+    fi
+    # A shard that runs runs every file of its part, and selects within it
+    # only when the map allows a selection.
+    if [ "$mode" = shard ] && [ "$action" = run ]; then
+      action=select _plan_files="${_plan_shard:+$_plan_shard$'\n'}"
+      while IFS= read -r f; do
+        [ -z "$f" ] || _plan_freason[$f]="shard $shard_i/$shard_n"
+      done <<<"$_plan_shard"
+    fi
+    if [ "$mode" = shard ] && [ "$action" = select ] && [ -z "$_plan_files" ]; then
+      action=carry _plan_reason="shard $shard_i/$shard_n holds no test file"
+    fi
+    [ "$mode" != shard ] || _plan_reason="shard $shard_i/$shard_n: $_plan_reason"
+    # A runner step that runs is traced every time: its test files' reads
+    # select its files next time (D2). A step without inputs= is traced when
+    # its map holds no valid trace of it, when the trace was taken under
+    # another step line, config or client, and on a full run (D4). MEASURED:
+    # strace made a type check and a lint run from half again to several times
+    # as long in a workspace (P3), more than most changes save.
+    trace=0
+    if [ "$action" != carry ]; then
+      if [ -n "${STEP_RUNNER[$step]-}" ]; then
+        trace=1
+      elif [ -z "${STEP_INPUTS[$step]-}" ]; then
+        if [ "$rerun" = full ] || ! f="$(devbox_map_step_traced "$step")" || [ "$f" != "${PLAN_TRACE_BASE[$step]}" ]; then trace=1; fi
       fi
     fi
     after=""
@@ -358,27 +707,42 @@ devbox_plan_build() {
       case " ${steps[*]} " in *" $a "*) after+="${after:+,}$a" ;; esac
     done
     b64="$(printf '%s' "${STEP_CMD[$step]}" | base64 | tr -d '\n')" || return 1
-    step_lines+=("$(printf 'step\t%s\t%s\t%s\t%s\t%s\t%s' "$step" "$action" "$key" \
-      "${STEP_RUNNER[$step]:--}" "${after:--}" "$b64")")
-    PLAN_ACTION[$step]="$action" PLAN_REASON[$step]="$_plan_reason" PLAN_NFILES[$step]=0
+    step_lines+=("$(printf 'step\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$step" "$action" "$key" \
+      "${STEP_RUNNER[$step]:--}" "${after:--}" "$b64" "${STEP_DIR[$step]:--}" "$trace")")
+    # shellcheck disable=SC2034 # PLAN_MODE and PLAN_TRACE are read by devbox-verify's record
+    PLAN_ACTION[$step]="$action" PLAN_MODE[$step]="$mode" PLAN_TRACE[$step]="$trace"
+    PLAN_REASON[$step]="$_plan_reason" PLAN_NFILES[$step]=0
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       file_lines+=("$(printf 'file\t%s\t%s' "$step" "$f")")
+      PLAN_FREASON[$step$'\t'$f]="${_plan_freason[$f]-}"
       PLAN_NFILES[$step]=$((PLAN_NFILES[$step] + 1))
     done <<<"$_plan_files"
+    if [ "$action" != carry ] && [ -n "${STEP_RUNNER[$step]-}" ]; then
+      while IFS= read -r f; do
+        [ -z "$f" ] || test_lines+=("$(printf 'test\t%s\t%s' "$step" "$f")")
+      done < <(printf '%s\n' "$_plan_tests" | LC_ALL=C sort -u)
+    fi
   done
   printf '%s\n' "${step_lines[@]}"
   [ "${#file_lines[@]}" -eq 0 ] || printf '%s\n' "${file_lines[@]}"
+  [ "${#test_lines[@]}" -eq 0 ] || printf '%s\n' "${test_lines[@]}"
 }
 
 # Print the plan that devbox_plan_build made for a person, for --plan: one line
-# per step, `<name>  <action>  <reason>`. The action of a narrow or related step
-# carries its file count, as section 3 shows it.
+# per step, `<name>  <action>  <reason>`, then, under a narrow or select step,
+# one line per file, `  <path>  <reason>` (learned-selection spec, section 3).
+# The action of a narrow or select step carries its file count.
 devbox_plan_print() {
-  local step action
+  local step action f
   for step in "${PLAN_STEPS[@]}"; do
     action="${PLAN_ACTION[$step]}"
-    case "$action" in narrow|related) action+=" ${PLAN_NFILES[$step]} files" ;; esac
+    case "$action" in narrow|select) action+=" ${PLAN_NFILES[$step]} files" ;; esac
     printf '%s  %s  %s\n' "$step" "$action" "${PLAN_REASON[$step]}"
+    case "${PLAN_ACTION[$step]}" in narrow|select) ;; *) continue ;; esac
+    for f in "${!PLAN_FREASON[@]}"; do
+      [[ "$f" == "$step"$'\t'* ]] || continue
+      printf '  %s  %s\n' "${f#"$step"$'\t'}" "${PLAN_FREASON[$f]}"
+    done | LC_ALL=C sort
   done
 }

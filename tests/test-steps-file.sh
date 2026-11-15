@@ -1,6 +1,8 @@
 #!/bin/bash
 # .devbox/steps is parsed and checked on the laptop, by line number, before any
 # target is asked (D2), and an each= line becomes one step per module (D12).
+# The attributes dir=, shards= and requires= and the ignored select=related are
+# those of docs/specs/2026-11-14-learned-selection-design.md, section 4.2.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
@@ -75,10 +77,19 @@ refused "each without {name}" 't each=apps/*/ -- x' 1 'a step with each= must ho
 refused "bad name after expansion" 't:{name} each=mods/*/ -- x' 1 'step name "t:Api" is not'
 refused "duplicate name after expansion" $'t:api -- a\nt:{name} each=apps/*/ -- b' 2 'step name "t:api" is already used on line 1'
 refused "narrow without runner" 't narrow=failed -- npx vitest run' 1 'narrow=failed needs runner=vitest or runner=pytest'
-refused "select without runner" 't select=related -- npx vitest run' 1 'select=related needs runner=vitest'
-refused "select with pytest" 't runner=pytest select=related -- uv run pytest' 1 'select=related needs runner=vitest'
-refused "select with no vitest run" 't runner=vitest select=related -- npm test' 1 'needs "vitest run" exactly once in the command, and it holds 0'
-refused "select with two vitest runs" 't runner=vitest select=related -- npx vitest run a && npx vitest run b' 1 'and it holds 2'
+refused "dir without /" 't runner=pytest dir=apps/worker -- uv run pytest' 1 'dir=apps/worker must end in "/"'
+refused "absolute dir" 't dir=/apps/worker/ -- x' 1 'dir=/apps/worker/ must be a folder of the checkout, written relative to its root'
+refused "dir with .." 't dir=apps/../apps/worker/ -- x' 1 'dir=apps/../apps/worker/ must not hold ".."'
+refused "dir with ." 't dir=./apps/ -- x' 1 'dir=./apps/ must not hold "."'
+refused "dir that is no folder" 't dir=apps/none/ -- x' 1 'dir=apps/none/ is not a folder of the checkout'
+refused "each dir that is no folder" 't:{name} each=apps/*/ dir={dir}src/ -- x' 1 'dir=apps/worker/src/ is not a folder of the checkout'
+refused "shards of zero" 't runner=vitest shards=0 -- npx vitest run' 1 'shards must be a whole number from 1, not "0"'
+refused "shards that is no number" 't runner=vitest shards=four -- npx vitest run' 1 'shards must be a whole number from 1, not "four"'
+refused "shards without runner" 't shards=4 -- npm test' 1 'shards=4 needs runner=vitest or runner=pytest'
+refused "requires with a blank entry" 't requires=docker,,psql -- x' 1 'requires=docker,,psql holds an empty entry'
+refused "requires with a semicolon" 't requires=a;b -- x' 1 'requires token "a;b" may hold only'
+refused "requires starting with a dash" 't requires=-x -- x' 1 'requires token "-x" may hold only'
+refused "requires all dots" 't requires=.. -- x' 1 'requires token ".." may hold only'
 refused "unknown runner" 't runner=jest -- npx jest' 1 'runner must be vitest or pytest, not "jest"'
 refused "unknown narrow" 't runner=vitest narrow=all -- npx vitest run' 1 'narrow must be failed, not "all"'
 refused "unknown select" 't runner=vitest select=all -- npx vitest run' 1 'select must be related, not "all"'
@@ -93,6 +104,19 @@ refused "each line after its own step" 't:{name} each=apps/*/ after=t:{name} -- 
 
 assert_eq "" "$(cat "$TMP/ssh.log" 2>/dev/null)" "no refusal calls ssh"
 
+# ── select=related, read and ignored ─────────────────────────────────────────
+
+printf '%s\n' 'lint -- x' 't select=related -- npm test' 'u runner=pytest select=related -- uv run pytest' >"$STEPS"
+rc=0
+err="$( (devbox_steps_load "$STEPS" "$ROOT") 2>&1 >/dev/null)" || rc=$?
+assert_eq 0 "$rc" "select=related loads, on any step"
+assert_eq 1 "$(printf '%s\n' "$err" | grep -c .)" "with one warning line for the file"
+assert_ok "that names its lines and says it is ignored" contains \
+  ".devbox/steps line 2, 3: select=related is ignored" "$err"
+devbox_steps_load "$STEPS" "$ROOT" 2>/dev/null
+assert_eq "|" "${STEP_SELECT[t]}|${STEP_SELECT[u]}" "and the step selects nothing of its own"
+assert_eq "u runner=pytest -- uv run pytest" "${STEP_SOURCE[u]}" "nor does the source hold it"
+
 rc=0; err="$( (devbox_steps_load "$TMP/absent" "$ROOT") 2>&1)" || rc=$?
 assert_eq 2 "$rc" "an unreadable file is refused"
 assert_ok "and the refusal names the file" contains "cannot read $TMP/absent" "$err"
@@ -104,7 +128,7 @@ cat >"$STEPS" <<'EOF'
    # an indented comment
 
 typecheck:{name}  each=apps/*/  inputs={dir},packages/  -- npx tsc -p {dir}tsconfig.json --noEmit
-test:{name}  each=apps/*/  after=typecheck:{name},lint  runner=vitest select=related narrow=failed inputs={dir}src/,packages/ -- npx vitest run --project {name}
+test:{name}  each=apps/*/  after=typecheck:{name},lint  runner=vitest narrow=failed inputs={dir}src/,packages/ -- npx vitest run --project {name}
 report  after=test:{name},lint,test:api  -- echo {name} done
 lint	inputs=apps/	--	npm run lint -- --max-warnings  0
 EOF
@@ -124,7 +148,7 @@ assert_eq "test:api test:web test:worker lint" "${STEP_AFTER[report]}" \
 assert_eq "echo {name} done" "${STEP_CMD[report]}" "a line without each keeps {name} in its command"
 assert_eq "" "${STEP_AFTER[lint]}" "a step with no after waits on nothing"
 assert_eq "" "${STEP_INPUTS[report]}" "a step with no inputs reads every synced file"
-assert_eq "vitest|failed|related|" \
+assert_eq "vitest|failed||" \
   "${STEP_RUNNER[test:web]}|${STEP_NARROW[test:web]}|${STEP_SELECT[test:web]}|${STEP_RERUN[test:web]}" \
   "the attributes of an each= line reach every module"
 assert_eq "|||" \
@@ -132,7 +156,7 @@ assert_eq "|||" \
   "an attribute that is not given is empty"
 assert_eq "npm run lint -- --max-warnings  0" "${STEP_CMD[lint]}" \
   "tabs around -- split, and the command keeps a later -- and its blanks"
-assert_eq "test:api after=lint,typecheck:api inputs=apps/api/src/,packages/ narrow=failed runner=vitest select=related -- npx vitest run --project api" \
+assert_eq "test:api after=lint,typecheck:api inputs=apps/api/src/,packages/ narrow=failed runner=vitest -- npx vitest run --project api" \
   "${STEP_SOURCE[test:api]}" "the source is the expanded step with its attributes in a fixed order"
 assert_eq "lint inputs=apps/ -- npm run lint -- --max-warnings  0" "${STEP_SOURCE[lint]}" \
   "the source leaves out an attribute that is not given"
@@ -151,6 +175,28 @@ assert_ok "a changed command changes the source" test "$a" != "$c"
 d="$(source_of $'t:{name} each=apps/*/ -- x\nr after=t:{name} -- y' r)"
 e="$(source_of $'t:{name} each=apps/*/ -- x\nr after=t:worker,t:api,t:web -- y' r)"
 assert_eq "$d" "$e" "after=t:{name} and the module names it covers give one source"
+
+# ── dir=, shards= and requires= ──────────────────────────────────────────────
+
+cat >"$STEPS" <<'EOF'
+service runner=pytest narrow=failed dir=apps/worker/ shards=3 requires=cmd:psql,docker -- uv run pytest
+mod:{name} each=apps/*/ runner=vitest dir={dir} requires=docker -- npx vitest run
+plain -- true
+EOF
+rc=0
+devbox_steps_load "$STEPS" "$ROOT" || rc=$?
+assert_eq 0 "$rc" "dir=, shards= and requires= load"
+assert_eq "apps/worker/|3|cmd:psql docker" \
+  "${STEP_DIR[service]}|${STEP_SHARDS[service]}|${STEP_REQUIRES[service]}" "each fills its array, requires space separated"
+assert_eq "apps/web/" "${STEP_DIR[mod:web]}" "{dir} is replaced in dir="
+assert_eq "|1|" "${STEP_DIR[plain]}|${STEP_SHARDS[plain]}|${STEP_REQUIRES[plain]}" \
+  "a step without them runs at the root, in one shard, with no token"
+assert_eq "service dir=apps/worker/ narrow=failed requires=cmd:psql,docker runner=pytest -- uv run pytest" \
+  "${STEP_SOURCE[service]}" "dir= and requires= are in the source, and shards= is not"
+f="$(source_of $'s runner=vitest shards=2 requires=docker,cmd:psql -- npx vitest run' s)"
+g="$(source_of $'s runner=vitest shards=6 requires=cmd:psql,docker -- npx vitest run' s)"
+assert_ok "the source of a sharded step is computed" contains "s requires=cmd:psql,docker runner=vitest -- " "$f"
+assert_eq "$f" "$g" "the shard count and the token order do not change the source"
 
 # ── the caller's scope ───────────────────────────────────────────────────────
 
@@ -176,8 +222,8 @@ assert_eq 2 "$rc" "under set -e a refusal still returns 2"
 devbox_steps_from_verify "npm run verify -- --ci"
 assert_eq "verify" "${STEP_NAMES[*]}" "DEVBOX_VERIFY becomes one step named verify"
 assert_eq "npm run verify -- --ci" "${STEP_CMD[verify]}" "with the command as written"
-assert_eq "||||||" \
-  "${STEP_AFTER[verify]}|${STEP_INPUTS[verify]}|${STEP_RUNNER[verify]}|${STEP_NARROW[verify]}|${STEP_SELECT[verify]}|${STEP_RERUN[verify]}|" \
+assert_eq "||||||||1|" \
+  "${STEP_AFTER[verify]}|${STEP_INPUTS[verify]}|${STEP_RUNNER[verify]}|${STEP_NARROW[verify]}|${STEP_SELECT[verify]}|${STEP_RERUN[verify]}|${STEP_DIR[verify]}|${STEP_REQUIRES[verify]}|${STEP_SHARDS[verify]}|" \
   "and no attribute"
 assert_eq "verify -- npm run verify -- --ci" "${STEP_SOURCE[verify]}" "its source matches a steps line of the same step"
 assert_eq "verify -- npm run verify -- --ci" \

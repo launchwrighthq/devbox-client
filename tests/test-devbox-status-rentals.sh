@@ -114,7 +114,7 @@ GD_MAIN="$(git -C "$CO" rev-parse --path-format=absolute --git-dir)"
 GD_FEAT="$(git -C "$TMP/feat-login" rev-parse --path-format=absolute --git-dir)"
 GD_OLD="$(git -C "$TMP/old-run" rev-parse --path-format=absolute --git-dir)"
 
-RUNPOD_KEY_VALUE=fixtureRunpodKey0123456789
+RUNPOD_KEY_VALUE=fixtureRunpodKey0123456789  # a fake fixture: gitleaks:allow
 HCLOUD_VALUE=fixtureHcloudToken0123456789
 ENV_RENT="$(printf 'DEVBOX_RENT=runpod,hetzner\nRUNPOD_KEY=%s\nHCLOUD_TOKEN=%s\n' "$RUNPOD_KEY_VALUE" "$HCLOUD_VALUE")"
 printf '%s\n' "$ENV_RENT" >"$CO/.devbox.env"

@@ -1,18 +1,22 @@
 #!/bin/bash
 # client/share/steps/devbox-steps, the runner of a gate's step graph.
 # docs/specs/2026-11-14-client-owns-the-gate-design.md section 6.3 holds the
-# design, section 6.7 the plan format and the output, and section 13 rows D3,
-# D4 and D14 the requirements this file checks.
+# design and section 13 rows D3 and D4 the requirements of its graph and its
+# plug-ins. docs/specs/2026-11-14-learned-selection-design.md section 5.6
+# holds the plan format, section 7 the worker count, and section 15 rows D5,
+# D6 and D7 the requirements this file checks of them. tests/test-steps-trace.sh
+# checks the trace of a step (rows D4 and D4b).
 #
 # The risks: a step that starts before the step it runs after has ended, a
 # failed step whose log never reaches the client, a ledger `pass` for a step
-# that did not finish, a runner whose plug-in or file filters reach the test
-# runner as the wrong words, and a stopped gate that leaves its test processes
-# running in the workspace.
+# that did not finish, a runner whose plug-in, worker option or files reach the
+# test runner as the wrong words, a dir= step whose files keep the folder's
+# prefix, a resume that passes --exclude, and a stopped gate that leaves its
+# test processes running in the workspace.
 #
 # vitest and pytest are stubs on PATH that record their argv one word per line,
-# so no test runner is installed. node is required for the --exclude of a
-# resumed vitest step, and a missing node FAILS this file, never skips it.
+# so no test runner is installed. node is required to import the copied
+# reporter, and a missing node FAILS this file, never skips it.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
@@ -23,16 +27,25 @@ TOOLS="$REPO/client/share/ledger"
 
 TMP="$(mktemp -d)" || { echo "mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
-unset DEVBOX_STEPS_PLAN DEVBOX_STEPS_LOGS DEVBOX_LEDGER DEVBOX_RESUME DEVBOX_LEDGER_TOOLS
+unset DEVBOX_STEPS_PLAN DEVBOX_STEPS_LOGS DEVBOX_LEDGER DEVBOX_RESUME DEVBOX_LEDGER_TOOLS \
+  DEVBOX_TOKENS DEVBOX_WORKER_MEMORY DEVBOX_CGROUP_ROOT DEVBOX_WORKERS DEVBOX_TRACE_DIR NODE_OPTIONS
 
 PROJ="$TMP/project"
 BIN="$TMP/bin"
 mkdir -p "$PROJ/.devbox" "$BIN"
 printf 'DEVBOX_PROJECT=app\n' >"$PROJ/.devbox/config.env"
-KEY=0123456789abcdef
+KEY=0123456789abcdef  # a fixture machine id: gitleaks:allow
+
+# The workspace's cgroup: 32 GiB, so the memory cap is (32 - 4) / 1.5 = 18
+# workers and no case below meets it unless it sets its own figure.
+CGROUP="$TMP/cgroup"
+mkdir -p "$CGROUP"
+printf '34359738368\n' >"$CGROUP/memory.max"
 
 # The stubs: npx runs the stub vitest, and each runner appends its argv, one
-# word per line, then `--end--`, so a word that holds a space stays one line.
+# word per line, then `--end--`, so a word that holds a space stays one line,
+# and its folder and DEVBOX_WORKERS to ENV_LOG. pytest answers -VV with the
+# plug-ins it registers, pytest-xdist when STUB_XDIST=1, and logs no argv for it.
 cat >"$BIN/npx" <<'STUB'
 #!/bin/bash
 exec "$@"
@@ -40,29 +53,41 @@ STUB
 cat >"$BIN/vitest" <<'STUB'
 #!/bin/bash
 { printf '%s\n' "$@"; echo --end--; } >>"$ARGV_LOG"
+printf 'vitest pwd=%s workers=%s\n' "$PWD" "${DEVBOX_WORKERS-}" >>"$ENV_LOG"
 STUB
 cat >"$BIN/pytest" <<'STUB'
 #!/bin/bash
+if [ "$*" = -VV ]; then
+  printf 'pytest 0.0.0\nregistered third-party plugins:\n'
+  [ "${STUB_XDIST-}" != 1 ] || printf '  pytest-xdist-0.0.0 at /opt/site/xdist/plugin.py\n'
+  exit 0
+fi
 { printf '%s\n' "$@"; echo --end--; } >>"$ARGV_LOG"
 printf '%s\n' "$PYTHONPATH" >>"$PYTHONPATH_LOG"
+printf 'pytest pwd=%s workers=%s\n' "$PWD" "${DEVBOX_WORKERS-}" >>"$ENV_LOG"
 STUB
 chmod +x "$BIN/npx" "$BIN/vitest" "$BIN/pytest"
-export ARGV_LOG="$TMP/argv.log" PYTHONPATH_LOG="$TMP/pythonpath.log"
+export ARGV_LOG="$TMP/argv.log" PYTHONPATH_LOG="$TMP/pythonpath.log" ENV_LOG="$TMP/env.log"
 
-# plan_step <name> <mode> <runner> <after> <command>: one step line of the plan.
+# plan_step <name> <mode> <runner> <after> <command> [<dir>] [<trace>]: one
+# step line of the plan, dir - and trace 0 unless given.
 plan_step() {
-  printf 'step\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$KEY" "$3" "$4" "$(printf '%s' "$5" | base64 | tr -d '\n')"
+  printf 'step\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$KEY" "$3" "$4" \
+    "$(printf '%s' "$5" | base64 | tr -d '\n')" "${6:--}" "${7:-0}"
 }
 plan_file() { printf 'file\t%s\t%s\n' "$1" "$2"; }
+plan_test() { printf 'test\t%s\t%s\n' "$1" "$2"; }
 
 # run_steps <case> <plan file> [VAR=value...]: runs the runner in the project
-# directory with fresh logs in $TMP/logs-<case>. Sets OUT, ERR, RC and LOGS.
+# directory with fresh logs in $TMP/logs-<case>, a 4-token grant and the
+# cgroup above unless the case names its own. Sets OUT, ERR, RC and LOGS.
 run_steps() {
   local case="$1" plan="$2"
   shift 2
   LOGS="$TMP/logs-$case"
   RC=0
-  OUT="$(cd "$PROJ" && env PATH="$BIN:$PATH" DEVBOX_STEPS_PLAN="$plan" DEVBOX_STEPS_LOGS="$LOGS" "$@" "$STEPS" 2>"$TMP/err")" || RC=$?
+  OUT="$(cd "$PROJ" && env PATH="$BIN:$PATH" DEVBOX_TOKENS=4 DEVBOX_CGROUP_ROOT="$CGROUP" \
+    DEVBOX_STEPS_PLAN="$plan" DEVBOX_STEPS_LOGS="$LOGS" "$@" "$STEPS" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
 }
 
@@ -81,7 +106,7 @@ new_ledger() { printf 'key\t%s\nresume\t0\n' "$KEY" >"$1"; }
 if command -v node >/dev/null 2>&1; then
   _pass "node is on PATH"
 else
-  _fail "node is on PATH" "the --exclude of a resumed vitest step needs node; a missing one fails this file, never skips it"
+  _fail "node is on PATH" "the import of the copied reporter needs node; a missing one fails this file, never skips it"
 fi
 assert_ok "devbox-steps is executable" test -x "$STEPS"
 
@@ -205,33 +230,14 @@ new_ledger "$L"
 : >"$ARGV_LOG"
 run_steps vitest "$TMP/vitest.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
 assert_eq "0" "$RC" "a vitest step runs: $ERR"
-assert_eq "$(printf '%s\n' run --project api "${REP[@]}")" "$(argv_call 1)" \
-  "a vitest step gets the default reporter and the ledger reporter appended"
+assert_eq "$(printf '%s\n' run --project api "${REP[@]}" --maxWorkers=4)" "$(argv_call 1)" \
+  "a vitest step gets the default reporter, the ledger reporter and its workers appended"
 assert_ok "the reporter is copied into the project's node_modules" cmp -s "$TOOLS/vitest-ledger.mjs" "$PROJ/node_modules/.devbox-ledger/vitest-ledger.mjs"
 assert_ok "ledger-core.mjs is copied beside it" cmp -s "$TOOLS/ledger-core.mjs" "$PROJ/node_modules/.devbox-ledger/ledger-core.mjs"
 imported="$(cd "$PROJ" && node --input-type=module -e "import('./node_modules/.devbox-ledger/vitest-ledger.mjs').then((m) => console.log(typeof m.default, typeof m.passedFiles))" 2>&1)"
 assert_eq "function function" "$imported" "the copied reporter imports its ledger-core.mjs from its own directory"
 
-# A resume leaves out each file whose last vitest record is pass, through the
-# reporter's own passedFiles(): a file opened again after its pass runs, a
-# pytest file is not vitest's, and a glob character is escaped.
-L="$TMP/vitest-resume.ledger"
-new_ledger "$L"
-printf '%s\n' \
-  $'file\tvitest\tsrc/a.test.ts\tstart' \
-  $'file\tvitest\tsrc/a.test.ts\tpass\t1' \
-  $'file\tvitest\tsrc/b c.test.ts\tpass\t1' \
-  $'file\tvitest\tapp/[id]/page.test.ts\tpass\t1' \
-  $'file\tvitest\tsrc/d.test.ts\tpass\t1' \
-  $'file\tvitest\tsrc/d.test.ts\tstart' \
-  $'file\tpytest\ttests/test_p.py\tpass\t1' >>"$L"
-: >"$ARGV_LOG"
-run_steps vitest-resume "$TMP/vitest.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=1
-assert_eq "0" "$RC" "a resumed vitest step runs: $ERR"
-assert_eq "$(printf '%s\n' run --project api "${REP[@]}" --exclude src/a.test.ts --exclude 'src/b c.test.ts' --exclude 'app/\[id\]/page.test.ts')" \
-  "$(argv_call 1)" "a resumed vitest step gets one --exclude per passed vitest file, a space kept inside one word"
-
-# A narrowed step appends its failed files as filters.
+# A narrowed step appends its failed files as file arguments.
 {
   plan_step unit narrow vitest - 'npx vitest run'
   plan_file unit src/x.test.ts
@@ -241,29 +247,74 @@ L="$TMP/narrow.ledger"
 new_ledger "$L"
 : >"$ARGV_LOG"
 run_steps narrow "$TMP/narrow.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
-assert_eq "$(printf '%s\n' run "${REP[@]}" src/x.test.ts 'src/with space.test.ts')" "$(argv_call 1)" \
-  "a narrowed vitest step appends its files after the options, one word each"
+assert_eq "$(printf '%s\n' run "${REP[@]}" --maxWorkers=2 src/x.test.ts 'src/with space.test.ts')" "$(argv_call 1)" \
+  "a narrowed vitest step appends its files after the options, one word each, and no more workers than files"
 
-# ── row D14: a related step runs vitest related on its changed files ─────────
+# ── row D7: a resume and a selection pass the files to run ───────────────────
+#
+# A vitest 2 release ignored an --exclude from the command line in a project that set
+# its own `exclude`, so a resume passes the files still to run instead.
 
 {
-  plan_step web related vitest - 'npx vitest run --project web'
-  plan_file web src/util.ts
-  plan_file web "src/it's here.ts"
-} >"$TMP/related.plan"
-L="$TMP/related.ledger"
+  plan_step unit run vitest - 'npx vitest run --project api'
+  plan_test unit 'app/[id]/page.test.ts'
+  plan_test unit src/a.test.ts
+  plan_test unit 'src/b c.test.ts'
+  plan_test unit src/d.test.ts
+  plan_test unit src/e.test.ts
+} >"$TMP/vitest-tests.plan"
+L="$TMP/vitest-resume.ledger"
 new_ledger "$L"
+printf '%s\n' \
+  $'file\tvitest\tsrc/a.test.ts\tstart' \
+  $'file\tvitest\tsrc/a.test.ts\tpass\t1' \
+  $'file\tvitest\tsrc/b c.test.ts\tpass\t1' \
+  $'file\tvitest\tapp/[id]/page.test.ts\tpass\t1' \
+  $'file\tvitest\tsrc/d.test.ts\tpass\t1' \
+  $'file\tvitest\tsrc/d.test.ts\tstart' \
+  $'file\tpytest\tsrc/e.test.ts\tpass\t1' >>"$L"
 : >"$ARGV_LOG"
-run_steps related "$TMP/related.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
-assert_eq "0" "$RC" "a related step runs: $ERR"
-assert_eq "$(printf '%s\n' related --run --project web "${REP[@]}" src/util.ts "src/it's here.ts")" "$(argv_call 1)" \
-  "a related step runs vitest related --run with the changed files after its options"
-assert_ok "the step log names the command that ran" grep -qF 'npx vitest related --run --project web' "$LOGS/web.log"
+run_steps vitest-resume "$TMP/vitest-tests.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=1
+assert_eq "0" "$RC" "a resumed vitest step runs: $ERR"
+assert_eq "$(printf '%s\n' run --project api "${REP[@]}" --maxWorkers=2 src/d.test.ts src/e.test.ts)" "$(argv_call 1)" \
+  "a resumed run step gets its test files less those whose last vitest record is pass, as file arguments"
+assert_eq "0" "$(grep -c -- '--exclude' "$ARGV_LOG")" "a resumed vitest step gets no --exclude"
 
 : >"$ARGV_LOG"
-run_steps related-noledger "$TMP/related.plan"
-assert_eq "$(printf '%s\n' related --run --project web src/util.ts "src/it's here.ts")" "$(argv_call 1)" \
-  "with no DEVBOX_LEDGER no reporter is wired, and the files still are"
+run_steps vitest-noresume "$TMP/vitest-tests.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=0
+assert_eq "$(printf '%s\n' run --project api "${REP[@]}" --maxWorkers=4)" "$(argv_call 1)" \
+  "a run step that is not resumed runs its whole suite, with no file argument"
+
+L="$TMP/vitest-allpassed.ledger"
+new_ledger "$L"
+for f in 'app/[id]/page.test.ts' src/a.test.ts 'src/b c.test.ts' src/d.test.ts src/e.test.ts; do
+  printf 'file\tvitest\t%s\tpass\t1\n' "$f" >>"$L"
+done
+: >"$ARGV_LOG"
+run_steps vitest-allpassed "$TMP/vitest-tests.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=1
+assert_eq "0" "$RC" "a resumed step whose every file passed exits 0: $ERR"
+assert_ok "a resumed step whose every file passed prints its result as resumed" grep -qx 'devbox-steps: result unit resumed 0 0' <<<"$OUT"
+assert_eq "" "$(cat "$ARGV_LOG")" "a resumed step whose every file passed never starts its runner, which would run the whole suite"
+
+{
+  plan_step unit select vitest - 'npx vitest run'
+  plan_file unit src/reads-data.test.ts
+  plan_test unit src/a.test.ts
+  plan_test unit src/reads-data.test.ts
+} >"$TMP/select.plan"
+L="$TMP/select.ledger"
+new_ledger "$L"
+: >"$ARGV_LOG"
+run_steps select "$TMP/select.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
+assert_eq "0" "$RC" "a select step runs: $ERR"
+assert_eq "$(printf '%s\n' run "${REP[@]}" --maxWorkers=1 src/reads-data.test.ts)" "$(argv_call 1)" \
+  "a select step runs exactly its file lines"
+assert_eq "0" "$(grep -c 'related' "$ARGV_LOG")" "a select step never runs vitest related"
+
+: >"$ARGV_LOG"
+run_steps select-noledger "$TMP/select.plan"
+assert_eq "$(printf '%s\n' run --maxWorkers=1 src/reads-data.test.ts)" "$(argv_call 1)" \
+  "with no DEVBOX_LEDGER and no trace no reporter is wired, and the files still are"
 
 # ── row D4: the pytest wiring ────────────────────────────────────────────────
 
@@ -272,11 +323,13 @@ L="$TMP/pytest.ledger"
 new_ledger "$L"
 : >"$ARGV_LOG"
 : >"$PYTHONPATH_LOG"
-run_steps pytest "$TMP/pytest.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" PYTHONPATH=/opt/site
+run_steps pytest "$TMP/pytest.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" PYTHONPATH=/opt/site STUB_XDIST=1
 assert_eq "0" "$RC" "a pytest step runs: $ERR"
-assert_eq "$(printf '%s\n' -q -n 2 -p devbox_ledger)" "$(argv_call 1)" "a pytest step gets -p devbox_ledger appended"
+assert_eq "$(printf '%s\n' -q -n 2 -p devbox_ledger)" "$(argv_call 1)" \
+  "a pytest step gets -p devbox_ledger appended, and a command that sets -n keeps its own"
 assert_eq "$TOOLS:/opt/site" "$(cat "$PYTHONPATH_LOG")" "a pytest step finds the plugin first on PYTHONPATH and keeps the PYTHONPATH it had"
 assert_eq "start pass" "$(step_outcomes "$L" py)" "the runner writes the pytest step's own ledger lines"
+assert_ok "the step log says the command keeps its own workers" grep -q 'sets its own pytest workers' "$LOGS/py.log"
 
 {
   plan_step py narrow pytest - 'pytest -q'
@@ -286,7 +339,131 @@ assert_eq "start pass" "$(step_outcomes "$L" py)" "the runner writes the pytest 
 : >"$ARGV_LOG"
 run_steps pytest-narrow "$TMP/pytest-narrow.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
 assert_eq "$(printf '%s\n' -q -p devbox_ledger tests/test_a.py 'tests/test b.py')" "$(argv_call 1)" \
-  "a narrowed pytest step appends its files after the plugin, one word each"
+  "a narrowed pytest step whose pytest has no xdist appends its files after the plugin, and no -n"
+assert_ok "the step log says xdist does not load, and names the words it ran" grep -qF "pytest-xdist does not load in \`pytest -VV\`" "$LOGS/py.log"
+
+: >"$ARGV_LOG"
+run_steps pytest-narrow-xdist "$TMP/pytest-narrow.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" STUB_XDIST=1
+assert_eq "$(printf '%s\n' -q -p devbox_ledger -n 2 tests/test_a.py 'tests/test b.py')" "$(argv_call 1)" \
+  "a pytest step whose pytest loads xdist gets -n before its files"
+
+# ── row D5: workers come from the grant ──────────────────────────────────────
+#
+# A 12-token grant and two runner steps that start together: each gets half,
+# capped by its file count. A step that starts later, with one runner step
+# still running, shares the grant with that one.
+
+{
+  plan_step suite run vitest - 'npx vitest run'
+  for i in 01 02 03 04 05 06 07 08 09 10; do plan_test suite "src/t$i.test.ts"; done
+  plan_step service run pytest - 'uv run pytest -q'
+  plan_test service tests/test_a.py
+  plan_test service tests/test_b.py
+  plan_test service tests/test_c.py
+  plan_step build run - - "printf '%s\n' \"\$DEVBOX_WORKERS\" >$(printf '%q' "$TMP/build-workers")"
+} >"$TMP/workers.plan"
+cat >"$BIN/uv" <<'STUB'
+#!/bin/bash
+[ "$1" = run ] && shift
+exec "$@"
+STUB
+chmod +x "$BIN/uv"
+: >"$ARGV_LOG"
+: >"$ENV_LOG"
+run_steps workers "$TMP/workers.plan" DEVBOX_TOKENS=12 STUB_XDIST=1
+assert_eq "0" "$RC" "a 12-token gate with two runner steps runs: $ERR"
+vitest_argv="$(awk '$0 == "--end--" { print c; c = ""; next } { c = c " " $0 }' "$ARGV_LOG" | grep ' run' | head -1)"
+pytest_argv="$(awk '$0 == "--end--" { print c; c = ""; next } { c = c " " $0 }' "$ARGV_LOG" | grep ' -q' | head -1)"
+assert_eq " run --maxWorkers=6" "$vitest_argv" "a vitest step of 10 files gets 12 / 2 = 6 workers when two runner steps start together"
+assert_eq " -q -n 3" "$pytest_argv" "a pytest step of 3 files gets min(6, 3) = 3 workers"
+assert_ok "the vitest step's DEVBOX_WORKERS is its worker count" grep -qx "vitest pwd=$PROJ workers=6" "$ENV_LOG"
+assert_ok "the pytest step's DEVBOX_WORKERS is its worker count" grep -qx "pytest pwd=$PROJ workers=3" "$ENV_LOG"
+assert_eq "6" "$(cat "$TMP/build-workers")" "a step with no runner gets DEVBOX_WORKERS too: the grant shared by the two runner steps that start with it"
+
+# The memory cap: (8 GiB - 4 GiB) / 1536 MiB is 2 workers, and with a worker
+# that needs 1 GiB it is 4. memory.max `max` means no limit, so memory.high is
+# read.
+plan_step suite run vitest - 'npx vitest run' >"$TMP/one-vitest.plan"
+CG8="$TMP/cgroup-8g"
+mkdir -p "$CG8"
+printf 'max\n' >"$CG8/memory.max"
+printf '8589934592\n' >"$CG8/memory.high"
+: >"$ARGV_LOG"
+run_steps mem8 "$TMP/one-vitest.plan" DEVBOX_TOKENS=12 DEVBOX_CGROUP_ROOT="$CG8"
+assert_eq "$(printf '%s\n' run --maxWorkers=2)" "$(argv_call 1)" "an 8 GiB workspace caps a 12-token step at 2 workers of 1536M"
+: >"$ARGV_LOG"
+run_steps mem8-1g "$TMP/one-vitest.plan" DEVBOX_TOKENS=12 DEVBOX_CGROUP_ROOT="$CG8" DEVBOX_WORKER_MEMORY=1G
+assert_eq "$(printf '%s\n' run --maxWorkers=4)" "$(argv_call 1)" "DEVBOX_WORKER_MEMORY=1G raises that cap to 4"
+printf '3221225472\n' >"$CG8/memory.high"
+: >"$ARGV_LOG"
+run_steps mem3 "$TMP/one-vitest.plan" DEVBOX_TOKENS=12 DEVBOX_CGROUP_ROOT="$CG8"
+assert_eq "$(printf '%s\n' run --maxWorkers=1)" "$(argv_call 1)" "a workspace under 4 GiB still gets 1 worker"
+
+# vitest 2 takes its minimum worker count from the cores, and a lower
+# --maxWorkers alone stopped it with a RangeError, so 2 and 3 also get
+# --minWorkers=1. vitest 4 has no such option.
+mkdir -p "$PROJ/node_modules/vitest"
+for v in 2.0.0 3.0.0 4.0.0; do
+  printf '{\n  "name": "vitest",\n  "version": "%s"\n}\n' "$v" >"$PROJ/node_modules/vitest/package.json"
+  : >"$ARGV_LOG"
+  run_steps "vitest-${v%%.*}" "$TMP/one-vitest.plan" DEVBOX_TOKENS=12 DEVBOX_CGROUP_ROOT="$CG8"
+  if [ "$v" = 4.0.0 ]; then
+    assert_eq "$(printf '%s\n' run --maxWorkers=1)" "$(argv_call 1)" "vitest $v gets --maxWorkers alone"
+  else
+    assert_eq "$(printf '%s\n' run --maxWorkers=1 --minWorkers=1)" "$(argv_call 1)" "vitest $v also gets --minWorkers=1"
+  fi
+done
+rm -r "$PROJ/node_modules/vitest"
+run_steps bad-memory "$TMP/one-vitest.plan" DEVBOX_WORKER_MEMORY=lots
+assert_eq "2" "$RC" "a DEVBOX_WORKER_MEMORY that is not a size is refused with exit 2"
+assert_ok "the refusal names DEVBOX_WORKER_MEMORY" grep -q 'DEVBOX_WORKER_MEMORY is lots' <<<"$ERR"
+run_steps bad-tokens "$TMP/one-vitest.plan" DEVBOX_TOKENS=many
+assert_eq "2" "$RC" "a DEVBOX_TOKENS that is not a count is refused with exit 2"
+
+# A command that sets its own worker count keeps it.
+for own in '--maxWorkers=3' '--maxWorkers 3' '--pool-options.forks.maxForks=3'; do
+  plan_step suite run vitest - "npx vitest run $own" >"$TMP/own.plan"
+  : >"$ARGV_LOG"
+  run_steps own "$TMP/own.plan" DEVBOX_TOKENS=12
+  assert_eq "0" "$(grep -c -- '--maxWorkers=6\|--maxWorkers=12' "$ARGV_LOG")" "a vitest command with $own keeps its own workers"
+done
+for own in '-n 3' '-n3' '-nauto' '--numprocesses=3' '--numprocesses 3'; do
+  plan_step py run pytest - "pytest $own" >"$TMP/own.plan"
+  : >"$ARGV_LOG"
+  run_steps own "$TMP/own.plan" DEVBOX_TOKENS=12 STUB_XDIST=1
+  read -r -a own_words <<<"$own"
+  assert_eq "$(printf '%s\n' "${own_words[@]}")" "$(argv_call 1)" "a pytest command with $own keeps its own workers and gets no second -n"
+done
+
+# ── row D6: a step may run in a subfolder ────────────────────────────────────
+
+mkdir -p "$PROJ/service/tests" "$PROJ/web"
+{
+  plan_step service narrow pytest - 'pytest -q' service/
+  plan_file service service/tests/test_a.py
+  plan_file service 'service/tests/test b.py'
+} >"$TMP/dir-pytest.plan"
+L="$TMP/dir.ledger"
+new_ledger "$L"
+: >"$ARGV_LOG"
+: >"$ENV_LOG"
+run_steps dir-pytest "$TMP/dir-pytest.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
+assert_eq "0" "$RC" "a dir= pytest step runs: $ERR"
+assert_eq "$(printf '%s\n' -q -p devbox_ledger tests/test_a.py 'tests/test b.py')" "$(argv_call 1)" \
+  "a dir= step's files reach its runner relative to its folder"
+assert_ok "a dir= step runs in its folder" grep -qx "pytest pwd=$PROJ/service workers=2" "$ENV_LOG"
+
+{
+  plan_step web run vitest - 'npx vitest run' web/
+  plan_test web web/src/a.test.ts
+} >"$TMP/dir-vitest.plan"
+rm -rf "$PROJ/web/node_modules"
+: >"$ARGV_LOG"
+run_steps dir-vitest "$TMP/dir-vitest.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS"
+assert_eq "$(printf '%s\n' run "${REP[@]}" --maxWorkers=1)" "$(argv_call 1)" \
+  "a dir= vitest step names its reporter relative to its folder"
+assert_ok "a dir= vitest step's reporter is copied under its folder, which vitest 3 requires" \
+  cmp -s "$TOOLS/vitest-ledger.mjs" "$PROJ/web/node_modules/.devbox-ledger/vitest-ledger.mjs"
 
 run_steps no-tools "$TMP/pytest.plan" DEVBOX_LEDGER="$L"
 assert_eq "2" "$RC" "a ledger and a runner step with no DEVBOX_LEDGER_TOOLS is refused with exit 2"
@@ -351,23 +528,33 @@ refused() {
   assert_ok "the refusal names plan line $want_line and why: $desc ($ERR)" grep -Eq "^devbox-steps: plan line $want_line: .*$pattern" <<<"$ERR"
   assert_fail "no step started: $desc" test -e "$TMP/malformed-ran"
 }
-refused "a step line with 6 fields" 2 '7 non-empty fields' "$(printf 'step\tx\trun\t%s\t-\t-\n' "$KEY")"
-refused "an empty field" 2 '7 non-empty fields' "$(printf 'step\tx\trun\t%s\t\t-\t%s\n' "$KEY" "$(printf 'true' | base64)")"
-refused "an unknown plan word" 2 'not run, carry, narrow or related' "$(plan_step x skip - - true)"
+refused "a step line with 8 fields" 2 '9 non-empty fields' "$(printf 'step\tx\trun\t%s\t-\t-\t%s\t-\n' "$KEY" "$(printf 'true' | base64)")"
+refused "a 3.3 step line of 7 fields" 2 '9 non-empty fields' "$(printf 'step\tx\trun\t%s\t-\t-\t%s\n' "$KEY" "$(printf 'true' | base64)")"
+refused "an empty field" 2 '9 non-empty fields' "$(printf 'step\tx\trun\t%s\t\t-\t%s\t-\t0\n' "$KEY" "$(printf 'true' | base64)")"
+refused "an unknown plan word" 2 'not run, carry, narrow or select' "$(plan_step x skip - - true)"
+refused "the plan word related, which select replaced" 2 'not run, carry, narrow or select' "$(plan_step x related vitest - 'npx vitest run'; plan_file x a.ts)"
 refused "a name with a capital" 2 'is not \[a-z0-9\]' "$(plan_step Xy run - - true)"
 refused "a name planned twice" 2 'planned twice' "$(plan_step first run - - true)"
 refused "an unknown runner" 2 'not vitest, pytest or -' "$(plan_step x run jest - true)"
-refused "a command that is not base64" 2 'not base64' "$(printf 'step\tx\trun\t%s\t-\t-\t!!!\n' "$KEY")"
+refused "a command that is not base64" 2 'not base64' "$(printf 'step\tx\trun\t%s\t-\t-\t!!!\t-\t0\n' "$KEY")"
+refused "a trace that is not 0 or 1" 2 'not 0 or 1' "$(plan_step x run - - true - yes)"
+refused "a dir that does not end in /" 2 'does not end in /' "$(plan_step x run - - true service)"
+refused "an absolute dir" 2 'not a relative folder' "$(plan_step x run - - true /srv/)"
+refused "a dir with .." 2 'not a relative folder' "$(plan_step x run - - true service/../../)"
+refused "a dir that is not a folder" 2 'is not a folder' "$(plan_step x run - - true nothere/)"
 refused "an after name the plan does not hold" 2 'does not hold' "$(plan_step x run - nothere true)"
 refused "a cycle of after edges" 2 'cycle' "$(plan_step x run - y true; plan_step y run - x true)"
-refused "a file line for a run step" 3 'not narrow or related' "$(plan_step x run vitest - 'npx vitest run'; plan_file x a.test.ts)"
+refused "a file line for a run step" 3 'not narrow or select' "$(plan_step x run vitest - 'npx vitest run'; plan_file x a.test.ts)"
 refused "a file line before its step" 2 'no step line above it' "$(plan_file x a.test.ts; plan_step x narrow vitest - 'npx vitest run')"
+refused "a test line for a step with no runner" 3 'names no runner' "$(plan_step x run - - 'make test'; plan_test x a.test.ts)"
 refused "a narrow step with no file line" 2 'has no file line' "$(plan_step x narrow vitest - 'npx vitest run')"
+refused "a select step with no file line" 2 'has no file line' "$(plan_step x select vitest - 'npx vitest run'; plan_test x a.test.ts)"
 refused "a narrow step with no runner" 2 'names no runner' "$(plan_step x narrow - - 'make test'; plan_file x a.test.ts)"
-refused "a related pytest step" 2 'not a vitest step' "$(plan_step x related pytest - pytest; plan_file x a.py)"
-refused "a related step with vitest run twice" 2 'exactly once' "$(plan_step x related vitest - 'npx vitest run && npx vitest run'; plan_file x a.ts)"
+refused "a select step with no runner" 2 'names no runner' "$(plan_step x select - - 'make test'; plan_file x a.test.ts)"
 refused "a file that starts with -" 3 'starts with -' "$(plan_step x narrow vitest - 'npx vitest run'; plan_file x --reporter=json)"
-refused "a line of another kind" 2 'starts with step or file' 'hello'
+refused "a test file that starts with -" 3 'starts with -' "$(plan_step x run vitest - 'npx vitest run'; plan_test x -x)"
+refused "a file outside the dir of its step" 3 'is outside service/' "$(plan_step x narrow pytest - pytest service/; plan_file x tests/test_a.py)"
+refused "a line of another kind" 2 'starts with step, file or test' 'hello'
 
 run_steps no-plan "$TMP/does-not-exist.plan"
 assert_eq "2" "$RC" "a plan file that does not exist is refused with exit 2"
