@@ -823,9 +823,10 @@ devbox_probe_line() {
   proto="${proto//[!A-Za-z0-9._:+-]/_}"
   fp="${fp//[!A-Za-z0-9._:+-]/_}"
   estimate="${estimate%%$'\n'*}"
-  # A pool that admits on pressure applies no job limit and writes `-` for it.
-  # The probe line's jobs field takes `<n>/<n>` or `-` in every 3.x parse, so
-  # such a pool's field is `-`, and the admission record carries the count.
+  # A pool of 4.1.3 or earlier that admits on pressure applies no job limit and
+  # writes `-` for it. The probe line's jobs field takes `<n>/<n>` or `-` in
+  # every 3.x parse, so such a pool's field is `-`, and the admission record
+  # carries the count. A later pool applies the limit and writes the number.
   if [[ "$estimate" =~ ^(now|wait|never|unknown)\ ([0-9]+|-)\ [0-9]+\ ([0-9]+/[0-9]+)\ ([0-9]+)/([0-9]+|-)\ ([0-9]+)$ ]]; then
     verdict="${BASH_REMATCH[1]}"; secs="${BASH_REMATCH[2]}"
     tokens="${BASH_REMATCH[3]}"; jobs="${BASH_REMATCH[4]}/${BASH_REMATCH[5]}"; queued="${BASH_REMATCH[6]}"
@@ -1010,11 +1011,12 @@ devbox_admission_parse() {
 # average under the `cpu` label until that host is redeployed. STATUS_LOAD1
 # keeps its name for the same reason the word kept its place.
 #
-# <max-jobs> is `-` from a pool that admits on pressure. DEVBOX_MAX_JOBS once
-# capped such a pool too, and in a live test it refused the same tickets the
-# idle-core rule refused, a second fixed limit beside the measured ones. So the
-# pressure rule applies no job limit, and the field says so with the `-` every
-# 3.x parse already accepts there.
+# <max-jobs> is `-` from a pool of 4.1.3 or earlier that admits on pressure.
+# In a live test DEVBOX_MAX_JOBS refused the same tickets the idle-core rule
+# refused, so those pools applied no job limit under pressure, and the field
+# said so with the `-` every 3.x parse already accepts there. A host that then
+# ran more gates than its limit brought the limit back, and a later pool
+# writes the number.
 #
 # The host writes it with devbox_status_line and the laptop reads it with
 # devbox_status_parse, and both take every field's shape from

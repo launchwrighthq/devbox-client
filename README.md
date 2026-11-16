@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.1.3"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.1.4"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.3"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.4"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.3"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.4"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.1.3 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.1.4 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -449,7 +449,7 @@ target, under that grant. The client takes the first rule that matches:
 A target fits now when its host says `now`, and the client does no token arithmetic of its own.
 The lines above are from hosts that admit on tokens. A host that admits on pressure, the
 default since 3.4.0, decides on its idle cores, its memory and I/O pressure, a settle time
-after each grant and its free memory, with no job limit, and its token figures decide nothing.
+after each grant, its free memory and its job limit, and its token figures decide nothing.
 Its line names the rule, the running jobs and the idle CPU share against its limit, then each
 other reading that holds the next run:
 
@@ -628,8 +628,8 @@ not its pin.
 `devbox status` asks every target one `status` verb, in parallel. It prints one line per
 target in `DEVBOX_TARGETS` order: health, then a bar each for reserved tokens, busy cores
 against the core count and memory in use, then jobs, and swap while the host uses it. On a host
-that admits on pressure the jobs show as a count alone, because no job limit applies there, and
-the token bar is the running worker hints over the cores, never yellow when full. Then one table
+of 4.1.3 or earlier that admits on pressure the jobs show as a count alone, because no job
+limit applies there, and on any host that admits on pressure the token bar is the running worker hints over the cores, never yellow when full. Then one table
 lists every gate that runs, then the queue in line order, then the runs this laptop started
 that no target holds yet (probe, rent, lock, sync, setup), then the lost ones. `lock` is the
 wait for a free lane. A run that waits in several queues is one row, and its target cell names
