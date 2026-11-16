@@ -233,7 +233,7 @@ shell('cat data/data.json');
 set('src/sh-args.test.mjs');
 spawnSync('sh', ['-c', 'git rev-parse HEAD', 'data/data.json'], { stdio: 'ignore' });
 set('src/esbuild.test.mjs');
-spawnSync(esbuild, ['--service=0.25.12', '--ping'], { stdio: 'ignore' });
+spawnSync(esbuild, ['--service=0.0.0', '--ping'], { stdio: 'ignore' });
 set('src/setup-script.test.mjs');
 spawnSync('node_modules/.bin/tool', [], { stdio: 'ignore' });
 set('src/git.test.mjs');
