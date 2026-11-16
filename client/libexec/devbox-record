@@ -18,6 +18,7 @@
 #   target    <target name, or local>
 #   scope     full | partial
 #   complete  1 | 0
+#   reason    <why a complete 0 record does not carry> (4.0.1 records on)
 #   step      <name>  <key>  pass | fail | carried  <seconds>  <code>  <mode>
 #   file      <step>  <runner>  <path>  pass | fail | open  <seconds or ->
 #
@@ -39,6 +40,12 @@
 # `complete 1` record answers a carry: a cancelled, stopped or killed gate, and
 # one whose files changed while it ran, wrote `complete 0`, and a pass in it
 # proves nothing about the tree it names.
+#
+# The `reason` line says which of those it was: `files changed while it ran`,
+# `a step did not end`, or the stop, such as `stopped by SIGTERM`. MEASURED: a
+# gate whose every step ended, and whose files changed while it ran, printed
+# that it did not end every step, because the verdict had one text for every
+# `complete 0`. A record older than the line names no reason.
 
 # The 200 newest records of a git common dir stay (section 7).
 DEVBOX_RECORD_KEEP=200
@@ -141,14 +148,31 @@ devbox_record_find_pass() {
     function done() { if (complete == "1" && hit) print at "\t" run }'
 }
 
+# Print the branch of the current checkout as a record names it: `-` for a
+# detached HEAD, where symbolic-ref exits 1 (section 7). The record, the plan
+# and `devbox result` read it here, so a record and the query that looks for
+# it never spell one branch two ways.
+devbox_record_branch() {
+  git symbolic-ref --short -q HEAD || printf -- '-\n'
+}
+
 # Print `<run-id> <outcome> <code>` of step $1's newest result in a complete
-# record, a shard's left out.
+# record of branch $2, a shard's left out. A detached HEAD, branch `-`, has no
+# record of its own, because every detached checkout writes `-`.
+#
+# A narrow runs only a step's failed files and trusts this result for every
+# other file. MEASURED: a resume narrowed by another branch's newer record
+# read green without running this branch's own failed files
+# (gate-fixes-4.0.1 spec, D1), and a fresh gate narrowed by another branch's
+# record has the same hole, so no branch's result answers for another's.
 devbox_record_last_of() {
   # shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
-  RECORD_STEP="$1" _devbox_record_query '
+  RECORD_STEP="$1" RECORD_BRANCH="$2" _devbox_record_query '
     function begin() { res = "" }
     $1 == "step" && $2 == ENVIRON["RECORD_STEP"] && $7 != "shard" { res = $4 " " $6 }
-    function done() { if (complete == "1" && res != "") print at "\t" run " " res }'
+    function done() {
+      if (complete == "1" && res != "" && branch != "-" && branch == ENVIRON["RECORD_BRANCH"]) print at "\t" run " " res
+    }'
 }
 
 # Print the run id of step $1's newest pass in a complete record, under any key,
@@ -219,12 +243,18 @@ devbox_record_newest() {
 # Print the record file $1 for a person: one line per step, `<name> <outcome>
 # <seconds>s code <code> <mode>`, then the verdict line of section 3. A failed
 # step names its failed test files by count. A partial record never prints
-# `green`, and an incomplete one says that it does not carry.
+# `green`, and an incomplete one says that it does not carry, and why.
+#
+# A step that reads `pass` while a test file of it reads `fail` is red too.
+# MEASURED: a stopped gate's vitest step failed 2 files, its resume recorded
+# the step `pass` beside those two `fail` lines, and the verdict read green.
+# The verdict reads the files as well as the step, whatever wrote the record.
 devbox_record_summary() {
   awk -F'\t' '
     $1 == "run" { run = $2 }
     $1 == "scope" { scope = $2 }
     $1 == "complete" { complete = $2 }
+    $1 == "reason" { reason = $2 }
     $1 == "step" {
       n++; name[n] = $2; outcome[$2] = $4
       printf "%s %s %ss code %s %s\n", $2, $4, $5, $6, $7
@@ -232,6 +262,7 @@ devbox_record_summary() {
     }
     $1 == "file" && $5 == "fail" { failed_files[$2]++ }
     END {
+      if (complete != "1" && reason != "") { printf "devbox: incomplete (run %s does not carry: %s)\n", run, reason; exit }
       # A gate cancelled before any step ended has no step line either, and
       # its record read "planned no step" for a gate that was running a step.
       if (n == 0 && complete != "1") { printf "devbox: incomplete (run %s ended before any step did, so it does not carry)\n", run; exit }
@@ -239,13 +270,15 @@ devbox_record_summary() {
       red = ""
       for (i = 1; i <= n; i++) {
         s = name[i]
-        if (outcome[s] != "fail") continue
-        part = s " failed"
-        if (failed_files[s] > 0) part = part ": " failed_files[s] " files"
+        if (outcome[s] == "fail") {
+          part = s " failed"
+          if (failed_files[s] > 0) part = part ": " failed_files[s] " files"
+        } else if (failed_files[s] > 0) part = s " passed with " failed_files[s] " failed files"
+        else continue
         red = red (red == "" ? "" : "; ") part
       }
       counts = n " steps: " (ran + 0) " ran, " (carried + 0) " carried"
-      if (complete != "1") printf "devbox: incomplete (run %s did not end every step, so it does not carry)\n", run
+      if (complete != "1") printf "devbox: incomplete (run %s does not carry)\n", run
       else if (red != "") printf "devbox: red (%s)\n", red
       else if (scope == "partial") printf "devbox: partial pass (%s; only the named steps ran, so this is not a green gate)\n", counts
       else printf "devbox: green (%s)\n", counts

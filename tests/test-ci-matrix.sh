@@ -120,4 +120,182 @@ run_ci bash "$CI" matrix extra
 assert_eq 2 "$rc" "an extra word exits 2"
 assert_ok "with the usage line" grep -qF 'usage: devbox ci matrix' <<<"$err"
 
+# ── devbox ci cache ──────────────────────────────────────────────────────────
+#
+# The shared workflow caches what the setup made, together with the key file
+# that skips it, under the key this prints. A key restored without every
+# output would skip a setup whose outputs are missing, so a setup whose
+# outputs are unknown gets no path at all.
+echo "-- ci cache"
+# A repository with a config.env of stdin, the steps file of one step and the
+# lock files named after it, each tracked.
+cache_repo() {
+  local name="$1" lock
+  shift
+  new_repo "$name" <<<'verify -- :'
+  cat >.devbox/config.env
+  for lock in "$@"; do
+    mkdir -p "$(dirname "$lock")"
+    printf 'lock of %s\n' "$lock" >"$lock"
+  done
+  git add -A
+}
+# The key `devbox ci cache` must print: the key file's value, from the same
+# devbox_setup_key of this tree, and the machine.
+want_key() {
+  local k s
+  # shellcheck disable=SC2016  # expanded by the bash -c, never here
+  k="$(bash -c 'source "$1/lib/devbox-lib.sh" && source "$1/client/libexec/devbox-config" &&
+    devbox_config_load && devbox_setup_key' key "$REPO")" || return 1
+  s="$(printf 'setup %s\nmachine %s\n' "$k" "$(uname -s -m)" | sha256sum)"
+  printf 'devbox-setup-%s' "${s%% *}"
+}
+paths_of() { sed -n 's/.*"paths":\(\[.*\]\)}$/\1/p' <<<"$1"; }
+key_of() { sed -n 's/^{"key":"\([^"]*\)".*/\1/p' <<<"$1"; }
+
+cache_repo default-locks app/uv.lock web/package-lock.json pnpm-lock.yaml ui/yarn.lock <<<'DEVBOX_PROJECT=app'
+run_ci bash "$CI" cache
+assert_eq 0 "$rc" "devbox ci cache exits 0 for the default setup"
+assert_eq "" "$err" "and prints nothing on stderr"
+assert_eq '["app/.venv","node_modules","ui/node_modules","web/node_modules",".git/devbox/setup"]' "$(paths_of "$out")" \
+  "the default setup caches .venv/ beside a uv.lock, node_modules/ beside the other three, and the key directory"
+assert_ok "the key is devbox-setup- and 64 hex digits" grep -qE '^devbox-setup-[0-9a-f]{64}$' <<<"$(key_of "$out")"
+assert_eq "$(want_key)" "$(key_of "$out")" "and it hashes the key file's value and the machine"
+assert_eq "{\"key\":\"$(want_key)\",\"paths\":$(paths_of "$out")}" "$out" "the object is the key and the paths, on one line"
+if command -v python3 >/dev/null 2>&1; then
+  assert_eq 5 "$(printf '%s' "$out" | python3 -I -c 'import json, sys; print(len(json.load(sys.stdin)["paths"]))')" \
+    "python3 json.load reads five paths"
+fi
+old="$(key_of "$out")"
+printf 'a changed lock\n' >app/uv.lock
+run_ci bash "$CI" cache
+assert_ok "a changed lock file changes the key" test "$(key_of "$out")" != "$old"
+mkdir -p sub && cd sub || exit 1
+run_ci bash "$CI" cache
+assert_eq '["app/.venv","node_modules","ui/node_modules","web/node_modules",".git/devbox/setup"]' "$(paths_of "$out")" \
+  "a subfolder prints the same paths, relative to the checkout root"
+
+cache_repo explicit-default app/uv.lock <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP=devbox_install_locks'
+run_ci bash "$CI" cache
+assert_eq '["app/.venv",".git/devbox/setup"]' "$(paths_of "$out")" \
+  "DEVBOX_SETUP=devbox_install_locks, written out, is the default install"
+
+cache_repo composed app/uv.lock <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP="devbox_install_locks && make models"'
+run_ci bash "$CI" cache
+assert_eq 0 "$rc" "a composed setup with no DEVBOX_SETUP_OUTPUTS exits 0"
+assert_eq '[]' "$(paths_of "$out")" \
+  "and caches nothing: its second part writes outputs no lock file names"
+assert_ok "and still prints a key" grep -qE '^devbox-setup-[0-9a-f]{64}$' <<<"$(key_of "$out")"
+
+cache_repo composed-outputs app/uv.lock <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP="devbox_install_locks && make models"
+DEVBOX_SETUP_INPUTS="app/uv.lock Makefile"
+DEVBOX_SETUP_OUTPUTS="models ~/.cache/ms-playwright"'
+run_ci bash "$CI" cache
+assert_eq '["app/.venv","models","~/.cache/ms-playwright",".git/devbox/setup"]' "$(paths_of "$out")" \
+  "a composed setup with DEVBOX_SETUP_OUTPUTS caches the lock outputs, its outputs as written, and the key directory"
+assert_eq "$(want_key)" "$(key_of "$out")" "and its key is the key file's value over DEVBOX_SETUP_INPUTS"
+old="$(key_of "$out")"
+printf 'models:\n' >Makefile
+run_ci bash "$CI" cache
+assert_ok "a changed DEVBOX_SETUP_INPUTS file changes the key" test "$(key_of "$out")" != "$old"
+
+cache_repo custom app/uv.lock <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP="make deps"'
+run_ci bash "$CI" cache
+assert_eq '[]' "$(paths_of "$out")" "a setup of its own with no DEVBOX_SETUP_OUTPUTS caches nothing"
+cache_repo custom-outputs app/uv.lock <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP="make deps"
+DEVBOX_SETUP_OUTPUTS=vendor'
+run_ci bash "$CI" cache
+assert_eq '["vendor",".git/devbox/setup"]' "$(paths_of "$out")" \
+  "a setup of its own caches its DEVBOX_SETUP_OUTPUTS and the key directory, and no lock output it never installs"
+
+# A workspace member keeps node_modules/ of its own: npm for a package two
+# members need in two versions, pnpm for every member with dependencies. A key
+# restored without them skips a setup whose member folders are missing.
+cache_repo workspaces <<<'DEVBOX_PROJECT=app'
+cat >package-lock.json <<'EOF'
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "workspaces": ["apps/*"]
+    },
+    "pkgs/one": {
+      "version": "1.0.0"
+    },
+    "pkgs/one/node_modules/react": {
+      "version": "18.0.0"
+    },
+    "pkgs/one/node_modules/react/node_modules/loose": {
+      "version": "1.0.0"
+    },
+    "node_modules/react": {
+      "version": "19.0.0"
+    },
+    "node_modules/react/node_modules/loose": {
+      "version": "2.0.0"
+    }
+  }
+}
+EOF
+mkdir -p ui
+cat >ui/pnpm-lock.yaml <<'EOF'
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    devDependencies:
+      typescript:
+        specifier: ^5.0.0
+        version: 5.0.0
+
+  cli:
+    dependencies:
+      zod:
+        specifier: ^3.0.0
+        version: 3.0.0
+
+  'modules/a b':
+    devDependencies:
+      vitest:
+        specifier: ^3.0.0
+        version: 3.0.0
+
+  modules/empty: {}
+
+packages:
+
+  zod@3.0.0:
+    resolution: {integrity: sha512-x}
+EOF
+git add -A
+run_ci bash "$CI" cache
+assert_eq 0 "$rc" "a checkout with npm and pnpm workspaces exits 0"
+assert_eq '["node_modules","pkgs/one/node_modules","ui/node_modules","ui/cli/node_modules","ui/modules/a b/node_modules",".git/devbox/setup"]' "$(paths_of "$out")" \
+  "it caches each member's own node_modules: an npm member copy, and each pnpm importer with dependencies, none inside the root node_modules"
+
+cache_repo no-setup <<<'DEVBOX_PROJECT=app'
+run_ci bash "$CI" cache
+assert_eq 0 "$rc" "a checkout with no lock file and no DEVBOX_SETUP exits 0"
+assert_eq '[]' "$(paths_of "$out")" "and caches nothing"
+
+cache_repo refused <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP_OUTPUTS=/var/cache'
+run_ci bash "$CI" cache
+assert_eq 2 "$rc" "a DEVBOX_SETUP_OUTPUTS path outside the checkout and the home is refused with exit 2"
+assert_ok "naming the key and the path" grep -qF "refusing DEVBOX_SETUP_OUTPUTS '/var/cache'" <<<"$err"
+assert_eq "" "$out" "and prints no partial object"
+cache_repo no-config </dev/null
+rm .devbox/config.env
+run_ci bash "$CI" cache
+assert_eq 2 "$rc" "no config.env exits 2"
+run_ci bash "$CI" cache extra
+assert_eq 2 "$rc" "an extra word exits 2"
+assert_ok "with the usage line" grep -qF 'usage: devbox ci matrix|cache' <<<"$err"
+
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

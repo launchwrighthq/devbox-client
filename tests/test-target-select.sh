@@ -486,16 +486,16 @@ rm -f "$TMP/probes/cloud-fixture.probe"
 
 # A host that admits on pressure sends its admission record, and the queue line
 # names the rule and what it judged in place of the token figures. A line once
-# read `25/16 tokens, 3/4 jobs, 0 waiting: this ask fits now` for such a host.
+# read `12/8 tokens, 3/6 jobs, 0 waiting: this ask fits now` for such a host.
 {
-  devbox_probe_line "$PROTO $FP" "wait 2 3 25/16 3/- 0" "$(date +%s) ok" "$(date +%s)"
+  devbox_probe_line "$PROTO $FP" "wait 2 3 12/8 3/- 0" "$(date +%s) ok" "$(date +%s)"
   echo "admission pressure 3 18.40 25 0.00 5 11.00 10 12 short"
 } >"$TMP/probes/cloud-fixture.probe"
 rm -f "$CO/.git/devbox/last-target"
 FAKE_GRANT="cloud-fixture:never" verify
 assert_ok "a pressure host's line names the rule, the jobs, the idle share and each reading that holds the ask" \
   contains "==> devbox: queuing on cloud1: admits on pressure, 3 jobs running, cpu idle 18.40% (at least 25%), io pressure 11.00% (limit 10%), the newest grant settles in 12s, too little free memory for the headroom, 0 waiting: about 2s of queuing" "$out"
-assert_fail "  and no token figure" contains "25/16 tokens" "$out"
+assert_fail "  and no token figure" contains "12/8 tokens" "$out"
 {
   devbox_probe_line "$PROTO $FP" "now 0 3 8/16 1/- 0" "$(date +%s) ok" "$(date +%s)"
   echo "admission pressure 1 61.20 25 0.00 5 0.00 10 0 fits"

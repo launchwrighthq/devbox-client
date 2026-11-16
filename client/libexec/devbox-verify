@@ -194,7 +194,9 @@ source "$_here/devbox-cancel"
 # and its record is partial. `--shard <i>/<n>` with one `--step` of a runner
 # step runs shard <i> of <n> of its test files (learned-selection spec, D10).
 # `--plan` prints what each step would do and runs nothing. `devbox cancel`
-# arrives as `--cancel`.
+# arrives as `--cancel`. `--setup` with `--local` runs DEVBOX_SETUP before the
+# steps here, as `--local` does under CI, and `--no-setup` turns that off
+# (steps_setup_local).
 #
 # The arguments are kept whole, because a grant released before the gate
 # starts this script again with them (refuse_prep_limit).
@@ -204,6 +206,7 @@ HETZNER_ACTION=""
 RUN_MODE=0
 RUN_SCRIPT=""
 LOCAL_ONLY=0
+SETUP_FLAG=""
 FORCE_TARGET=""
 FRESH=0
 RERUN_FLAG=""
@@ -217,6 +220,11 @@ rerun_flag() {
   [ -z "$RERUN_FLAG" ] || [ "$RERUN_FLAG" = "$1" ] \
     || refuse_args "--$RERUN_FLAG and $2 name two settings of DEVBOX_RERUN; pass one"
   RERUN_FLAG="$1"
+}
+setup_flag() {
+  [ -z "$SETUP_FLAG" ] || [ "$SETUP_FLAG" = "$1" ] \
+    || refuse_args "--setup and --no-setup name two choices; pass one"
+  SETUP_FLAG="$1"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -248,6 +256,8 @@ while [ "$#" -gt 0 ]; do
     --runpod)
       refuse_args "--runpod is no longer read. Run 'devbox verify --target runpod', or 'devbox runpod up|status|down' to manage the rental." ;;
     --local) LOCAL_ONLY=1; shift ;;
+    --setup) setup_flag 1; shift ;;
+    --no-setup) setup_flag 0; shift ;;
     --fresh) FRESH=1; rerun_flag full --fresh; shift ;;
     --target)
       [ -n "${2:-}" ] || refuse_args "--target needs a name: a target in DEVBOX_TARGETS, runpod or hetzner"
@@ -259,7 +269,7 @@ while [ "$#" -gt 0 ]; do
     --) shift; break ;;
     *)
       [ "$RUN_MODE" = "1" ] && break
-      refuse_args "unknown argument '$1'. usage: devbox verify [--local | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--shard <i>/<n>] [--plan]" ;;
+      refuse_args "unknown argument '$1'. usage: devbox verify [--local [--setup | --no-setup] | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--shard <i>/<n>] [--plan]" ;;
   esac
 done
 if [ "$RUN_MODE" = "1" ]; then
@@ -287,6 +297,16 @@ if [ "$CANCEL_MODE" = 1 ] && [ "${#DEVBOX_VERIFY_ARGS[@]}" -ne 1 ]; then
   refuse_args "devbox cancel takes no argument: it cancels this checkout's running gate"
 fi
 [ "$LOCAL_ONLY" = "0" ] || [ -z "$FORCE_TARGET" ] || refuse_args "--local and --target name two places; pass one"
+# A gate on a target runs DEVBOX_SETUP on every run, so --setup and
+# --no-setup ask for nothing there, and a flag that changes nothing reads as
+# one that worked. With --local and neither flag, CI decides (steps_setup_local).
+if [ "$LOCAL_ONLY" = 1 ]; then
+  [ -n "$SETUP_FLAG" ] || { if [ -n "${CI:-}" ]; then SETUP_FLAG=1; else SETUP_FLAG=0; fi; }
+else
+  [ -z "$SETUP_FLAG" ] \
+    || refuse_args "--setup and --no-setup choose the setup of a gate on this machine, so they need --local; a gate on a target runs the setup on every run"
+  SETUP_FLAG=0
+fi
 # `devbox runpod|hetzner up|status|down` manage a rental and run no gate, so
 # they keep no run file for devbox status, and neither does `devbox cancel`.
 [ -z "$RUNPOD_ACTION$HETZNER_ACTION" ] || DEVBOX_RUNFILE_OFF=1
@@ -432,14 +452,16 @@ steps_cancel_older() {
 # a test result devbox chose nor one of its own codes, and a shell gives 143.
 # shellcheck disable=SC2317  # reached through the TERM trap, never by name
 steps_on_term() {
-  local rc=0 target="$STEPS_TARGET"
+  local rc=0 target="$STEPS_TARGET" stop
   trap - TERM
   steps_stop_job
   # This laptop and a RunPod pod have no gate account, so no verb goes there.
   case "$target" in local|runpod) target=- ;; esac
   devbox_cancel_own_run "$target" "$HISTORY_SLUG" "$MACHINE_ID" "$RUN_ID"
   devbox_cancel_on_term "$HISTORY_SLUG" || rc=$?
-  [ -z "$STEPS_RAW" ] || steps_record_finish "$STEPS_RAW" 0 0
+  stop="stopped by SIGTERM"
+  [ "$rc" != 14 ] || stop="$DEVBOX_CANCEL_REASON"
+  [ -z "$STEPS_RAW" ] || steps_record_finish "$STEPS_RAW" 0 0 "$stop"
   [ "$rc" != 14 ] || devbox_die 14
   GATE_OWNS_EXIT=1
   exit 143
@@ -453,7 +475,7 @@ steps_on_int() {
   trap - INT
   steps_stop_job
   echo "devbox verify: stopped by SIGINT" >&2
-  [ -z "$STEPS_RAW" ] || steps_record_finish "$STEPS_RAW" 0 0
+  [ -z "$STEPS_RAW" ] || steps_record_finish "$STEPS_RAW" 0 0 "stopped by SIGINT"
   GATE_OWNS_EXIT=1
   exit 130
 }
@@ -711,29 +733,38 @@ steps_file_lines() {
 # Write the record of section 7, and with $4 = 1 print its verdict last. $1 is
 # the gate's stdout file, saved beside the record as <run-id>.log, or empty for
 # a gate whose every step carried. $2 is 1 when the gate returned its own code
-# and 0 when it was cancelled, stopped or killed. A complete record also needs a
-# result for every planned step and the tree as the plan hashed it (D10a). A
-# record that cannot be written leaves its line and changes no exit code: the
-# gate's result is the gate's.
+# and 0 when it was cancelled, stopped or killed, and $4 then names that stop.
+# A complete record also needs a result for every planned step and the tree as
+# the plan hashed it (D10a). The record's `reason` line names the first cause
+# that made it incomplete, and the verdict prints it. A record that cannot be
+# written leaves its line and changes no exit code: the gate's result is the
+# gate's.
 steps_record_finish() {
   local raw="$1" complete="$2" verdict="$3" rec="$STEPS_DIR/record" dir scope=full manifest="$STEPS_DIR/manifest"
-  local kind step action key outcome secs code mode version branch commit
+  local reason="" line kind step action key outcome secs code mode version branch commit
   local -a learn=()
   [ -z "$raw" ] || steps_results "$raw"
-  if [ "$STEPS_NO_MANIFEST" = 1 ]; then complete=0 manifest=""; fi
+  [ "$complete" = 1 ] || reason="${4:-the gate was stopped}"
+  if [ "$STEPS_NO_MANIFEST" = 1 ]; then
+    [ "$complete" = 0 ] || reason="the synced files could not be hashed"
+    complete=0 manifest=""
+  fi
   if [ "$complete" = 1 ]; then
     for step in "${PLAN_STEPS[@]}"; do
-      [ "${PLAN_ACTION[$step]}" = carry ] || [ -n "${STEPS_RESULT[$step]+x}" ] || complete=0
+      [ "${PLAN_ACTION[$step]}" = carry ] || [ -n "${STEPS_RESULT[$step]+x}" ] || complete=0 reason="a step did not end"
     done
   fi
-  if [ "$complete" = 1 ] && [ -n "$raw" ] && ! steps_tree_unchanged; then complete=0; fi
+  if [ "$complete" = 1 ] && [ -n "$raw" ] && ! steps_tree_unchanged; then complete=0 reason="files changed while it ran"; fi
   [ "${#STEPS_ASKED[@]}" -eq 0 ] || scope=partial
   version="$(cat -- "$_here/../../VERSION")" || version=-
-  branch="$(git symbolic-ref --short -q HEAD)" || branch=-
+  branch="$(devbox_record_branch)"
   commit="$(git rev-parse -q --verify HEAD)" || commit=-
   {
     printf 'run\t%s\nat\t%s\nclient\t%s\nbranch\t%s\ncommit\t%s\ntarget\t%s\nscope\t%s\ncomplete\t%s\n' \
       "$RUN_ID" "$(date +%s)" "${version:--}" "$branch" "$commit" "$STEPS_TARGET" "$scope" "$complete"
+    # The text of a stop may come from the host, and a record line is
+    # tab-separated fields on one line.
+    [ -z "$reason" ] || printf 'reason\t%s\n' "${reason//[$'\t\n']/ }"
     while IFS=$'\t' read -r kind step action key _; do
       [ "$kind" = step ] || continue
       mode="${PLAN_MODE[$step]:-full}"
@@ -770,7 +801,15 @@ steps_record_finish() {
   else
     echo "devbox verify: could not create the record directory under the git common dir, so this gate left no record" >&2
   fi
-  [ "$verdict" = 0 ] || devbox_record_summary "$rec" | tail -n 1
+  [ "$verdict" = 0 ] && return 0
+  line="$(devbox_record_summary "$rec" | tail -n 1)"
+  printf '%s\n' "$line"
+  # The code follows the verdict. A step whose result line said pass while a
+  # test file of it failed reads red, and a red gate that exited 0 would pass
+  # every script that reads the code, as README "Exit codes" tells it to.
+  # MEASURED: a resumed gate recorded its step pass beside two failed files.
+  # 1 is the code of a failed gate whose own step gave none.
+  case "$line" in "devbox: red ("*) [ "$STEPS_GATE_CODE" != 0 ] || STEPS_GATE_CODE=1 ;; esac
 }
 
 # The end of a gate on a rented RunPod pod, which devbox-runpod runs with its
@@ -785,6 +824,29 @@ steps_gate_finish() {
   steps_record_finish "$1" 1 1
 }
 
+# `--local` with the setup on: devbox_setup_local here, before the steps, so
+# the services start only after the setup passed, as on a target.
+#
+# On by default under CI, off by default on a laptop. MEASURED in consumer CI:
+# a job restores a cached node_modules/ in about a third of the time `npm ci`
+# takes. The first design ran the setup only with --setup, because a fresh
+# runner held no key file, and a setup there would run `npm ci` over the
+# restored tree in every matrix job. The shared workflow now restores the key
+# directory in the same cache as the outputs (`devbox ci cache`), so a
+# restored tree comes with the key that skips the setup, and a miss runs it.
+# On a laptop the checkout is installed already, and a project's setup may
+# call sudo, so the setup there runs only with --setup. A fallback to this
+# machine runs none: both flags need --local.
+#
+# A failed setup ends this run the way a failed remote setup ends it: with the
+# setup's own status, after its own output. It is not devbox_die and not the
+# gate's code, so strict mode maps it to 65, `a step before the gate stopped`,
+# as it maps the remote one. `|| exit` passes the status on itself: a caller
+# under `||` would switch set -e off here.
+steps_setup_local() {
+  devbox_setup_local "devbox verify" || exit
+}
+
 # The gate on this laptop: the same steps, the same runner and the same record
 # as a remote gate (R3), its logs in the private dir and the ledger of
 # ledger_local. It runs as a background job, so a TERM reaches the trap at once:
@@ -794,6 +856,7 @@ steps_run_local() {
   local priv root_sum hooks fpid ofd rc=0 n=0
   priv="$(devbox_gate_private_dir)" || devbox_die 1
   root_sum="$(printf '%s' "$ROOT" | sha256sum)" || { echo "devbox verify: sha256sum failed, so the gate has no log directory and did not run" >&2; devbox_die 1; }
+  [ "$SETUP_FLAG" = 0 ] || steps_setup_local
   DEVBOX_STEPS_HOOKS="$(devbox_steps_hooks local "$priv/steps/local-${root_sum:0:16}" "$STEPS_DIR/plan" "$RUN_ID")"
   # The declared services start in docker before the first step and stop at
   # the exit, as a workspace's do (learned-selection spec, D8 and D10).
@@ -808,7 +871,7 @@ steps_run_local() {
     STEPS_SERVICES_UP=1
     devbox_services_local_up "$RUN_ID" || devbox_die "$?"
   fi
-  hooks="$(devbox_hooks_script)" || { echo "devbox verify: could not build the hooks of the gate, so it did not run" >&2; devbox_die 1; }
+  hooks="$(DEVBOX_HOOKS_TARGET=local devbox_hooks_script)" || { echo "devbox verify: could not build the hooks of the gate, so it did not run" >&2; devbox_die 1; }
   STEPS_TARGET=local
   STEPS_RAW="$STEPS_DIR/local.out"
   STEPS_LEDGER="$LOCAL_LEDGER"
@@ -1436,7 +1499,7 @@ join_want() {
 # shellcheck disable=SC2317  # started in the background by join_start
 join_job() {
   set +e
-  local name="$1" maxwait="$2" d="$JOIN_DIR/$1" f answer slug lpid rpid efd tpid ofd opid="" p n
+  local name="$1" maxwait="$2" d="$JOIN_DIR/$1" f answer slug lpid rpid efd tpid ofd opid="" p n rc
   for f in "${JOIN_FDS[@]}"; do exec {f}>&-; done
   # The address was checked by devbox_targets_check, and its message went out
   # then; this second use only selects the target in this job.
@@ -1490,21 +1553,29 @@ join_job() {
   rpid="$GATE_SPAWN_PID"
   printf '%s\n' "$rpid" >"$d/run.pid"
   exec {efd}>&- {ofd}>&-
+  rc=""
   while kill -0 "$rpid" 2>/dev/null; do
     if [ -e "$d/abort" ]; then
       # A held grant ends on the abort line at once. A pool still in its queue
       # reads no stdin, so the session is dropped: SIGKILL, because ssh prints
       # a line on any signal it catches, and this run's terminal is not the
       # place for it.
+      #
+      # bash prints `line N: <pid> Killed <command>` on its stderr when it
+      # reaps a job that a signal ended, and the job's ssh is that job.
+      # MEASURED: every join that lost printed that line, with the whole ssh
+      # command, on the terminal of the gate that won. The reap is the wait in
+      # the same group as the kill, whose stderr goes nowhere.
       n=0
       while kill -0 "$rpid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 0.2; n=$((n + 1)); done
-      kill -KILL "$rpid" 2>/dev/null
+      { kill -KILL "$rpid"; wait "$rpid"; } 2>/dev/null
+      rc=$?
       break
     fi
     sleep 0.2
   done
-  wait "$rpid"
-  printf '%s\n' "$?" >"$d/run.rc.tmp"
+  [ -n "$rc" ] || { wait "$rpid"; rc=$?; }
+  printf '%s\n' "$rc" >"$d/run.rc.tmp"
   # The tee must have written its last line before run.rc says the run ended.
   # Bounded, because a killed ssh's child may still hold the pipe, and a job
   # that never ends holds this run's exit. The display of the gate's stdout
@@ -2534,7 +2605,7 @@ join_start_target() {
   # numbers the join rested on.
   pool="$tokens tokens, $jobs jobs, $queued waiting"
   # Under pressure the token figures decide nothing. A line once read
-  # `25/16 tokens, 3/4 jobs, 0 waiting: this ask fits now` for a host that
+  # `12/8 tokens, 3/6 jobs, 0 waiting: this ask fits now` for a host that
   # admits on its idle cores, and the reader could not see what it judged. So
   # the line names the rule and its readings, and `now` is the host's verdict.
   if [ -n "${JOIN_ADMISSION[$name]-}" ] && devbox_admission_parse "admission ${JOIN_ADMISSION[$name]}" \
@@ -3067,7 +3138,7 @@ refuse_prep_limit "$status" "$GATE_ERR" "$TARGET"
 # that never happened.
 if [ "$status" -eq 79 ] && [ "$STEPS_ACTIVE" = 1 ] && devbox_cancel_reason_is_newer "$GATE_ERR"; then
   echo "devbox verify: $DEVBOX_CANCEL_REASON: the pool on $TARGET stopped this gate" >&2
-  steps_record_finish "$STEPS_RAW" 0 0
+  steps_record_finish "$STEPS_RAW" 0 0 "$DEVBOX_CANCEL_REASON"
   devbox_die 14
 fi
 
@@ -3086,7 +3157,7 @@ if [ "$status" -eq 79 ] && stop_reason="$(grep -m1 -F "$WATCHDOG_LINE" "$GATE_ER
     echo "  this is not a test result. Do not rerun the gate unchanged: find the test that hangs or spins, or raise DEVBOX_GATE_MAX_SECONDS in $DEVBOX_CONFIG when the gate is really that long."
   } >&2
   ledger_after_stop
-  [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 0 0
+  [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 0 0 "stopped by the watchdog on $TARGET: ${stop_reason#*"$WATCHDOG_LINE"}"
   devbox_die 10
 fi
 refuse_lost_ticket "$status" "$GATE_ERR" "$TARGET"
@@ -3171,7 +3242,7 @@ if [ "$status" -ne 0 ] || [ "$STRICT" = 1 ]; then
     # 7 and not the gate's own status: this run says nothing about the tests.
     if [ "$oom_keeps_gate_status" != 1 ]; then
       ledger_after_stop
-      [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 0 0
+      [ "$STEPS_ACTIVE" = 0 ] || steps_record_finish "$STEPS_RAW" 0 0 "OOM-killed on $TARGET"
       devbox_die 7
     fi
     echo '::devbox-infra::oom' >&2
@@ -3181,5 +3252,7 @@ if [ "$STRICT" = 1 ] && [ "$queued_past_ceiling" = 1 ]; then
   echo '::devbox-infra::queue' >&2
 fi
 ledger_finished
+# A record that reads red raised STEPS_GATE_CODE from 0 (steps_record_finish).
+[ "$STEPS_ACTIVE" = 0 ] || [ "$status" != 0 ] || status="$STEPS_GATE_CODE"
 GATE_OWNS_EXIT=1
 exit "$status"

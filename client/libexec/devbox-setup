@@ -1,0 +1,39 @@
+#!/bin/bash
+# `devbox setup`: run this checkout's DEVBOX_SETUP on this machine, with the
+# setup skip and the key file of `devbox verify --local`, and exit with its
+# status. No step runs and no service starts.
+#
+# A CI workflow installed its dependencies in a job of its own, with its own
+# copy of the install commands beside the config, and that copy drifted from
+# .devbox/config.env. The shared workflow's setup job runs this instead, then
+# caches the paths `devbox ci cache` names, the key file among them, so each
+# step job restores the outputs together with the key that skips the setup.
+#
+# Exit 0 when the setup passed or was skipped; 2 for a usage error, a
+# directory outside a git checkout, or a config.env that devbox refuses; 1
+# when devbox could not build the setup; any other code is the setup's own.
+set -euo pipefail
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
+_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox setup: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-config
+source "$_here/devbox-config"
+# shellcheck disable=SC2034  # read by the guards in lib/devbox-lib.sh, a source shellcheck does not follow
+DEVBOX_GUARD_WHO="devbox setup"
+
+[ "$#" -eq 0 ] || { echo "usage: devbox setup" >&2; exit 2; }
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "devbox setup: $PWD is not inside a git checkout" >&2
+  exit 2
+}
+cd "$root"
+devbox_config_load || exit
+devbox_setup_local "devbox setup"

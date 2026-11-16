@@ -51,8 +51,15 @@ runs() { [ -f "$LOG" ] && wc -l <"$LOG" | tr -d ' ' || echo 0; }
 out="$(setup_run)"; rc=$?
 assert_eq "0" "$rc" "the first setup passes"
 assert_eq "1" "$(runs)" "and runs the project's setup"
-assert_eq "$(cd "$WS" && devbox_setup_key)" "$(cat "$KEY" 2>/dev/null)" \
-  "and writes the laptop's key to <key dir>/<project>.key"
+assert_eq "==> setup: runs, this workspace has no key of a setup that passed" "$(head -n 1 <<<"$out")" \
+  "and says why it runs, on the line before the setup's own output"
+assert_eq "$(cd "$WS" && devbox_setup_key)" "$(head -n 1 "$KEY" 2>/dev/null)" \
+  "and writes the laptop's key to <key dir>/<project>.key, on its first line"
+assert_eq "$(cd "$WS" && devbox_setup_key_lines)" "$(tail -n +2 "$KEY" 2>/dev/null)" \
+  "and the lines the key hashes after it"
+assert_eq "$(cd "$WS" && devbox_setup_key)" \
+  "$(tail -n +2 "$KEY" | sha256sum | cut -d ' ' -f 1)" \
+  "and the key is the sha256 of those lines, the bytes it hashed before they were kept"
 
 # ── unchanged inputs skip ────────────────────────────────────────────────────
 out="$(setup_run)"; rc=$?
@@ -109,7 +116,8 @@ assert_eq "7" "$(runs)" "the lock file coming back changes the key and runs the 
 DEVBOX_SETUP="$SETUP_OK; echo second-line"
 out="$(setup_run)"
 assert_eq "8" "$(runs)" "a changed DEVBOX_SETUP text runs the setup with unchanged inputs"
-assert_eq "second-line" "$out" "and the new text is what runs"
+assert_eq "==> setup: runs, DEVBOX_SETUP changed since the setup that wrote this workspace's key
+second-line" "$out" "and the new text is what runs, after the line that names DEVBOX_SETUP"
 
 # ── a failed setup leaves no key and returns non-zero ────────────────────────
 assert_ok "a key exists before the failing setup" test -f "$KEY"
@@ -144,13 +152,14 @@ for prefix in : 'set -e'; do
   DEVBOX_SETUP='false; echo after-false'
   rm -f "$KEY"
   want="$(today "$prefix"; echo "rc=$?")"
-  got="$(setup_run "$prefix"; echo "rc=$?")"
-  assert_eq "$want" "$got" "a failing line in the body behaves as today under '$prefix'"
+  got="$(setup_run "$prefix" >"$TMP/got"; echo "rc=$?")"
+  got="$(sed '1{/^==> setup: runs, this workspace has no key of a setup that passed$/d;}' "$TMP/got"; echo "$got")"
+  assert_eq "$want" "$got" "a failing line in the body behaves as today under '$prefix', after the line that says why it runs"
 done
 DEVBOX_SETUP='export SETUP_MARK=set; mkdir -p node_modules'
 hooks="$(cd "$WS" && devbox_hooks_script)"
 out="$(cd "$WS" && printf '%s\n' "$hooks" | bash -c 'eval "$(cat)" && devbox_environment && devbox_setup && printf %s "$SETUP_MARK"')"
-assert_eq "set" "$out" "what the setup exports is still set after devbox_setup"
+assert_eq "set" "$(tail -n 1 <<<"$out")" "what the setup exports is still set after devbox_setup"
 
 # ── a key directory that cannot be written ───────────────────────────────────
 DEVBOX_SETUP="$SETUP_OK"
@@ -183,18 +192,40 @@ assert_eq "1" "$rc" "and devbox_hooks_script fails with it"
 assert_eq "" "$(cd "$WS" && DEVBOX_SETUP_INPUTS=adir devbox_hooks_script 2>/dev/null)" \
   "before it prints a line of the hooks"
 
-# ── no inputs: the text is today's, byte for byte ────────────────────────────
+# ── no inputs: the text before the skip, and the key file removed ───────────
 #
-# A host and a test that read the hooks see no change unless a project sets
-# DEVBOX_SETUP_INPUTS, calls devbox_install_locks or holds a lock file below its
-# root. This is the text the function printed before the skip.
+# A host and a test that read the hooks see the text the function printed
+# before the skip, unless a project sets DEVBOX_SETUP_INPUTS, calls
+# devbox_install_locks or holds a lock file below its root. The one line more
+# removes the key file of an earlier keyed setup, so a workspace whose setup
+# ran with no inputs is no seed source (D9 of the 4.0.1 spec).
 DEVBOX_ENVIRONMENT='export A=1'
 DEVBOX_PROVISION='apt-get install -y x'
 DEVBOX_SETUP='npm ci'
-want="$(printf 'devbox_environment() {\nexport A=1\n}\ndevbox_provision() {\napt-get install -y x\n}\ndevbox_setup() {\nnpm ci\n}\ndevbox_verify() {\necho "devbox: no step plan reached the workspace, so nothing ran" >&2\nreturn 2\n}\n')"
-assert_eq "$want" "$(DEVBOX_SETUP_INPUTS='' devbox_hooks_script)" "with DEVBOX_SETUP_INPUTS empty the hooks are today's text"
+want="$(printf 'devbox_environment() {\nexport A=1\n}\ndevbox_provision() {\napt-get install -y x\n}\ndevbox_setup() {\nrm -f -- %s || return\nnpm ci\n}\ndevbox_verify() {\necho "devbox: no step plan reached the workspace, so nothing ran" >&2\nreturn 2\n}\n' "$KEY")"
+assert_eq "$want" "$(DEVBOX_SETUP_INPUTS='' devbox_hooks_script)" \
+  "with DEVBOX_SETUP_INPUTS empty the hooks are the text before the skip, after a removal of the key file"
 assert_eq "$want" "$(unset DEVBOX_SETUP_INPUTS; devbox_hooks_script)" "and with it unset"
-assert_fail "and they name no key directory" contains "$DEVBOX_SETUP_KEY_DIR" "$(DEVBOX_SETUP_INPUTS='' devbox_hooks_script)"
+assert_fail "and they write no key" contains "_devbox_setup_want" "$(DEVBOX_SETUP_INPUTS='' devbox_hooks_script)"
+# A probe's setup, which devbox-probe sends with no inputs, in a workspace a
+# keyed setup left a key in.
+DEVBOX_PROVISION=
+DEVBOX_SETUP="$SETUP_OK"
+DEVBOX_SETUP_INPUTS=package-lock.json
+setup_run >/dev/null
+assert_ok "a keyed setup leaves a key file" test -f "$KEY"
+before="$(runs)"
+hooks="$(cd "$WS" && DEVBOX_SETUP_INPUTS='' devbox_hooks_script)"
+# The hooks are the workspace's text, expanded by its bash, never here.
+# shellcheck disable=SC2016
+out="$(cd "$WS" && printf '%s\n' "$hooks" | bash -c 'eval "$(cat)" && devbox_environment && devbox_setup' 2>&1)"; rc=$?
+assert_eq "0" "$rc" "a setup with no inputs passes"
+assert_eq "$((before + 1))" "$(runs)" "and runs the project's setup"
+assert_fail "and no key file survives it" test -e "$KEY"
+setup_run >/dev/null
+assert_eq "$((before + 2))" "$(runs)" "so the next keyed setup runs, and writes a key again"
+assert_ok "  the key" test -f "$KEY"
+DEVBOX_PROVISION='apt-get install -y x'
 DEVBOX_PROVISION=
 assert_ok "with inputs set, the hooks name the key file" \
   contains "$DEVBOX_SETUP_KEY_DIR/app.key" "$(cd "$WS" && devbox_hooks_script)"
@@ -211,6 +242,55 @@ before="$(runs)"
 out="$(setup_run)"
 assert_eq "$before" "$(runs)" "a uv.lock the inputs do not name asks for no .venv/, so the setup skips"
 assert_eq "==> setup: skipped, package-lock.json unchanged since the last setup here" "$out" "and says so"
+
+# ── a setup that runs says why ───────────────────────────────────────────────
+# D9 of docs/specs/2026-11-15-gate-fixes-4-0-1-design.md. Projects ran their
+# whole setup after a seed with the lock files of the seed's source, and
+# a key of one hash could not say which input differed. The first line of each
+# run names it, from the lines the key file keeps after the key.
+why() { local o; o="$(setup_run)"; head -n 1 <<<"$o"; }
+rm -rf "$WS/node_modules"
+assert_eq "==> setup: runs, the key matches, and ./node_modules is missing" "$(why)" \
+  "an equal key with node_modules/ gone names the missing output"
+DEVBOX_SETUP_INPUTS="package-lock.json uv.lock"
+setup_run >/dev/null
+rm -rf "$WS/node_modules" "$WS/.venv"
+assert_eq "==> setup: runs, the key matches, and ./node_modules ./.venv are missing" "$(why)" \
+  "and two missing outputs are both named"
+printf '{"lockfileVersion": 3, "name": "changed"}\n' >"$WS/package-lock.json"
+assert_eq "==> setup: runs, package-lock.json changed since the setup that wrote this workspace's key" "$(why)" \
+  "a changed input is named"
+DEVBOX_SETUP_INPUTS="uv.lock package-lock.json"
+assert_eq "==> setup: runs, the order of DEVBOX_SETUP_INPUTS changed since the setup that wrote this workspace's key" "$(why)" \
+  "the same inputs in another order name the order"
+printf 'echo setup\n' >"$WS/setup.sh"
+DEVBOX_SETUP_INPUTS="uv.lock package-lock.json setup.sh"
+assert_eq "==> setup: runs, setup.sh changed since the setup that wrote this workspace's key" "$(why)" \
+  "an input new to the list is named"
+DEVBOX_SETUP_INPUTS="uv.lock package-lock.json"
+assert_eq "==> setup: runs, setup.sh changed since the setup that wrote this workspace's key" "$(why)" \
+  "and so is an input that left the list"
+rm -f "$WS/uv.lock"
+assert_eq "==> setup: runs, uv.lock changed since the setup that wrote this workspace's key" "$(why)" \
+  "an input deleted from the checkout is named once"
+printf 'version = 1\n' >"$WS/uv.lock"
+setup_run >/dev/null
+printf '{"lockfileVersion": 3, "name": "changed again"}\n' >"$WS/package-lock.json"
+DEVBOX_SETUP="$SETUP_OK; echo third-line"
+assert_eq "==> setup: runs, DEVBOX_SETUP package-lock.json changed since the setup that wrote this workspace's key" "$(why)" \
+  "a changed DEVBOX_SETUP and a changed input are both named"
+# A key file that an older client wrote holds the key alone. It still skips
+# when it matches, and when it does not, the line says that nothing names why.
+DEVBOX_SETUP="$SETUP_OK"
+setup_run >/dev/null
+(cd "$WS" && devbox_setup_key) >"$KEY"
+out="$(setup_run)"
+assert_eq "==> setup: skipped, uv.lock package-lock.json unchanged since the last setup here" "$out" \
+  "a key file of the key alone, as an older client wrote it, still skips when it matches"
+printf '0000000000000000000000000000000000000000000000000000000000000000\n' >"$KEY"
+assert_eq "==> setup: runs, the key in this workspace differs, and the client that wrote it kept no inputs to compare" "$(why)" \
+  "and when it differs the line says no input can be named"
+DEVBOX_SETUP_INPUTS=package-lock.json
 
 # ── no DEVBOX_SETUP: the client installs the lock files ─────────────────────
 #
@@ -255,6 +335,14 @@ assert_ok "and names each install" contains "==> setup: uv sync --locked --all-p
 out="$(default_run)"
 assert_eq "==> setup: skipped, app/uv.lock web/package-lock.json unchanged since the last setup here" "$out" \
   "an unchanged checkout skips the default setup"
+# The key file a client that installed another way wrote: another install line,
+# and so another key.
+co_key="$DEVBOX_SETUP_KEY_DIR/app.key"
+{ printf '%064d\n' 0; tail -n +2 "$co_key" | sed 's/^install .*/install 0000/'; } >"$co_key.new"
+mv "$co_key.new" "$co_key"
+out="$(default_run)"
+assert_eq "==> setup: runs, the client's install of the lock files changed since the setup that wrote this workspace's key" \
+  "$(head -n 1 <<<"$out")" "a key a client with another install wrote names the install"
 
 # ── a .venv symlink below the root is removed before the setup ──────────────
 rm -rf "$CO/app/.venv"
@@ -285,11 +373,106 @@ assert_eq "uv sync --locked --all-packages --directory app" "$(cat "$LOG")" \
   "a lock file DEVBOX_SETUP_INPUTS names is installed, and one it does not name is not"
 printf 'DEVBOX_PROJECT=app\n' >"$CO/.devbox/config.env"
 
-# ── a pnpm or yarn lock file refuses the default ────────────────────────────
+# ── pnpm and yarn lock files: the default installs them ─────────────────────
+#
+# A pnpm-lock.yaml or a yarn.lock with no DEVBOX_SETUP was refused, so every
+# such project wrote its own install. pnpm at the root, yarn berry (a
+# .yarnrc.yml beside the lock file) in berry/, yarn classic in classic/. The
+# stubs log their arguments and the folder they ran in, and make node_modules/
+# there, as a real install does.
 printf 'lockfileVersion: 9\n' >"$CO/pnpm-lock.yaml"
-git -C "$CO" add pnpm-lock.yaml
-err="$(default_load 2>&1)"; rc=$?
-assert_eq "2" "$rc" "a pnpm-lock.yaml with no DEVBOX_SETUP is refused"
-assert_ok "and the refusal names the file" contains "pnpm-lock.yaml needs a DEVBOX_SETUP" "$err"
+mkdir -p "$CO/berry" "$CO/classic"
+printf '# yarn lockfile v1\n' >"$CO/berry/yarn.lock"
+printf 'nodeLinker: node-modules\n' >"$CO/berry/.yarnrc.yml"
+printf '# yarn lockfile v1\n' >"$CO/classic/yarn.lock"
+git -C "$CO" add pnpm-lock.yaml berry/yarn.lock berry/.yarnrc.yml classic/yarn.lock
+# shellcheck disable=SC2016  # expanded by the bash that runs the stub, never here
+printf '#!/bin/bash\necho "pnpm $*" >>"$LOG"\nmkdir -p "${4:-.}/node_modules"\n' >"$TMP/bin/pnpm"
+# shellcheck disable=SC2016  # expanded by the bash that runs the stub, never here
+printf '#!/bin/bash\necho "yarn $* in ${PWD##*/}" >>"$LOG"\nmkdir -p node_modules\n' >"$TMP/bin/yarn"
+chmod +x "$TMP/bin/pnpm" "$TMP/bin/yarn"
+assert_eq "devbox_install_locks|app/uv.lock berry/yarn.lock classic/yarn.lock pnpm-lock.yaml web/package-lock.json" \
+  "$(default_load)" "a tracked pnpm-lock.yaml and yarn.lock join the default install and its skip key"
+rm -f "$LOG"
+out="$(default_run)"; rc=$?
+assert_eq "0" "$rc" "the default setup with pnpm and yarn lock files passes"
+assert_ok "pnpm installs beside pnpm-lock.yaml, frozen" grep -qx "pnpm install --frozen-lockfile --dir ." "$LOG"
+assert_ok "yarn berry installs in its folder with --immutable" grep -qx "yarn install --immutable in berry" "$LOG"
+assert_ok "yarn classic installs in its folder with --frozen-lockfile" grep -qx "yarn install --frozen-lockfile in classic" "$LOG"
+assert_ok "and the setup names each install" contains "==> setup: yarn install --immutable in berry/" "$out"
+out="$(default_run)"
+assert_ok "an unchanged checkout skips the setup" contains "==> setup: skipped," "$out"
+rm -rf "$CO/classic/node_modules"
+rm -f "$LOG"
+out="$(default_run)"
+assert_ok "a yarn.lock whose node_modules/ is gone runs the setup again" \
+  grep -qx "yarn install --frozen-lockfile in classic" "$LOG"
+rm -rf "$CO/node_modules"
+rm -f "$LOG"
+default_run >/dev/null
+assert_ok "and so does a pnpm-lock.yaml whose node_modules/ is gone" grep -qx "pnpm install --frozen-lockfile --dir ." "$LOG"
+
+# A machine without pnpm: a PATH of the stubs but pnpm, and the few system
+# tools the hooks call. The setup must fail by name, never run the gate with
+# no dependencies.
+mkdir -p "$TMP/nopnpm"
+for tool in bash cat mkdir rm mv; do ln -sf "$(command -v "$tool")" "$TMP/nopnpm/$tool"; done
+cp "$TMP/bin/uv" "$TMP/bin/npm" "$TMP/bin/yarn" "$TMP/nopnpm/"
+rm -rf "$CO/node_modules"
+hooks="$(cd "$CO" && unset DEVBOX_SETUP DEVBOX_SETUP_INPUTS && devbox_config_load && devbox_hooks_script)"
+rc=0
+# shellcheck disable=SC2016  # the hooks text is expanded by the bash -c, never here
+out="$(cd "$CO" && printf '%s\n' "$hooks" | PATH="$TMP/nopnpm" "$(command -v bash)" -c 'set -e'$'\n''eval "$(cat)" && devbox_environment && devbox_setup' 2>&1)" || rc=$?
+assert_ok "a pnpm-lock.yaml on a machine without pnpm fails the setup" test "$rc" -ne 0
+assert_ok "naming the lock file and the tool" \
+  contains "devbox: pnpm-lock.yaml needs pnpm, which this machine does not have" "$out"
+assert_fail "and writes no key" test -f "$DEVBOX_SETUP_KEY_DIR/app.key"
+
+# ── DEVBOX_SETUP_OUTPUTS ─────────────────────────────────────────────────────
+#
+# The outputs a setup writes beside no lock file. A CI cache restores them
+# with the key file, so the skip asks for each of them, as it asks for
+# node_modules/ beside a lock file.
+outputs_load() {  # prints DEVBOX_SETUP_OUTPUTS after a load of the config.env on stdin
+  cat >"$CO/.devbox/config.env"
+  (cd "$CO" && devbox_config_load && printf '%s' "$DEVBOX_SETUP_OUTPUTS")
+}
+assert_eq "models ~/.cache/ms-playwright" "$(outputs_load <<<'DEVBOX_PROJECT=app
+DEVBOX_SETUP_OUTPUTS="models ~/.cache/ms-playwright"')" "a path of the checkout and a path under ~/ are read"
+assert_eq "" "$(DEVBOX_SETUP_OUTPUTS=models outputs_load <<<'DEVBOX_PROJECT=app')" \
+  "an exported DEVBOX_SETUP_OUTPUTS is not read: the committed file alone names the outputs"
+# shellcheck disable=SC2088  # each word is the literal text of a config line, never a path to expand
+for bad in /var/cache ../up '~' '~/../x' '-x' 'a*b'; do
+  rc=0
+  err="$(outputs_load <<<"DEVBOX_PROJECT=app
+DEVBOX_SETUP_OUTPUTS='$bad'" 2>&1)" || rc=$?
+  assert_eq "2" "$rc" "DEVBOX_SETUP_OUTPUTS '$bad' is refused with exit 2"
+  assert_ok "naming it" contains "refusing DEVBOX_SETUP_OUTPUTS '$bad'" "$err"
+done
+cat >"$CO/.devbox/config.env" <<'EOF'
+DEVBOX_PROJECT=app
+DEVBOX_SETUP='echo ran >>"$LOG"; mkdir -p models "$HOME/cache"'
+DEVBOX_SETUP_INPUTS=app/uv.lock
+DEVBOX_SETUP_OUTPUTS="models ~/cache"
+EOF
+mkdir -p "$TMP/outhome"
+outputs_run() {
+  local hooks
+  hooks="$(cd "$CO" && devbox_config_load && devbox_hooks_script)" || return 99
+  (cd "$CO" && printf '%s\n' "$hooks" | HOME="$TMP/outhome" bash -c 'eval "$(cat)" && devbox_environment && devbox_setup' 2>&1)
+}
+rm -f "$LOG"
+outputs_run >/dev/null
+assert_eq "1" "$(runs)" "a setup with DEVBOX_SETUP_OUTPUTS runs"
+out="$(outputs_run)"
+assert_eq "1" "$(runs)" "and with every output in place the next run skips"
+assert_ok "and says so" contains "==> setup: skipped, app/uv.lock unchanged" "$out"
+rm -rf "$CO/models"
+outputs_run >/dev/null
+assert_eq "2" "$(runs)" "an equal key with an output of the checkout gone runs the setup"
+rm -rf "$TMP/outhome/cache"
+outputs_run >/dev/null
+assert_eq "3" "$(runs)" "and so does an equal key with an output under ~/ gone"
+printf 'DEVBOX_PROJECT=app\n' >"$CO/.devbox/config.env"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

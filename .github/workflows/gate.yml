@@ -1,0 +1,525 @@
+# The CI gate of a project that uses devbox: every step of its .devbox/steps, one job per step
+# and per shard, run with `devbox verify --local`. A project calls it with one job:
+#
+#   jobs:
+#     gate:
+#       uses: launchwrighthq/devbox-client/.github/workflows/gate.yml@v4
+#       secrets: inherit
+#
+# Each project once carried its own copy of this: the client install, the toolchain, the
+# dependency install and a cache of it, some with a node_modules cache action of their own.
+# The copies drifted. Each installed the client its own way, one cached the npm registry
+# download while `npm ci` still re-extracted the whole tree on every job, and a hand-written
+# step list once ran some steps and never the others. This workflow holds those parts once,
+# and reads everything project-specific from the checkout.
+#
+# The client version has one home, the project's own pin in package.json or pyproject.toml.
+# This file names no client version. `v4` is a branch of launchwrighthq/devbox-client
+# that each 4.x release moves, because a release tag can never move.
+# tools/export-client.sh writes this file to .github/workflows/gate.yml there, and fills in
+# every major from VERSION.
+#
+# Actions are pinned to a SHA. Every input and output reaches a run line through env:, never
+# as ${{ }} in its text, because an expression is pasted into the script before the shell
+# starts, and an input becomes code.
+name: devbox gate
+
+on:
+  workflow_call:
+    inputs:
+      client-from:
+        description: "The package file that holds the client pin. Default: the root package.json, else the root pyproject.toml"
+        type: string
+        default: ""
+      prepare:
+        description: "A shell command run in the setup and step jobs before devbox, for system packages such as ffmpeg or a JDK"
+        type: string
+        default: ""
+      runs-on:
+        description: "The runner label of every job"
+        type: string
+        default: ubuntu-latest
+      runners:
+        description: 'A JSON object of step name to runner label, such as {"test": "ubuntu-latest-8-cores"}. A step it does not name runs on runs-on'
+        type: string
+        default: "{}"
+      skip-steps:
+        description: "Step names, separated by spaces, that the matrix leaves out"
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "The time limit of the setup job and of each step job"
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+env:
+  # The major of the client releases this workflow serves. tools/export-client.sh writes it
+  # from VERSION, so it has no second home. In the devbox source tree it is a placeholder, and
+  # the plan job refuses to run there.
+  DEVBOX_WORKFLOW_MAJOR: "4"
+  # Corepack asks before it downloads a package manager, and a job has nobody to answer.
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    env:
+      # A runners value that is not JSON fails here, in the first job, with GitHub's parse
+      # error. Unchecked, it failed in every step job, after the setup had run.
+      RUNNERS: ${{ toJSON(fromJSON(inputs.runners)) }}
+    outputs:
+      node: ${{ steps.toolchain.outputs.node }}
+      node-version: ${{ steps.toolchain.outputs.node-version }}
+      node-version-file: ${{ steps.toolchain.outputs.node-version-file }}
+      package-manager: ${{ steps.toolchain.outputs.package-manager }}
+      uv: ${{ steps.toolchain.outputs.uv }}
+      client-kind: ${{ steps.toolchain.outputs.client-kind }}
+      client-spec: ${{ steps.pin.outputs.client-spec }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      cache-key: ${{ steps.cache.outputs.key }}
+      cache-paths: ${{ steps.cache.outputs.paths }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # What the project needs, read from the checkout, so a project lists no tool. Node for a
+      # package.json or any tracked npm, pnpm or yarn lock; uv for any tracked uv.lock or a pin
+      # in a pyproject.toml. Python comes from uv and .python-version.
+      - name: Read the toolchain
+        id: toolchain
+        env:
+          CLIENT_FROM: ${{ inputs.client-from }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=devbox gate::$*"; exit 1; }
+          from="$CLIENT_FROM"
+          if [ -z "$from" ]; then
+            if [ -f package.json ]; then from=package.json
+            elif [ -f pyproject.toml ]; then from=pyproject.toml
+            else fail "no client-from input, and the checkout root holds neither package.json nor pyproject.toml to read the client pin from"
+            fi
+          fi
+          [ -f "$from" ] || fail "client-from names $from, which this checkout does not hold"
+          case "$from" in
+            package.json | */package.json) kind=npm ;;
+            pyproject.toml | */pyproject.toml) kind=uv ;;
+            *) fail "client-from names $from; it must name a package.json or a pyproject.toml" ;;
+          esac
+          node=false
+          if [ "$kind" = npm ] || [ -f package.json ] \
+            || [ -n "$(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/pnpm-lock.yaml' ':(glob)**/yarn.lock')" ]; then
+            node=true
+          fi
+          node_version="" node_file="" pm=""
+          if [ "$node" = true ]; then
+            # One JSON line, so the two patterns below read a key that spans lines.
+            pkg=""
+            [ ! -f package.json ] || pkg="$(tr -d '\n' <package.json)"
+            if [ -f .nvmrc ]; then node_file=.nvmrc
+            elif [ -f .node-version ]; then node_file=.node-version
+            elif grep -Eq '"engines"[[:space:]]*:[[:space:]]*\{[^}]*"node"[[:space:]]*:' <<<"$pkg"; then node_file=package.json
+            else node_version='lts/*'
+            fi
+            pm="$(sed -nE 's/.*"packageManager"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' <<<"$pkg")"
+            case "$pm" in
+              "" | npm@[0-9]* | pnpm@[0-9]* | yarn@[0-9]*) ;;
+              *) fail "package.json names packageManager $pm; this workflow installs npm, pnpm or yarn" ;;
+            esac
+          fi
+          uv=false
+          if [ "$kind" = uv ] || [ -n "$(git ls-files -- ':(glob)**/uv.lock')" ]; then
+            uv=true
+          fi
+          {
+            echo "client-from=$from"
+            echo "client-kind=$kind"
+            echo "node=$node"
+            echo "node-version=$node_version"
+            echo "node-version-file=$node_file"
+            echo "package-manager=$pm"
+            echo "uv=$uv"
+          } >>"$GITHUB_OUTPUT"
+          echo "client pin in $from ($kind); node $node ${node_file:-$node_version}; packageManager ${pm:-none}; uv $uv"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.toolchain.outputs.node == 'true'
+        with:
+          node-version: ${{ steps.toolchain.outputs.node-version }}
+          node-version-file: ${{ steps.toolchain.outputs.node-version-file }}
+          # Its default caches the npm registry download. devbox caches the installed tree, and
+          # on a hit npm never runs, so a registry cache restored there is pure cost.
+          package-manager-cache: false
+
+      # The bundled npm of a Node release is not the npm a project pins, and two npm majors
+      # that disagree about a lock file undo each other's install, so the pin is installed.
+      # pnpm and yarn come through corepack, itself pinned: Node 25 and later ship no corepack,
+      # and an older bundled one refused every download once its signing keys rotated.
+      - name: Package manager
+        if: steps.toolchain.outputs.package-manager != ''
+        env:
+          PACKAGE_MANAGER: ${{ steps.toolchain.outputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm@*) npm install -g --no-audit --no-fund "${PACKAGE_MANAGER%%+*}" ;;
+            *) npm install -g --no-audit --no-fund corepack@0.36.0 && corepack enable ;;
+          esac
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: steps.toolchain.outputs.uv == 'true'
+        with:
+          # devbox caches the installed .venv. uv's own download cache on top is pure cost.
+          enable-cache: false
+
+      - name: Find the client pin
+        id: pin
+        env:
+          CLIENT_FROM: ${{ steps.toolchain.outputs.client-from }}
+          CLIENT_KIND: ${{ steps.toolchain.outputs.client-kind }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=devbox gate::$*"; exit 1; }
+          if [ "$CLIENT_KIND" = npm ]; then
+            spec="$(node -p 'const n = "@launchwrighthq/devbox-client";
+              const d = JSON.parse(require("fs").readFileSync(process.env.CLIENT_FROM, "utf8"));
+              (d.dependencies || {})[n] || (d.devDependencies || {})[n] || ""')"
+            [ -n "$spec" ] || fail "$CLIENT_FROM names no @launchwrighthq/devbox-client in dependencies or devDependencies, so there is no client to install"
+            # A workspace, file or catalog pin names a place inside the project, and the client
+            # is installed outside it, before any dependency.
+            case "$spec" in
+              workspace:* | file:* | link:* | catalog:*) fail "$CLIENT_FROM pins the client as $spec, which installs only inside the project; pin a tag, such as github:launchwrighthq/devbox-client#v$DEVBOX_WORKFLOW_MAJOR.0.0" ;;
+            esac
+          else
+            # grep exits 1 when no line matches, and an empty result is the refusal below.
+            specs="$(grep -oE 'devbox-client @ [^"'"'"']+' "$CLIENT_FROM" | sort -u || true)"
+            [ -n "$specs" ] || fail "$CLIENT_FROM holds no \"devbox-client @ <url>\" requirement, so there is no client to install"
+            [ "$(wc -l <<<"$specs")" -eq 1 ] || fail "$CLIENT_FROM pins the client more than once, and each pin differs: $(tr '\n' ' ' <<<"$specs")"
+            spec="$specs"
+          fi
+          echo "client-spec=$spec" >>"$GITHUB_OUTPUT"
+          echo "client pin: $spec"
+
+      # The same text in the plan, setup and step jobs. tests/test-workflows.sh fails when the
+      # three differ.
+      - name: Install the devbox client
+        env:
+          CLIENT_KIND: ${{ steps.toolchain.outputs.client-kind }}
+          CLIENT_SPEC: ${{ steps.pin.outputs.client-spec }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/devbox"
+          case "$CLIENT_KIND" in
+            npm)
+              npm install --no-save --no-package-lock --no-audit --no-fund --prefix "$dir" "@launchwrighthq/devbox-client@$CLIENT_SPEC"
+              bin="$dir/node_modules/.bin"
+              ;;
+            uv)
+              UV_TOOL_DIR="$dir/tools" UV_TOOL_BIN_DIR="$dir/bin" uv tool install "$CLIENT_SPEC"
+              bin="$dir/bin"
+              ;;
+            *) echo "::error title=devbox gate::no client kind from the plan job"; exit 1 ;;
+          esac
+          "$bin/devbox" version
+          echo "$bin" >>"$GITHUB_PATH"
+
+      - name: Check the client major
+        env:
+          CLIENT_FROM: ${{ steps.toolchain.outputs.client-from }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=devbox gate::$*"; exit 1; }
+          [[ "$DEVBOX_WORKFLOW_MAJOR" =~ ^[0-9]+$ ]] \
+            || fail "this workflow carries no client major ($DEVBOX_WORKFLOW_MAJOR); call launchwrighthq/devbox-client/.github/workflows/gate.yml, which tools/export-client.sh writes"
+          version="$(devbox version | sed -n 's/^devbox //p')"
+          [ -n "$version" ] || fail "devbox version printed no release line"
+          major="${version%%.*}"
+          [ "$major" = "$DEVBOX_WORKFLOW_MAJOR" ] \
+            || fail "$CLIENT_FROM pins devbox $version, and this is the gate workflow of major $DEVBOX_WORKFLOW_MAJOR; call gate.yml@v$major, or pin a $DEVBOX_WORKFLOW_MAJOR.x release"
+
+      # devbox ci matrix less skip-steps. An empty matrix FAILS: GitHub skips a matrix job of
+      # no entry, and the run then reports green over no step at all.
+      - name: Matrix
+        id: matrix
+        env:
+          SKIP_STEPS: ${{ inputs.skip-steps }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=devbox gate::$*"; exit 1; }
+          full="$(devbox ci matrix)"
+          head='{"include":[' tail=']}' sep='},{'
+          body="${full#"$head"}"
+          body="${body%"$tail"}"
+          [ "$full" = "$head$body$tail" ] || fail "devbox ci matrix printed $full, which is not one include list"
+          # A step name is [a-z0-9:_-]*, so an entry holds no brace and no quote to escape.
+          entries=()
+          rest="$body"
+          while [[ "$rest" == *"$sep"* ]]; do
+            entries+=("${rest%%"$sep"*}}")
+            rest="{${rest#*"$sep"}"
+          done
+          entries+=("$rest")
+          read -ra skips <<<"$SKIP_STEPS"
+          for s in "${skips[@]}"; do
+            grep -qF "{\"step\":\"$s\"," <<<"$body" || fail "skip-steps names $s, which .devbox/steps does not hold"
+          done
+          kept=""
+          for e in "${entries[@]}"; do
+            [ -n "$e" ] || continue
+            step="$(sed -nE 's/^\{"step":"([^"]*)",.*/\1/p' <<<"$e")"
+            for s in "${skips[@]}"; do
+              [ "$step" != "$s" ] || continue 2
+            done
+            kept="${kept:+$kept,}$e"
+            echo "  $step $(sed -nE 's/.*"shard":"([^"]*)".*/\1/p' <<<"$e")"
+          done
+          [ -n "$kept" ] || fail "the matrix holds no entry once skip-steps ($SKIP_STEPS) is left out; refusing to report green over no step"
+          echo "matrix={\"include\":[$kept]}" >>"$GITHUB_OUTPUT"
+
+      # The cache of the setup's outputs, from the client. Empty paths mean no cache: a custom
+      # setup that declares no outputs could be skipped over a restore that lacks one of them.
+      # The setup then runs in each step job. The key gains the Node major here, because the
+      # installed tree carries binaries built for its ABI, and the OS and architecture in each
+      # job that reads it.
+      - name: Cache key and paths
+        id: cache
+        env:
+          NODE_USED: ${{ steps.toolchain.outputs.node }}
+          UV_USED: ${{ steps.toolchain.outputs.uv }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=devbox gate::$*"; exit 1; }
+          out="$(devbox ci cache)" || fail "devbox ci cache failed; this workflow needs a client with devbox ci cache and devbox setup, which arrived in 4.1.0"
+          key="$(sed -nE 's/.*"key":"([^"]*)".*/\1/p' <<<"$out")"
+          [[ "$key" =~ ^devbox-setup-[0-9a-f]{64}$ ]] || fail "devbox ci cache printed no key: $out"
+          grep -q '"paths":\[' <<<"$out" || fail "devbox ci cache printed no paths: $out"
+          list="$(sed -nE 's/.*"paths":\[(.*)\].*/\1/p' <<<"$out")"
+          paths=()
+          if [ -n "$list" ]; then
+            case "$list" in *\\*) fail "devbox ci cache printed a path with a JSON escape, which this workflow does not read: $list" ;; esac
+            sep='","'
+            list="${list#\"}"
+            list="${list%\"}"
+            while [[ "$list" == *"$sep"* ]]; do
+              paths+=("${list%%"$sep"*}")
+              list="${list#*"$sep"}"
+            done
+            paths+=("$list")
+          fi
+          # uv links a .venv to the Python it installed. Restored on a runner that lacks that
+          # Python, the .venv points at nothing and the skipped setup leaves it broken, so that
+          # Python is kept in the checkout (the "uv Python" step) and cached with the .venv.
+          if [ "${#paths[@]}" -gt 0 ] && [ "$UV_USED" = true ]; then
+            paths+=(.git/devbox/uv-python)
+          fi
+          if [ "$NODE_USED" = true ]; then
+            key="$key-node$(node -p 'process.versions.node.split(".")[0]')"
+          fi
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+          {
+            echo "paths<<DEVBOX_CACHE_PATHS"
+            [ "${#paths[@]}" -eq 0 ] || printf '%s\n' "${paths[@]}"
+            echo "DEVBOX_CACHE_PATHS"
+          } >>"$GITHUB_OUTPUT"
+          echo "cache key $key"
+          if [ "${#paths[@]}" -gt 0 ]; then
+            printf 'cache path %s\n' "${paths[@]}"
+          else
+            echo "no cache paths: the setup runs in each step job"
+          fi
+
+  # One setup for the whole run when the client names its outputs. A hit does nothing; a miss
+  # runs the setup once and saves it, so every step job of this run restores it.
+  setup:
+    needs: plan
+    if: needs.plan.outputs.cache-paths != ''
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Look up the setup cache
+        id: lookup
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ needs.plan.outputs.cache-key }}-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ needs.plan.outputs.cache-paths }}
+          lookup-only: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.lookup.outputs.cache-hit != 'true'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.lookup.outputs.cache-hit != 'true' && needs.plan.outputs.node == 'true'
+        with:
+          node-version: ${{ needs.plan.outputs.node-version }}
+          node-version-file: ${{ needs.plan.outputs.node-version-file }}
+          package-manager-cache: false
+
+      - name: Package manager
+        if: steps.lookup.outputs.cache-hit != 'true' && needs.plan.outputs.package-manager != ''
+        env:
+          PACKAGE_MANAGER: ${{ needs.plan.outputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm@*) npm install -g --no-audit --no-fund "${PACKAGE_MANAGER%%+*}" ;;
+            *) npm install -g --no-audit --no-fund corepack@0.36.0 && corepack enable ;;
+          esac
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: steps.lookup.outputs.cache-hit != 'true' && needs.plan.outputs.uv == 'true'
+        with:
+          enable-cache: false
+
+      - name: uv Python
+        if: steps.lookup.outputs.cache-hit != 'true' && needs.plan.outputs.uv == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.git/devbox/uv-python"
+          echo "UV_PYTHON_INSTALL_DIR=$GITHUB_WORKSPACE/.git/devbox/uv-python" >>"$GITHUB_ENV"
+
+      - name: Install the devbox client
+        if: steps.lookup.outputs.cache-hit != 'true'
+        env:
+          CLIENT_KIND: ${{ needs.plan.outputs.client-kind }}
+          CLIENT_SPEC: ${{ needs.plan.outputs.client-spec }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/devbox"
+          case "$CLIENT_KIND" in
+            npm)
+              npm install --no-save --no-package-lock --no-audit --no-fund --prefix "$dir" "@launchwrighthq/devbox-client@$CLIENT_SPEC"
+              bin="$dir/node_modules/.bin"
+              ;;
+            uv)
+              UV_TOOL_DIR="$dir/tools" UV_TOOL_BIN_DIR="$dir/bin" uv tool install "$CLIENT_SPEC"
+              bin="$dir/bin"
+              ;;
+            *) echo "::error title=devbox gate::no client kind from the plan job"; exit 1 ;;
+          esac
+          "$bin/devbox" version
+          echo "$bin" >>"$GITHUB_PATH"
+
+      - name: Prepare
+        if: steps.lookup.outputs.cache-hit != 'true' && inputs.prepare != ''
+        env:
+          PREPARE: ${{ inputs.prepare }}
+        run: bash -euo pipefail -c "$PREPARE"
+
+      - name: devbox setup
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: devbox setup
+
+      - name: Save the setup cache
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ needs.plan.outputs.cache-key }}-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ needs.plan.outputs.cache-paths }}
+
+  step:
+    name: ${{ matrix.step }} ${{ matrix.shard }}
+    needs: [plan, setup]
+    # The setup job is skipped when the client names no cache paths, and a job whose need was
+    # skipped is skipped too, so the steps would never run. They run after a setup that passed
+    # or was skipped, never after one that failed.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.setup.result == 'success' || needs.setup.result == 'skipped') }}
+    runs-on: ${{ fromJSON(inputs.runners)[matrix.step] || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      # One step's failure cancels no other: a run reports every broken step at once.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # Full history, as a partial clone. A test that reads history (a commit range
+      # against its merge base) read a depth-1 clone as one commit and reported clean.
+      # blob:none fetches commits and trees, and a test fetches the few blobs it opens.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      # A test that reads an LFS file read its pointer instead, and failed, in a checkout with
+      # no LFS content. Only a project whose .gitattributes names LFS pays for the pull.
+      - name: Git LFS
+        run: |
+          set -euo pipefail
+          # grep exits 1 when no .gitattributes names LFS, which is the common case, not a fault.
+          lfs="$(git ls-files -z -- ':(glob)**/.gitattributes' | xargs -0 -r grep -l 'filter=lfs' || true)"
+          if [ -n "$lfs" ]; then git lfs install --local && git lfs pull; fi
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: needs.plan.outputs.node == 'true'
+        with:
+          node-version: ${{ needs.plan.outputs.node-version }}
+          node-version-file: ${{ needs.plan.outputs.node-version-file }}
+          package-manager-cache: false
+
+      - name: Package manager
+        if: needs.plan.outputs.package-manager != ''
+        env:
+          PACKAGE_MANAGER: ${{ needs.plan.outputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm@*) npm install -g --no-audit --no-fund "${PACKAGE_MANAGER%%+*}" ;;
+            *) npm install -g --no-audit --no-fund corepack@0.36.0 && corepack enable ;;
+          esac
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: needs.plan.outputs.uv == 'true'
+        with:
+          enable-cache: false
+
+      - name: uv Python
+        if: needs.plan.outputs.uv == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.git/devbox/uv-python"
+          echo "UV_PYTHON_INSTALL_DIR=$GITHUB_WORKSPACE/.git/devbox/uv-python" >>"$GITHUB_ENV"
+
+      - name: Install the devbox client
+        env:
+          CLIENT_KIND: ${{ needs.plan.outputs.client-kind }}
+          CLIENT_SPEC: ${{ needs.plan.outputs.client-spec }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/devbox"
+          case "$CLIENT_KIND" in
+            npm)
+              npm install --no-save --no-package-lock --no-audit --no-fund --prefix "$dir" "@launchwrighthq/devbox-client@$CLIENT_SPEC"
+              bin="$dir/node_modules/.bin"
+              ;;
+            uv)
+              UV_TOOL_DIR="$dir/tools" UV_TOOL_BIN_DIR="$dir/bin" uv tool install "$CLIENT_SPEC"
+              bin="$dir/bin"
+              ;;
+            *) echo "::error title=devbox gate::no client kind from the plan job"; exit 1 ;;
+          esac
+          "$bin/devbox" version
+          echo "$bin" >>"$GITHUB_PATH"
+
+      - name: Prepare
+        if: inputs.prepare != ''
+        env:
+          PREPARE: ${{ inputs.prepare }}
+        run: bash -euo pipefail -c "$PREPARE"
+
+      # Exact key, no restore-keys: a near match restores outputs of another setup, and the
+      # setup's own record then decides to run it again anyway.
+      - name: Restore the setup cache
+        if: needs.plan.outputs.cache-paths != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ needs.plan.outputs.cache-key }}-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ needs.plan.outputs.cache-paths }}
+
+      # With CI set, devbox verify --local runs the setup, and skips it when the restored record
+      # equals the setup key and its outputs exist. On a miss, or with no cache paths, it runs
+      # the setup in this job.
+      - name: devbox verify
+        env:
+          STEP: ${{ matrix.step }}
+          SHARD: ${{ matrix.shard }}
+        run: devbox verify --local --step "$STEP" --shard "$SHARD"

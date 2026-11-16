@@ -908,7 +908,7 @@ devbox_probe_parse() {
 #
 # The probe line carries the token figures of the pool, and under
 # DEVBOX_ADMISSION=pressure those decide nothing. A client printed
-# `25/16 tokens, 3/4 jobs, 0 waiting: this ask fits now` for a host that admits
+# `12/8 tokens, 3/6 jobs, 0 waiting: this ask fits now` for a host that admits
 # on its idle cores, and the reader could not see what the host judged. So the
 # `probe` verb answers a SECOND line, the rule the pool runs and the readings
 # it judged by:

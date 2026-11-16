@@ -165,7 +165,8 @@ new_repo d2
 add_step test runner=pytest narrow=failed
 plan changed
 assert_eq "test=run" "$(actions)" "the first plan runs the step in full"
-assert_eq "no earlier pass" "$(reason_of test)" "because it never passed"
+assert_eq "no earlier pass; no record of branch main to narrow by" "$(reason_of test)" \
+  "because it never passed, and its narrow=failed has no result of this branch"
 assert_eq 1 "$(awk -F'\t' '$1 == "step" { print $9 }' "$P")" "and asks for a trace"
 assert_eq "tests/test_a.py
 tests/test_b.py
@@ -286,11 +287,17 @@ plan changed test
 trace test "read tests/test_a.py src/a.py" "read tests/test_b.py src/b.py" \
   "read tests/test_c.py tests/test_c.py" "partial tests/test_c.py subprocess git"
 gate
+# 4.0.1 D2: one partial file once gave its step every synced file as its key,
+# so a docs-only edit selected every partial file of the step.
 edit README.md
 plan changed test
-assert_eq "test=select" "$(actions)" "an unrelated change reaches the step, whose key now holds every file"
-assert_eq "tests/test_c.py" "$(files_of test)" "and selects the partial file alone"
-assert_eq "partial" "$(freason_of test tests/test_c.py)" "as partial"
+assert_eq "test=carry" "$(actions)" "4.0.1 D2: an edit no test of the step read carries, partial file and all"
+edit src/a.py
+plan changed test
+assert_eq "test=select" "$(actions)" "4.0.1 D2: an edit a test of the step read reaches the step"
+assert_eq "tests/test_a.py
+tests/test_c.py" "$(files_of test)" "and selects the file that read it and the partial file"
+assert_eq "read src/a.py|partial" "$(freason_of test tests/test_a.py)|$(freason_of test tests/test_c.py)" "each with its reason"
 pytest_trace
 gate
 

@@ -89,6 +89,11 @@ name="$1"
 printf '%s\n' "$name" >>"$STEP_LOG"
 var="FAKE_RC_${name//[^a-z0-9]/_}"
 if [ -n "${FAKE_TOUCH-}" ] && [ "$name" = "${FAKE_TOUCH_STEP-}" ]; then printf 'changed\n' >>"$FAKE_TOUCH"; fi
+# FAKE_FAILED_FILE: the step named FAKE_FAILED_FILE_STEP writes that test file
+# failed into the gate's ledger, and still exits 0.
+if [ -n "${FAKE_FAILED_FILE-}" ] && [ "$name" = "${FAKE_FAILED_FILE_STEP-}" ]; then
+  printf 'file\tvitest\t%s\tfail\t1\n' "$FAKE_FAILED_FILE" >>"$DEVBOX_LEDGER"
+fi
 echo "step $name output"
 exit "${!var:-0}"
 STEP
@@ -272,6 +277,20 @@ verify --target lan1 --step nope
 assert_eq "2" "$rc" "R2: a step the gate does not hold is refused with exit 2"
 assert_eq "" "$(cat "$SSH_LOG")" "R2: before any target is asked"
 
+# ═══ D1a (gate fixes 4.0.1): a red verdict never exits 0 ═════════════════════
+# MEASURED: a resumed gate recorded its step pass beside two failed files of
+# that step, and printed green. The verdict reads such a record red, and the
+# code follows the verdict.
+FAKE_FAILED_FILE=tests/a.test.ts FAKE_FAILED_FILE_STEP=lint verify --target lan1 --full --step lint
+assert_eq "pass" "$(step_line "$(newest_record)" lint | cut -d' ' -f1)" "D1a: the record holds the step pass"
+assert_eq "fail" "$(awk -F'\t' '$1 == "file" && $2 == "lint" { print $5 }' "$(newest_record)")" \
+  "D1a: beside a failed test file of that step"
+assert_eq "devbox: red (lint passed with 1 failed files)" "$(last_line)" "D1a: the verdict is red"
+assert_eq "1" "$rc" "D1a: and the gate exits 1, the code of a failed gate, never 0"
+FAKE_FAILED_FILE=tests/a.test.ts FAKE_FAILED_FILE_STEP=lint verify --local --full --step lint
+assert_eq "devbox: red (lint passed with 1 failed files)" "$(last_line)" "D1a: a gate on this laptop reads red too"
+assert_eq "1" "$rc" "D1a: and exits 1"
+
 # ═══ D10a: a file changed while the gate ran: complete 0, nothing carries ════
 printf 'four\n' >"$CO/src/a.ts"
 FAKE_TOUCH="$CO/src/a.ts" FAKE_TOUCH_STEP=lint verify --target lan1
@@ -279,6 +298,10 @@ assert_eq "0" "$rc" "D10a: the steps passed, so the code is 0"
 assert_ok "D10a: one line says the result does not carry" \
   contains "devbox verify: files changed while the gate ran, so this result does not carry" "$out"
 assert_eq "0" "$(field "$(newest_record)" complete)" "D10a: the record is complete 0"
+# Every step of this gate ended. Its verdict once read `did not end every step`.
+assert_eq "files changed while it ran" "$(field "$(newest_record)" reason)" "D10a: the record names why it does not carry"
+assert_ok "D10a: and the verdict names that reason" \
+  grep -qE '^devbox: incomplete \(run [^ ]+ does not carry: files changed while it ran\)$' <<<"$(last_line)"
 printf 'four\n' >"$CO/src/a.ts"
 verify --plan
 assert_ok "D10a: with the planned tree back, lint does not carry from that record" grep -qE '^lint  run  ' <<<"$out"

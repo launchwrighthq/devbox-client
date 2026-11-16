@@ -189,6 +189,10 @@ assert_ok "D1: the grant line names the target, the lane, the wait and the other
 assert_eq "0" "$(tickets_left)" "D1: no queue keeps a ticket of this run"
 # A queued pool reads no stdin, so the client leaves it by killing that ssh.
 assert_ok "D1: lan1's queue was left when its session ended" contains "left session" "$(grep " $A_LAN1 " "$HOLD_LOG")"
+# bash names a job that a signal ended when it reaps it. Every join that lost
+# once printed `line N: <pid> Killed ... ssh ...` on the winner's terminal
+# (docs/specs/2026-11-15-gate-fixes-4-0-1-design.md, D6).
+assert_fail "D1: no Killed job line of a join that lost reaches the terminal" contains "Killed" "$out"
 assert_eq "vps1" "$(cat "$CO/.git/devbox/last-target" 2>/dev/null)" "D1: the affinity record names the granted target"
 # The run carries the lane slug, the history slug and the run id as its last words.
 assert_ok "D1: run carries nine words: lane, project, want, min, max wait, limit, mode, history slug, run id" \

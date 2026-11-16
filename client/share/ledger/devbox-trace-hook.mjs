@@ -220,7 +220,27 @@ function childCommand(name, args) {
     argv = [program, '-c', argv.join(' ')];
   }
   const words = argv.flatMap((a) => a.split(/\s+/)).filter((w) => w !== '');
-  return { program: resolveProgram(program, cwd, env), cwd, words };
+  return { program: resolveProgram(program, cwd, env), cwd, words, argv, env };
+}
+
+// 4.0.1 D3: the shell of one plain command runs that command. On real suites
+// `execSync("git rev-parse --short HEAD")` reached this hook as `/bin/sh -c
+// "git rev-parse ..."`, and sh is an interpreter, so its test file was
+// partial, although git run directly is not. Only `sh -c` or `bash -c` with
+// one command string unwraps, and only when every character of that string
+// is a plain word character or a blank. Any other character, a `;`, `&&`, a
+// pipe, `$`, a backquote, a redirection, a quote, a glob, a brace or a tilde,
+// is shell syntax: the shell then runs other words than the ones split here,
+// and a quote, a glob or a variable can name a repository file no word names.
+// The words of the inner command, or null.
+const SHELLS = new Set(['sh', 'bash']);
+const PLAIN_COMMAND = /^[A-Za-z0-9_.,:=+@%/ \t-]+$/;
+
+function plainShellCommand(program, argv) {
+  if (program === null || !SHELLS.has(path.basename(program))) return null;
+  if (argv.length !== 3 || argv[1] !== '-c' || !PLAIN_COMMAND.test(argv[2])) return null;
+  const words = argv[2].split(/[ \t]+/).filter((w) => w !== '');
+  return words.length > 0 ? words : null;
 }
 
 // Section 5.4: a child process reads no repository file when its program
@@ -231,8 +251,18 @@ function childCommand(name, args) {
 // `/usr/bin/env python3` names the interpreter in an argument. On a real
 // suite a session fixture whose library ran `git rev-parse HEAD` marked every
 // test file partial, and selection then gave that suite nothing.
+//
+// A program under node_modules/ or .venv/ is inside the repository, so it
+// stays partial. esbuild's service binary is one: its build() reads entry
+// files of the repository inside the binary, where this hook sees nothing, and
+// a test file that called it would look complete with those reads missing.
 function childMayRead(root, name, args) {
-  const { program, cwd, words } = childCommand(name, args);
+  let { program, cwd, words, argv, env } = childCommand(name, args);
+  const inner = plainShellCommand(program, argv);
+  if (inner !== null) {
+    program = resolveProgram(inner[0], cwd, env);
+    words = inner;
+  }
   const inside = (p) => {
     let real = p;
     try {
@@ -459,6 +489,11 @@ function record(kind, target) {
   if (abs === null) return;
   const c = classifyPath(cur.root, abs);
   if (c === null) return;
+  // The git database of a workspace, the `.git` file of a worktree and
+  // `.git-common/`, changes with every commit and is no synced input. A test
+  // that ran git once recorded reads of `.git-common/refs/`, so a commit
+  // selected it (4.0.1 D3b).
+  if (c.kind === 'read' && /^\.git(-common)?(\/|$)/.test(c.rel)) return;
   if (c.kind === 'setup') {
     w.trace.write(formatTraceLine('setup', cur.owner));
     return;

@@ -134,7 +134,15 @@ echo "-- a partial file, a gone file, a pruned record"
 printf '%s\n' $'read\ttests/test_a.py\tsrc/a.py' $'partial\ttests/test_a.py\tsubprocess python' >"$T"
 record pass tests/test_a.py:pass
 devbox_map_update test "$RUN" "$T" select base1 setup1
-assert_fail "a partial file gives the step no learned inputs" devbox_map_step_inputs test
+# 4.0.1 D2: one partial file once gave its step every synced file as its key,
+# so a docs-only edit selected every partial file of the step.
+assert_eq "pytest.ini
+src/a.py
+src/b.py
+tests/
+tests/test_a.py
+tests/test_b.py" "$(devbox_map_step_inputs test)" \
+  "4.0.1 D2: a partial file keeps the step's learned inputs, its own reads among them"
 manifest
 assert_eq "tests/test_a.py	partial" "$(devbox_map_select test "$M" base1 setup1)" "and is selected"
 rm tests/test_b.py
@@ -184,6 +192,8 @@ assert_eq traced1 "$(devbox_map_step_traced test)" "an untraced run keeps it"
 printf '%s\n' $'read\t-\tsrc/b.py' $'partial\t-\ttrace cut short' >"$T"
 devbox_map_update test "$RUN" "$T" run base1 setup1 traced3
 assert_fail "a partial step trace is no valid trace, so it is taken again" devbox_map_step_traced test
+assert_fail "4.0.1 D2a: a step trace cut short gives no learned inputs, so the key covers every synced file" \
+  devbox_map_step_inputs test
 
 echo "-- a runner step's own reads, owner -"
 # pytest reads its config, a root conftest and its cache at session start,
@@ -250,6 +260,77 @@ assert_eq "src/b.test.ts	partial
 src/a.test.ts	read src/worker.ts" "$(devbox_map_select test "$M" base1 setup1)" \
   "a change to the file the Worker read selects the test file that started it, and the partial file runs on any change of its step"
 rm src/a.test.ts src/b.test.ts src/a.ts src/b.ts src/worker.ts
+
+echo "-- 4.0.1 D3b: the git database is no input"
+# A map an earlier client wrote can hold reads of .git-common/, the git
+# database of a workspace, which a test that ran git recorded. A commit then
+# changed a read of that test.
+rm -f "$MAP"
+mkdir -p .git-common/refs/heads
+printf 'ref: refs/heads/main\n' >.git-common/HEAD
+printf '0123\n' >.git-common/refs/heads/main
+printf 'tests/test_a.py v1\n' >tests/test_a.py
+printf '%s\n' 'map	1' 'context	base1	setup1' \
+  'path	1	src/a.py' 'path	2	.git-common/HEAD' 'dir	3	.git-common/refs/heads/' 'path	4	.git' \
+  'dir	5	.github/' >"$MAP"
+record pass tests/test_a.py:pass
+printf 'file\ttests/test_a.py\t%s\tcomplete\t1,2,3,4,5\nstep\t%s\tcomplete\t-\t-\n' "$RUN" "$RUN" >>"$MAP"
+assert_eq ok "$(devbox_map_state test)" "a map with reads under .git-common reads"
+assert_eq ".github/
+src/a.py
+tests/test_a.py" "$(devbox_map_step_inputs test)" "4.0.1 D3b: the learned inputs leave out .git and .git-common, and keep .github"
+printf '4567\n' >.git-common/refs/heads/main
+printf 'ref: refs/heads/other\n' >.git-common/HEAD
+printf 'x\n' >.git-common/refs/heads/new
+manifest
+assert_eq "" "$(devbox_map_select test "$M" base1 setup1)" "4.0.1 D3b: a commit, a change under .git-common, selects no test"
+printf 'more\n' >>src/a.py
+manifest
+assert_eq "tests/test_a.py	read src/a.py" "$(devbox_map_select test "$M" base1 setup1)" "while a read outside it still selects"
+printf 'src/a.py v1\n' >src/a.py
+rm -r .git-common
+
+echo "-- gate fixes 4.0.1, row D4: a resumed gate stamps every file it passed"
+# MEASURED: after a resume, the map wrote the files that passed before the
+# stop with the pass run `-`, because their trace went with the stopped part
+# and the map's context had changed since, so the next plan named each of
+# them `no trace` and ran it again.
+rm -f "$MAP"
+printf 'tests/test_c.py v1\n' >tests/test_c.py
+printf '%s\n' $'read\ttests/test_a.py\tsrc/a.py' $'read\ttests/test_b.py\tsrc/b.py' \
+  $'read\ttests/test_c.py\tdata/one.json' >"$T"
+record pass tests/test_a.py:pass tests/test_b.py:pass tests/test_c.py:pass
+devbox_map_update test "$RUN" "$T" run base1 setup1
+printf '%s\n' $'read\ttests/test_b.py\tsrc/b.py' >"$T"
+record fail tests/test_a.py:pass tests/test_b.py:pass tests/test_c.py:fail
+rc=0; devbox_map_update test "$RUN" "$T" resume base2 setup1 || rc=$?
+assert_eq 0 "$rc" "D4: the map takes the merge of a resumed gate"
+assert_ok "D4: a file that passed before the stop, with no trace this run, has this gate's run" \
+  grep -q $'^file\ttests/test_a.py\t'"$RUN"$'\tcomplete\t' "$MAP"
+assert_ok "D4: a file that passed after the resume has it too" grep -q $'^file\ttests/test_b.py\t'"$RUN"$'\tcomplete\t' "$MAP"
+assert_ok "D4: a file that failed in the gate has no pass" grep -q $'^file\ttests/test_c.py\t-\t' "$MAP"
+manifest
+assert_eq "tests/test_c.py	no trace" "$(devbox_map_select test "$M" base2 setup1)" \
+  "D4: on the gate's own tree only the failed file runs"
+printf 'more\n' >>src/a.py
+manifest
+assert_eq "tests/test_a.py	read src/a.py
+tests/test_c.py	no trace" "$(devbox_map_select test "$M" base2 setup1)" \
+  "D4: the stamped file keeps its learned reads, so a change to what it read selects it"
+printf 'src/a.py v1\n' >src/a.py
+rm tests/test_c.py
+
+echo "-- gate fixes 4.0.1, row D3b: no git path in a map"
+# MEASURED: a test that runs git recorded reads of .git-common/refs/ and
+# .git-common/worktrees/, the workspace copy of the git common dir, so a
+# commit would have selected it.
+rm -f "$MAP"
+printf '%s\n' $'read\ttests/test_a.py\tsrc/a.py' $'read\ttests/test_a.py\t.git-common/refs/heads/x' \
+  $'list\ttests/test_a.py\t.git-common/worktrees' $'read\ttests/test_a.py\t.git/HEAD' >"$T"
+record pass tests/test_a.py:pass
+devbox_map_update test "$RUN" "$T" run base1 setup1
+assert_ok "D3b: the merge keeps the real read" grep -q $'^path\t[0-9]*\tsrc/a.py$' "$MAP"
+assert_fail "D3b: and no .git-common or .git path" grep -qE $'^(path|dir)\t[0-9]+\t\\.git(-common)?/' "$MAP"
 
 echo "-- a map that breaks the format"
 printf 'map\t1\nfile\tx\n' >"$MAP"

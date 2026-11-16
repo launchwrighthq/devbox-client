@@ -300,10 +300,13 @@ _devbox_services_local_redis_ping() {
 # Every rabbitmq CLI call runs as the rabbitmq user. MEASURED: a ping as root
 # during the broker's first start wrote /var/lib/rabbitmq/.erlang.cookie as
 # root, the broker died on "Error when reading .erlang.cookie: eacces", and the
-# wait ran out its 60 s. The output of a ping that fails is the wait's to
+# wait ran out its 60 s. The output of a check that fails is the wait's to
 # drop: _devbox_services_wait names a broker that never answers.
-_devbox_services_local_rabbit_ping() {
-  docker exec -u rabbitmq "$1" rabbitmq-diagnostics -q ping >/dev/null 2>&1
+# check_running, not ping: ping passes once the Erlang node is up, before the
+# rabbit app runs, and add_vhost then failed with "this command requires the
+# 'rabbit' app to be running on the target node".
+_devbox_services_local_rabbit_ready() {
+  docker exec -u rabbitmq "$1" rabbitmq-diagnostics -q check_running >/dev/null 2>&1
 }
 
 # Start the declared services on this machine, give the run its database,
@@ -371,7 +374,7 @@ devbox_services_local_up() {
         fi
         _devbox_services_local_container "$c" -e 'RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit loopback_users []' \
           "${publish[@]}" "$DEVBOX_SERVICES_IMAGE_RABBITMQ" || return 1
-        rc=0; _devbox_services_wait rabbitmq _devbox_services_local_rabbit_ping "$c" || rc=$?
+        rc=0; _devbox_services_wait rabbitmq _devbox_services_local_rabbit_ready "$c" || rc=$?
         [ "$rc" = 0 ] || return "$rc"
         port="$(_devbox_services_local_port "$c" 5672)" || return 1
         docker exec -u rabbitmq "$c" rabbitmqctl -q add_vhost "$name" >/dev/null || return 1

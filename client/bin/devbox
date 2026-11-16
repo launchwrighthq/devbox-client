@@ -30,10 +30,12 @@ usage() {
   cat <<'EOF'
 usage: devbox <command> [args]
 
-  verify [--local | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--plan]
+  verify [--local [--setup | --no-setup] | --target <name>] [--full | --changed | --fresh] [--step <name>]... [--plan]
                          run this checkout's gate, the steps of .devbox/steps, on the
                          first target whose pool grants; a step whose inputs did not
                          change since it passed is carried; --local runs it here,
+                         with DEVBOX_SETUP first under CI or with --setup, and
+                         never with --no-setup,
                          --target joins one target from .devbox.env, runpod or
                          hetzner; --full carries nothing, --changed carries what it
                          can; --fresh is --full and discards the ledger of a stopped
@@ -46,8 +48,11 @@ usage: devbox <command> [args]
   probe [--local] <rev>  run the failed test files of the newest record at <rev>
                          in a temporary worktree, through devbox run or here with
                          --local, and print one line per file
+  setup                  run DEVBOX_SETUP here, skipped when its inputs and outputs
+                         are unchanged since it last passed; no step runs
   ci matrix              print the GitHub Actions matrix of .devbox/steps: one
                          entry per step, and one per shard of a step with shards=
+  ci cache               print the CI cache key and paths of the setup as JSON
   cancel                 cancel this checkout's running gate, here and on its target
   run [--target <name>] -- <command>
                          run one command in this checkout's workspace on a target, never here
@@ -109,6 +114,7 @@ case "${1:-}" in
   result)  shift; runnable "$LIBEXEC/devbox-result" "$@"; exec "$LIBEXEC/devbox-result" "$@" ;;
   probe)   shift; runnable "$LIBEXEC/devbox-probe" "$@"; exec "$LIBEXEC/devbox-probe" "$@" ;;
   ci)      shift; runnable "$LIBEXEC/devbox-ci" "$@"; exec "$LIBEXEC/devbox-ci" "$@" ;;
+  setup)   shift; runnable "$LIBEXEC/devbox-setup" "$@"; exec "$LIBEXEC/devbox-setup" "$@" ;;
   cancel)  shift; runnable "$LIBEXEC/devbox-cancel" "$@"; exec "$LIBEXEC/devbox-cancel" "$@" ;;
   runpod) shift; runnable "$LIBEXEC/devbox-runpod" "$@"; exec "$LIBEXEC/devbox-runpod" "$@" ;;
   hetzner) shift; runnable "$LIBEXEC/devbox-hetzner" "$@"; exec "$LIBEXEC/devbox-hetzner" "$@" ;;

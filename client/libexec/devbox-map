@@ -83,6 +83,11 @@ function map_check(   i) {
   for (i = 1; i <= m_nf; i++) if (!map_ids_ok(m_fids[m_file[i]])) { m_bad = "an id of " m_file[i]; return }
   if (m_hasstep && !map_ids_ok(m_sids)) m_bad = "an id of the step line"
 }
+# True for a path that is an input of a key. The git database of a workspace,
+# the `.git` file of a worktree and `.git-common/`, changes with every commit.
+# A map an earlier client wrote held reads of `.git-common/refs/` from a test
+# that ran git, and a commit selected that test (4.0.1 D3b).
+function map_input(p) { return p !~ /^\.git(-common)?(\/|$)/ }
 '
 
 # Print <git common dir>/devbox/maps. The common dir, as for the records: a
@@ -126,21 +131,26 @@ devbox_map_state() {
 # and directories (with their `/`) its own process read, every test file's
 # reads, and the test files. A directory stands for the names of its own
 # entries, never for the content of the files under it: the key of devbox-plan
-# hashes its listing. Exits 1 with no usable trace: no map, a map that
-# cannot be read, no step line, or a partial trace of the step or of any test
-# file. A partial trace missed what a child process read, so the step's key
-# covers every synced file, and any change reaches the selection, which runs
-# the partial files (D3a).
+# hashes its listing. Exits 1 with no usable trace, and the step's key then
+# covers every synced file: no map, a map that cannot be read, no step line,
+# which a step whose trace never arrived has, or a partial step line, which a
+# trace cut short leaves (4.0.1 D2a).
+#
+# A partial test file keeps its reads in the union (4.0.1 D2). Its trace
+# missed what a child process read, and section 5.4 of the learned-selection
+# spec selects it whenever any file its step read changed, which is this key.
+# One partial file once gave its step every synced file as its key, so after
+# a docs-only edit two suites selected about 10 % and 3 % of their test files
+# as partial, and none of them read the edited file.
 devbox_map_step_inputs() {
   local out
   out="$(_devbox_map_awk "$1" '
     function add(ids,   n, a, i) {
       n = split(ids, a, ",")
-      for (i = 1; i <= n; i++) if (a[i] in m_path) print m_path[a[i]]
+      for (i = 1; i <= n; i++) if ((a[i] in m_path) && map_input(m_path[a[i]])) print m_path[a[i]]
     }
     function report(   i) {
       if (!m_hasstep || m_spart == "partial") exit 1
-      for (i = 1; i <= m_nf; i++) if (m_fpart[m_file[i]] == "partial") exit 1
       add(m_sids)
       for (i = 1; i <= m_nf; i++) { print m_file[i]; add(m_fids[m_file[i]]) }
     }')" || return 1
@@ -249,7 +259,7 @@ devbox_map_select() {
       }
       own = ""
       n = split(m_sids, a, ",")
-      for (i = 1; i <= n; i++) if ((a[i] in m_path) && m_path[a[i]] !~ /\/$/) own = own "," a[i]
+      for (i = 1; i <= n; i++) if ((a[i] in m_path) && m_path[a[i]] !~ /\/$/ && map_input(m_path[a[i]])) own = own "," a[i]
       for (i = 1; i <= m_nf; i++) {
         t = m_file[i]
         if (!(t in cur)) continue
@@ -262,6 +272,7 @@ devbox_map_select() {
         for (j = 1; j <= n; j++) {
           if (!(a[j] in m_path)) continue
           p = m_path[a[j]]
+          if (!map_input(p)) continue
           if (p ~ /\/$/) { if (!dir_changed(r, p)) continue }
           else if (old[r, p] == cur[p]) continue
           if (first == "" || p < first) first = p
@@ -278,13 +289,21 @@ devbox_map_select() {
 # with its owner, a test file or `-` for the step's own process. <mode> is the
 # plan's action: `run` makes this run the step's last full trace and replaces
 # its own reads; `select` or `narrow` ran a part of the test files and adds to
-# them. The record and the manifest of <run-id> give each test file's outcome
-# and tell which test files are gone.
+# them; `resume` is the part run of a resumed gate. The record and the
+# manifest of <run-id> give each test file's outcome and tell which test files
+# are gone.
 #
 # A test file that ran replaces its own line, with this run id when it passed
 # and `-` when it failed. A test file that is gone loses its line. A test file
 # that did not run keeps its line, with `-` when the context changed, since its
-# pass was under another context. A trace with no read at all, the trace of a
+# pass was under another context. Under `resume`, a test file with no trace
+# this run whose record line says it passed keeps its reads and takes this run
+# id, and one whose record line says it failed or was open takes `-`: the
+# record of a resumed gate holds both parts of it, and the trace only the part
+# after the stop (gate-fixes-4.0.1 spec, D4). MEASURED: the files that passed
+# before a stop had the pass run `-` after the resume, because the map's
+# context had changed since their last trace, and the next plan named each of
+# them `no trace` and ran it again. A trace with no read at all, the trace of a
 # step `strace` could not follow, keeps the earlier inputs and marks the map
 # `untraced`, with the reason its `partial` line gives (section 5.3). A `run`
 # with reads of the step's own process records <traced under> on the step line.
@@ -292,8 +311,8 @@ devbox_map_update() {
   local step="$1" run="$2" trace="$3" mode="$4" base="${5-}" setup="${6-}" traced="${7:--}"
   local file dir rdir rec=/dev/null man=/dev/null old=/dev/null
   (require_run_id "$run" "the map of step $step") || return 2
-  case "$mode" in run|select|narrow) ;; *)
-    echo "devbox verify: refusing the map mode '$mode' for step $step: write run, select or narrow" >&2; return 2 ;;
+  case "$mode" in run|select|narrow|resume) ;; *)
+    echo "devbox verify: refusing the map mode '$mode' for step $step: write run, select, narrow or resume" >&2; return 2 ;;
   esac
   [ -r "$trace" ] || { echo "devbox verify: could not read the trace $trace of step $step, so its map did not change" >&2; return 1; }
   _devbox_map_file file "$step" || return 1
@@ -324,7 +343,11 @@ devbox_map_update() {
       }
       if (p == "" || p == "." || substr(p, 1, 1) == "/") return ""
       n = split(p, c, "/")
-      if (c[1] == ".git") return ""
+      # .git-common is the workspace copy of the git common dir. MEASURED: a
+      # test that runs git recorded reads of .git-common/refs/ and
+      # .git-common/worktrees/, so a commit would have selected it
+      # (gate-fixes-4.0.1 spec, D3b).
+      if (c[1] == ".git" || c[1] == ".git-common") return ""
       for (i = 1; i <= n; i++) {
         if (c[i] == "..") return ""
         if (c[i] == "node_modules" || c[i] == ".venv") return "\001"
@@ -420,7 +443,9 @@ devbox_map_update() {
         t = m_file[i]
         if (t in done) continue
         if (have_man && !(t in man)) continue
-        fl[++nf] = "file\t" t "\t" (changed ? "-" : m_frun[t]) "\t" m_fpart[t] "\t" ids_old(m_fids[t])
+        r = changed ? "-" : m_frun[t]
+        if (mode == "resume" && (t in fout)) r = (fout[t] == "pass") ? run : "-"
+        fl[++nf] = "file\t" t "\t" r "\t" m_fpart[t] "\t" ids_old(m_fids[t])
       }
       if (!data) {
         if (m_hasstep) sl = "step\t" m_srun "\t" m_spart "\t" ids_old(m_sids) "\t" m_straced

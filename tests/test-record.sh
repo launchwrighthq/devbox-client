@@ -84,7 +84,7 @@ assert_ok "the record holds the run line, tab separated" grep -qx $'run\t'"$R1" 
 assert_eq "$R1" "$(devbox_record_find_pass test k-test)" "find_pass finds the step under its key"
 assert_eq "" "$(devbox_record_find_pass test k-other)" "and nothing under another key"
 assert_eq "" "$(devbox_record_find_pass build k-test)" "and nothing for another step"
-assert_eq "$R1 pass 0" "$(devbox_record_last_of lint)" "last_of prints run, outcome and code"
+assert_eq "$R1 pass 0" "$(devbox_record_last_of lint main)" "last_of prints run, outcome and code"
 assert_eq "$R1" "$(devbox_record_last_pass_of test)" "last_pass_of prints the run"
 out="$(bash "$RESULT")"; rc=$?
 assert_eq 0 "$rc" "devbox result exits 0"
@@ -98,7 +98,7 @@ write_record "$R1" 1000 main full 1 "step lint k-lint pass 4 0 full" \
   "step test k-test fail 30 1 full" "step typecheck k-tc fail 9 2 full" \
   "file test vitest src/a.test.ts fail" "file test vitest src/b.test.ts pass" \
   "file test vitest src/c.test.ts fail"
-assert_eq "$R1 fail 1" "$(devbox_record_last_of test)" "last_of reads the failure and its code"
+assert_eq "$R1 fail 1" "$(devbox_record_last_of test main)" "last_of reads the failure and its code"
 assert_eq "" "$(devbox_record_last_pass_of test)" "a failed step has no pass"
 assert_eq "src/a.test.ts
 src/c.test.ts" "$(devbox_record_failed_files "$R1" test)" "failed_files prints the failed files only"
@@ -126,10 +126,42 @@ write_record "$R1" 1000 main full 1 "step test k-test fail 30 1 full"
 write_record "$R2" 1001 main full 0 "step lint k-lint pass 4 0 full" "step test k-test fail 12 143 full"
 assert_eq "" "$(devbox_record_find_pass lint k-lint)" "a pass in a complete 0 record never carries"
 assert_eq "" "$(devbox_record_last_pass_of lint)" "nor counts as a pass"
-assert_eq "$R1 fail 1" "$(devbox_record_last_of test)" "last_of skips the complete 0 record"
+assert_eq "$R1 fail 1" "$(devbox_record_last_of test main)" "last_of skips the complete 0 record"
 out="$(bash "$RESULT")"
-assert_ok "devbox result prints the newest record, incomplete" \
-  contains "devbox: incomplete (run $R2 did not end every step, so it does not carry)" "$out"
+assert_ok "devbox result prints the newest record, incomplete, and claims no reason its record does not name" \
+  contains "devbox: incomplete (run $R2 does not carry)" "$out"
+
+echo "-- the verdict names the reason a record does not carry (gate fixes 4.0.1, D7)"
+# A gate whose every step ended and whose files changed while it ran once read
+# `did not end every step`, the one text of every complete 0 record.
+new_repo reasons
+for why in "files changed while it ran" "a step did not end" "stopped by SIGTERM" \
+  "cancelled by a newer gate of this checkout" "stopped by the watchdog on lan1: it ran past DEVBOX_GATE_MAX_SECONDS"; do
+  # record_text splits each argument at its spaces, and the reason is one field.
+  record_text "$R1" 1000 main full 0 "step test k-test pass 30 0 full" >"$TMP/why.record"
+  printf 'reason\t%s\n' "$why" >>"$TMP/why.record"
+  assert_eq "test pass 30s code 0 full
+devbox: incomplete (run $R1 does not carry: $why)" "$(devbox_record_summary "$TMP/why.record")" "D7: the verdict names: $why"
+done
+record_text "$R1" 1000 main full 0 >"$TMP/why.record"
+printf 'reason\tstopped by SIGINT\n' >>"$TMP/why.record"
+assert_eq "devbox: incomplete (run $R1 does not carry: stopped by SIGINT)" "$(devbox_record_summary "$TMP/why.record")" \
+  "D7: a record with no step line names its stop as well"
+
+echo "-- a passed step beside a failed file of its own is red (gate fixes 4.0.1, D1a)"
+# MEASURED: a resumed gate recorded its vitest step pass beside the step's two
+# failed files, and the verdict read green.
+new_repo passfail
+write_record "$R1" 1000 main full 1 "step lint k-lint pass 4 0 full" "step test k-test pass 30 0 full" \
+  "file test vitest src/a.test.ts fail 3" "file test vitest src/b.test.ts pass 2" "file test vitest src/c.test.ts fail 4"
+out="$(bash "$RESULT")"
+assert_fail "D1a: the verdict is never green" contains "devbox: green" "$out"
+assert_ok "D1a: it is red, and names the step and its failed files" \
+  contains "devbox: red (test passed with 2 failed files)" "$out"
+assert_eq "test" "$(bash "$RESULT" --failed-steps)" "D1a: --failed-steps names the step"
+write_record "$R2" 1001 main partial 1 "step test k-test pass 30 0 full" "file test vitest src/a.test.ts fail 3"
+assert_ok "D1a: a partial record with such a step is red as well" \
+  contains "devbox: red (test passed with 1 failed files)" "$(bash "$RESULT")"
 
 echo "-- files changed while the gate ran (D10a, record half)"
 new_repo changed
@@ -166,9 +198,18 @@ write_record "$R1" 1000 main full 1 "step lint k1 pass 1 0 full"
 write_record "$R2" 2000 side full 1 "step lint k2 fail 2 1 full"
 out="$(bash "$RESULT")"
 assert_ok "on main, main's record answers though another branch's is newer" contains "lint pass 1s" "$out"
+assert_eq "main" "$(devbox_record_branch)" "the branch reads as a record names it"
+assert_eq "$R1 pass 0" "$(devbox_record_last_of lint main)" \
+  "last_of answers with this branch's result though another branch's is newer"
+assert_eq "$R2 fail 1" "$(devbox_record_last_of lint side)" "and the other branch's with its own name"
 git checkout -q -b fresh
 out="$(bash "$RESULT")"
 assert_ok "a branch with no record gets the newest of any branch" contains "lint fail 2s" "$out"
+assert_eq "" "$(devbox_record_last_of lint fresh)" "but last_of answers a branch with no record with nothing"
+write_record "$R3" 3000 - full 1 "step lint k3 fail 3 1 full"
+git checkout -q --detach
+assert_eq "-" "$(devbox_record_branch)" "a detached HEAD reads as -"
+assert_eq "" "$(devbox_record_last_of lint -)" "and last_of never answers it, since every detached checkout writes -"
 
 echo "-- devbox result --log"
 new_repo log
@@ -193,6 +234,68 @@ test line one" "$(bash "$RESULT" --log test)" "--log test stops at the runner's 
 bash "$RESULT" --log build >/dev/null 2>"$TMP/err"; rc=$?
 assert_eq 1 "$rc" "--log of a step with no section exits 1"
 assert_ok "with a line that names the step" grep -q "no section for step build" "$TMP/err"
+
+echo "-- devbox result --log reads the headers of its run (gate fixes 4.0.1, D8)"
+# MEASURED: a step whose own output printed `== check: one` got a log of 2
+# lines, and the log of the last failed step carried every trace chunk.
+new_repo log-run
+write_record "$R1" 1000 main full 1 "step web k1 fail 9 1 full" "step py:unit k2 fail 4 1 full"
+dir="$(devbox_record_dir)"
+cat >"$dir/$R1.log" <<LOG
+[12 s] web failed (9 s); running: py:unit
+devbox-steps: untraced py:unit it runs a program strace cannot follow
+devbox-steps: summary
+  web  fail     9 s  code 1
+  py:unit    fail     4 s  code 1
+== web: /home/dev/.devbox/logs/$R1/web.log
+devbox-steps: tools/check.sh --only one,two
+== check: one
+== py:unit: /home/dev/.devbox/logs/other/py:unit.log
+== check: one passed
+== check: two FAILED
+== py:unit: /home/dev/.devbox/logs/$R1/py:unit.log
+devbox-steps: uv run pytest -p devbox_ledger -n 1
+FAILED tests/test_a.py::test_one
+devbox-steps: trace py:unit 1 ZmFrZS10cmFjZS0x
+devbox-steps: trace py:unit 2 ZmFrZS10cmFjZS0y
+devbox-steps: result web fail 9 1
+devbox-steps: result py:unit fail 4 1
+LOG
+assert_eq "== web: /home/dev/.devbox/logs/$R1/web.log
+devbox-steps: tools/check.sh --only one,two
+== check: one
+== py:unit: /home/dev/.devbox/logs/other/py:unit.log
+== check: one passed
+== check: two FAILED" "$(bash "$RESULT" --log web)" \
+  "D8: --log prints the whole section, through lines that start with == and a header of no run of this record"
+assert_eq "== py:unit: /home/dev/.devbox/logs/$R1/py:unit.log
+devbox-steps: uv run pytest -p devbox_ledger -n 1
+FAILED tests/test_a.py::test_one" "$(bash "$RESULT" --log py:unit)" \
+  "D8: the last section drops the trace chunks and the result lines"
+
+# A gate with one running step streams it, header first, before the summary.
+# Its own output may print a summary line of a runner it starts.
+write_record "$R2" 2000 main full 1 "step test k3 fail 5 1 full"
+cat >"$dir/$R2.log" <<LOG
+[0 s] test started
+== test: /home/dev/.devbox/logs/$R2/test.log
+test line one
+devbox-steps: summary
+  inner  pass  0 s  code 0
+test line two
+[5 s] test failed (5 s, code 1); running: nothing
+devbox-steps: summary
+  test  fail      5 s  code 1
+devbox-steps: trace test 1 ZmFrZS10cmFjZS0x
+devbox-steps: result test fail 5 1
+LOG
+assert_eq "== test: /home/dev/.devbox/logs/$R2/test.log
+test line one
+devbox-steps: summary
+  inner  pass  0 s  code 0
+test line two
+[5 s] test failed (5 s, code 1); running: nothing" "$(bash "$RESULT" --log test)" \
+  "D8: a streamed section ends at the runner's own summary, and keeps a summary line of its own output"
 
 echo "-- devbox result with no record, and its usage"
 new_repo empty
@@ -262,7 +365,7 @@ write_record "$R2" 200 main partial 1 "step test kshard pass 3 0 shard" \
 assert_eq "$R1" "$(devbox_record_find_pass test kfull)" "a full pass answers its key"
 assert_eq "" "$(devbox_record_find_pass test kshard)" "a shard's pass does not"
 assert_eq "$R1" "$(devbox_record_last_pass_of test)" "nor is it the last pass"
-assert_eq "$R1 pass 0" "$(devbox_record_last_of test)" "nor the last result"
+assert_eq "$R1 pass 0" "$(devbox_record_last_of test main)" "nor the last result"
 assert_eq "c.test.ts" "$(devbox_record_failed_files "$R2" test)" "a sixth field leaves the failed files readable"
 assert_eq "a.test.ts	30
 c.test.ts	4" "$(devbox_record_durations test)" \

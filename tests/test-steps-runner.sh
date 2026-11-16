@@ -55,6 +55,7 @@ cat >"$BIN/vitest" <<'STUB'
 #!/bin/bash
 { printf '%s\n' "$@"; echo --end--; } >>"$ARGV_LOG"
 printf 'vitest pwd=%s workers=%s\n' "$PWD" "${DEVBOX_WORKERS-}" >>"$ENV_LOG"
+exit "${STUB_RC:-0}"
 STUB
 cat >"$BIN/pytest" <<'STUB'
 #!/bin/bash
@@ -296,6 +297,68 @@ run_steps vitest-allpassed "$TMP/vitest-tests.plan" DEVBOX_LEDGER="$L" DEVBOX_LE
 assert_eq "0" "$RC" "a resumed step whose every file passed exits 0: $ERR"
 assert_ok "a resumed step whose every file passed prints its result as resumed" grep -qx 'devbox-steps: result unit resumed 0 0' <<<"$OUT"
 assert_eq "" "$(cat "$ARGV_LOG")" "a resumed step whose every file passed never starts its runner, which would run the whole suite"
+
+# ── gate fixes 4.0.1, row D1: a resume owes what its own ledger left ─────────
+#
+# MEASURED: a stopped gate's vitest step failed two files. Its resume was
+# planned again, and the plan narrowed the step to the failed files of
+# another branch's newer record. Every file on that list had passed in this
+# gate, so the step resumed as passed, and the gate read green while its own
+# two failed files never ran again.
+{
+  plan_step unit narrow vitest - 'npx vitest run'
+  plan_file unit src/c.test.ts
+  plan_file unit src/d.test.ts
+  for f in src/a.test.ts src/b.test.ts src/c.test.ts src/d.test.ts src/e.test.ts; do plan_test unit "$f"; done
+} >"$TMP/owed-narrow.plan"
+L="$TMP/owed-narrow.ledger"
+new_ledger "$L"
+printf '%s\n' $'step\tunit\tstart' \
+  $'file\tvitest\tsrc/a.test.ts\tstart' $'file\tvitest\tsrc/a.test.ts\tfail\t1' \
+  $'file\tvitest\tsrc/b.test.ts\tstart' $'file\tvitest\tsrc/b.test.ts\tfail\t1' \
+  $'file\tvitest\tsrc/c.test.ts\tpass\t1' $'file\tvitest\tsrc/d.test.ts\tpass\t1' \
+  $'file\tvitest\tsrc/e.test.ts\tstart' $'step\tunit\tfail\t9' >>"$L"
+: >"$ARGV_LOG"
+run_steps owed-narrow "$TMP/owed-narrow.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=1 STUB_RC=1
+assert_eq "$(printf '%s\n' run "${REP[@]}" --maxWorkers=3 src/a.test.ts src/b.test.ts src/e.test.ts)" "$(argv_call 1)" \
+  "D1: a resumed narrow step runs its test lines less its passed files, never the narrow list a record gave"
+assert_ok "D1: and its result is the run's, never resumed" grep -qE '^devbox-steps: result unit fail [0-9]+ 1$' <<<"$OUT"
+assert_eq "1" "$RC" "D1: the resumed gate fails"
+
+{
+  plan_step unit select vitest - 'npx vitest run'
+  plan_file unit src/c.test.ts
+  for f in src/a.test.ts src/b.test.ts src/c.test.ts src/d.test.ts; do plan_test unit "$f"; done
+  plan_step other select pytest unit 'pytest -q'
+  plan_file other tests/test_x.py
+  plan_test other tests/test_x.py
+  plan_test other tests/test_y.py
+} >"$TMP/owed-select.plan"
+L="$TMP/owed-select.ledger"
+new_ledger "$L"
+printf '%s\n' $'step\tunit\tstart' \
+  $'file\tvitest\tsrc/a.test.ts\tstart' $'file\tvitest\tsrc/a.test.ts\tfail\t1' \
+  $'file\tvitest\tsrc/b.test.ts\tstart' $'file\tvitest\tsrc/c.test.ts\tpass\t1' \
+  $'file\tvitest\tsrc/z.test.ts\tfail\t1' $'file\tpytest\ttests/test_y.py\tfail\t1' >>"$L"
+: >"$ARGV_LOG"
+run_steps owed-select "$TMP/owed-select.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=1
+assert_eq "$(printf '%s\n' run "${REP[@]}" --maxWorkers=2 src/a.test.ts src/b.test.ts)" "$(argv_call 1)" \
+  "D1: a resumed select step adds its own failed and open files to its selection, and no file of another step"
+assert_eq "$(printf '%s\n' -q -p devbox_ledger tests/test_x.py tests/test_y.py)" "$(argv_call 2)" \
+  "D1: a pytest select step adds its own failed file the same way"
+
+L="$TMP/owed-stepfail.ledger"
+new_ledger "$L"
+printf '%s\n' $'step\tunit\tstart' >>"$L"
+for f in 'app/[id]/page.test.ts' src/a.test.ts 'src/b c.test.ts' src/d.test.ts src/e.test.ts; do
+  printf 'file\tvitest\t%s\tpass\t1\n' "$f" >>"$L"
+done
+printf 'step\tunit\tfail\t9\n' >>"$L"
+: >"$ARGV_LOG"
+run_steps owed-stepfail "$TMP/vitest-tests.plan" DEVBOX_LEDGER="$L" DEVBOX_LEDGER_TOOLS="$TOOLS" DEVBOX_RESUME=1
+assert_fail "D1: a step that failed while every file passed is not resumed as passed" grep -q 'devbox-steps: result unit resumed' <<<"$OUT"
+assert_eq "$(printf '%s\n' run --project api "${REP[@]}" --maxWorkers=4 'app/[id]/page.test.ts' src/a.test.ts 'src/b c.test.ts' src/d.test.ts src/e.test.ts)" \
+  "$(argv_call 1)" "D1: it runs every file of its list again"
 
 {
   plan_step unit select vitest - 'npx vitest run'
@@ -600,6 +663,36 @@ refused "a file that starts with -" 3 'starts with -' "$(plan_step x narrow vite
 refused "a test file that starts with -" 3 'starts with -' "$(plan_step x run vitest - 'npx vitest run'; plan_test x -x)"
 refused "a file outside the dir of its step" 3 'is outside service/' "$(plan_step x narrow pytest - pytest service/; plan_file x tests/test_a.py)"
 refused "a line of another kind" 2 'starts with step, file or test' 'hello'
+
+# ── a streamed step whose log fills up ───────────────────────────────────────
+#
+# A strace log filled a CI runner's tmpfs, and with pipefail tee's ENOSPC
+# failed a streamed step whose command passed. Here a 1 KiB file size limit
+# fills the log: the runner's first lines fit, and tee's write of the 4 KiB of
+# output fails with EFBIG. SIGXFSZ is ignored, so tee gets the error as it got
+# ENOSPC on that runner, and is not killed.
+
+# full_log_run <case> <exit code>: one streamed step that prints 4 KiB, then
+# "solo output", then exits with that code, under the limit.
+full_log_run() {
+  plan_step solo run - - "head -c 4096 /dev/zero | tr -c x x; echo; echo solo output; exit $2" >"$TMP/$1.plan"
+  LOGS="$TMP/logs-$1"
+  RC=0
+  OUT="$(cd "$PROJ" && trap '' XFSZ && ulimit -f 1 && env PATH="$BIN:$PATH" DEVBOX_TOKENS=4 \
+    DEVBOX_CGROUP_ROOT="$CGROUP" DEVBOX_STEPS_PLAN="$TMP/$1.plan" DEVBOX_STEPS_LOGS="$LOGS" "$STEPS" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+
+full_log_run full-pass 0
+assert_eq "0" "$RC" "a streamed step that passes passes when its log fills up"
+assert_ok "and its result line is pass" grep -Eq '^devbox-steps: result solo pass [0-9]+ 0$' <<<"$OUT"
+assert_ok "and its output streams past the full log" grep -qxF "solo output" <<<"$OUT"
+assert_ok "and the runner names the log it could not write" \
+  grep -qxF "devbox-steps: could not write all of the log $LOGS/solo.log" <<<"$ERR"
+
+full_log_run full-fail 3
+assert_eq "1" "$RC" "a streamed step that fails still fails when its log fills up"
+assert_ok "and its result line keeps the command's code" grep -Eq '^devbox-steps: result solo fail [0-9]+ 3$' <<<"$OUT"
 
 run_steps no-plan "$TMP/does-not-exist.plan"
 assert_eq "2" "$RC" "a plan file that does not exist is refused with exit 2"

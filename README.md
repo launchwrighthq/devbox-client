@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.0.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.1.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.0.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.0.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.0.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.1.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -72,8 +72,22 @@ line before the target choice and go on:
 
 A pin they cannot read prints nothing. The line never stops a run.
 
-A CI runner does not need the client. Put it in a dependency group that CI does not install.
-Without a `.devbox.env`, `devbox verify` runs the gate locally, and CI never has that file.
+**CI.** This repository serves a reusable workflow that installs the client from the same
+pin, the toolchain and the dependencies, caches the setup, and runs one job per step of
+`.devbox/steps`. A project's CI is one job:
+
+```yaml
+jobs:
+  gate:
+    uses: launchwrighthq/devbox-client/.github/workflows/gate.yml@v4
+    secrets: inherit
+```
+
+`v4` is a branch that each 4.x release moves. The workflow names no client version: it
+installs the one `package.json` or `pyproject.toml` pins, and fails when that pin's major is
+not 4. Its inputs are `client-from`, `prepare`, `runs-on`, `runners`, `skip-steps` and
+`timeout-minutes`; `.github/workflows/gate.yml` describes each. Without a `.devbox.env`,
+`devbox verify` runs the gate locally, and CI never has that file.
 
 ## The gate guard
 
@@ -221,7 +235,10 @@ version, `.devbox/config.env`, the step's line, the forwarded variables,
 `DEVBOX_SHARED_INPUTS` and the content of the step's inputs. When every step carries,
 `devbox verify` prints green and asks no host. A broken line exits 2 before any target is
 asked. The last line of a run is `devbox: green (...)` or `devbox: red (...)`, and the exit
-code is the code of the first failed step in plan order.
+code is the code of the first failed step in plan order. A gate whose record does not carry ends
+in `devbox: incomplete (run <run-id> does not carry: <reason>)`, such as `files changed while it
+ran` or `stopped by SIGTERM`. A step that passed while a test file of it failed makes the verdict
+red, and `devbox verify` exits 1.
 
 **What a step reads.** A step without `inputs=` learns its inputs from `strace -f`. The runner
 traces it when it has no valid trace, when its line, `.devbox/config.env` or the client version
@@ -247,8 +264,9 @@ that test file. A test file is partial, because its trace may miss reads, when:
 - it starts another program, such as `bash` or `git`, that may read repository files;
 - under vitest's `isolate: false`, it may reach a live Worker that an earlier test file started.
 
-A partial file runs whenever an input of its step changed. One partial file also makes its step
-key every synced file, so any synced edit runs the step instead of carrying it.
+A partial file runs whenever an input of its step changed. Its reads still count among the
+step's inputs, so an edit no test of the step read carries the step. `sh -c` of one plain
+command marks nothing partial.
 
 **Workers.** Every step gets `DEVBOX_WORKERS=<n>`. A vitest step gets `--maxWorkers=<n>`, plus `--minWorkers=1` on vitest 2 and 3, and a
 pytest step `-n <n>` when pytest-xdist loads. `<n>` is the grant (`DEVBOX_TOKENS`, or the
@@ -267,7 +285,9 @@ step without `dir=` counting as the checkout root. `devbox result` prints the ne
 cancels the older gate of the same worktree, which exits 14; `devbox cancel` does the same by
 hand. A gate stopped by any other SIGTERM exits 143. With `DEVBOX_SETUP_INPUTS`, the workspace
 skips the setup when the setup text and those files did not change since the last setup that
-passed there.
+passed there. When the setup runs, its first line names why, such as each input that changed.
+Name a setup script in `DEVBOX_SETUP_INPUTS` when a change to it must run the setup. A seed
+copies `/home/dev` alone, so put system packages in the image, not in the setup.
 
 **CI.** `devbox ci matrix` prints `{"include":[{"step":"lint","shard":"1/1"},...]}` from
 `.devbox/steps`, one entry per step and shard. A job runs
@@ -305,8 +325,9 @@ ledger of a resumable gate.
 
 A gate keeps a ledger of the steps and test files that finished. When the watchdog stops it
 (exit 10), the memory cap kills it (exit 7) or the client dies before it returns, `devbox verify`
-resumes it with only the units that had not passed, up to `DEVBOX_MAX_RESUMES` times. A gate that
-returned a failure is not resumed. A ledger is valid only for the exact files the sync sends,
+resumes it with only the units that had not passed, up to `DEVBOX_MAX_RESUMES` times. A resume
+reruns every test file that failed or was still running in its own ledger, never what another
+branch's record says. A gate that returned a failure is not resumed. A ledger is valid only for the exact files the sync sends,
 `.devbox/config.env`, the forwarded variables and the client version. `devbox verify --fresh`
 ignores it.
 

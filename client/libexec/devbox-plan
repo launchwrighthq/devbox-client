@@ -188,9 +188,9 @@ _devbox_plan_shared_of() {
 
 # Print the setup key of the manifest $1: the hash of the lines of the files
 # the setup installs from. DEVBOX_SETUP_INPUTS names them; without it, every
-# package-lock.json and uv.lock, the two lock files whose outputs, node_modules/
-# and .venv/, the hooks script knows. The setup command itself is in
-# .devbox/config.env, which every key holds.
+# package-lock.json, uv.lock, pnpm-lock.yaml and yarn.lock, the four lock files
+# whose outputs, node_modules/ and .venv/, the hooks script knows. The setup
+# command itself is in .devbox/config.env, which every key holds.
 _devbox_plan_setup_key() {
   local -a paths
   local sum
@@ -200,7 +200,7 @@ _devbox_plan_setup_key() {
     if [ "${#paths[@]}" -gt 0 ]; then
       _devbox_plan_match "$1" "$(printf '%s\n' "${paths[@]}" | sed 's/[][*?\\]/\\&/g')"
     else
-      awk "$_DEVBOX_PLAN_AWK_PATH"'{ p = path_of($0); n = split(p, c, "/"); if (c[n] == "package-lock.json" || c[n] == "uv.lock") print }' "$1"
+      awk "$_DEVBOX_PLAN_AWK_PATH"'{ p = path_of($0); n = split(p, c, "/"); if (c[n] == "package-lock.json" || c[n] == "uv.lock" || c[n] == "pnpm-lock.yaml" || c[n] == "yarn.lock") print }' "$1"
     fi
   } | sha256sum)" || return 1
   printf '%s\n' "${sum%% *}"
@@ -309,11 +309,12 @@ devbox_plan_rekey() {
 # <record file>. Name only the steps that ran in this gate and asked for a
 # trace. A step whose trace is missing marks its map untraced and keeps its
 # earlier inputs. With DEVBOX_PLAN_RESUMED=1 the gate resumed a stopped one,
-# so a `run` step ran only the files the stop left, and its trace merges as a
-# part run: a test file that passed before the stop would otherwise read as
-# one the step never runs. The caller writes <record file> again afterwards. A
-# map that cannot be written names itself and changes no result: the gate's
-# result is the gate's.
+# so a step ran only the files the stop left, and its trace merges as the
+# part run `resume`: a test file that passed before the stop would otherwise
+# read as one the step never runs, and it keeps its reads and takes this run
+# id (gate-fixes-4.0.1 spec, D4). The caller writes <record file> again
+# afterwards. A map that cannot be written names itself and changes no result:
+# the gate's result is the gate's.
 devbox_plan_learn() {
   local run="$1" manifest="$2" tdir="$3" rec="$4" step mode trace key
   shift 4
@@ -321,7 +322,7 @@ devbox_plan_learn() {
     mode="${PLAN_ACTION[$step]-}"
     [ "${PLAN_TRACE[$step]-0}" = 1 ] || continue
     case "$mode" in run|select|narrow) ;; *) continue ;; esac
-    [ "$mode" != run ] || [ "${DEVBOX_PLAN_RESUMED:-0}" != 1 ] || mode=select
+    [ "${DEVBOX_PLAN_RESUMED:-0}" != 1 ] || mode=resume
     trace="$tdir/$step.trace"
     if [ ! -r "$trace" ]; then
       trace="$tdir/.$step.none"
@@ -482,12 +483,21 @@ _devbox_plan_shard() {
 # with at least one failed file and no open one. The files are the failed
 # files that still exist, then every test file of the runner that changed
 # since that record. That record's manifest is required, because without it
-# the changed test files are unknown. Returns 0 to narrow, 1 not to.
+# the changed test files are unknown. The newest result is this branch's
+# alone (devbox_record_last_of): with none, _plan_narrow_why says so. Returns
+# 0 to narrow, 1 not to.
 _devbox_plan_narrow() {
   local step="$1" manifest="$2" last run outcome code failed f dir changed paths names tests="" kept="" nf=0 nt=0
   [ "${STEP_NARROW[$step]-}" = failed ] && [ -n "${STEP_RUNNER[$step]-}" ] || return 1
-  last="$(devbox_record_last_of "$step")" || return 1
-  [ -n "$last" ] || return 1
+  last="$(devbox_record_last_of "$step" "$_plan_branch")" || return 1
+  if [ -z "$last" ]; then
+    if [ "$_plan_branch" = - ]; then
+      _plan_narrow_why="a detached HEAD has no record of its own to narrow by"
+    else
+      _plan_narrow_why="no record of branch $_plan_branch to narrow by"
+    fi
+    return 1
+  fi
   read -r run outcome code <<<"$last"
   [ "$outcome" = fail ] && [ "$code" = 1 ] || return 1
   failed="$(_devbox_plan_failed_files "$run" "$step")" || return 1
@@ -526,7 +536,9 @@ _devbox_plan_narrow() {
 # its reason. Selection needs a map that reads, written under this run's base
 # and setup key, and a newest result that passed or failed in its test files
 # alone: a crash or a stop leaves files that never ran and that no reason
-# would select. Returns 0 to select, 10 when no file is selected, which
+# would select. That result is this branch's newest (devbox_record_last_of);
+# with none, the map's own passes decide, because each one names the tree it
+# passed on. Returns 0 to select, 10 when no file is selected, which
 # carries the step with the reason `no test read a changed file` (D3), and 1
 # not to select, with _plan_why set to why.
 _devbox_plan_select() {
@@ -539,7 +551,7 @@ _devbox_plan_select() {
       echo "devbox verify: the map of step $step could not be read, so the step runs in full" >&2
       _plan_why="its map could not be read"; return 1 ;;
   esac
-  last="$(devbox_record_last_of "$step")" || return 2
+  last="$(devbox_record_last_of "$step" "$_plan_branch")" || return 2
   if [ -n "$last" ]; then
     read -r run outcome code <<<"$last"
     if [ "$outcome" = fail ]; then
@@ -595,7 +607,7 @@ _devbox_plan_select() {
 # Set _plan_reason for step $1 that runs in full under DEVBOX_RERUN=changed.
 _devbox_plan_run_reason() {
   local step="$1" manifest="$2" last run outcome code dir shared changed
-  last="$(devbox_record_last_of "$step")" || return 1
+  last="$(devbox_record_last_of "$step" "$_plan_branch")" || return 1
   if [ -n "$last" ]; then
     read -r run outcome code <<<"$last"
     if [ "$outcome" = fail ]; then
@@ -647,7 +659,7 @@ _devbox_plan_run_reason() {
 # it could not read would carry a pass written under other inputs.
 devbox_plan_build() {
   local rerun="$1" manifest="$2" step var action key run after a b64 f mode trace rc
-  local _plan_version _plan_config _plan_forward _plan_files _plan_reason _plan_why _plan_tests _plan_new _plan_shard
+  local _plan_version _plan_config _plan_forward _plan_files _plan_reason _plan_why _plan_tests _plan_new _plan_shard _plan_branch _plan_narrow_why
   local shard_step="" shard_i="" shard_n=""
   local -a steps afters step_lines=() file_lines=() test_lines=()
   local -A _plan_freason=() _plan_mapfiles=()
@@ -690,6 +702,7 @@ devbox_plan_build() {
   _plan_config="$(cat -- "${DEVBOX_CONFIG:?devbox-plan needs DEVBOX_CONFIG}")" \
     || { echo "devbox verify: could not read $DEVBOX_CONFIG, so no plan was made" >&2; return 1; }
   _plan_forward="$(_devbox_plan_forward)" || return 1
+  _plan_branch="$(devbox_record_branch)"
 
   declare -ga PLAN_STEPS=("${steps[@]}")
   declare -gA PLAN_ACTION=() PLAN_MODE=() PLAN_TRACE=() PLAN_NFILES=() PLAN_REASON=() PLAN_FREASON=() \
@@ -704,7 +717,7 @@ devbox_plan_build() {
     _devbox_plan_learn "$step"
     key="$(_devbox_plan_key "$manifest" "$step")" \
       || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
-    _plan_files="" _plan_reason="" _plan_why="" _plan_tests="" _plan_new="" mode=full
+    _plan_files="" _plan_reason="" _plan_why="" _plan_tests="" _plan_new="" _plan_narrow_why="" mode=full
     unset _plan_shard
     _plan_freason=()
     if [ -n "${STEP_RUNNER[$step]-}" ]; then
@@ -738,6 +751,7 @@ devbox_plan_build() {
         _devbox_plan_run_reason "$step" "$manifest" \
           || { echo "devbox verify: could not read the records, so no plan was made" >&2; return 1; }
         case "$_plan_reason" in "no earlier pass"|"failed in run "*) ;; *) [ -z "$_plan_why" ] || _plan_reason+="; $_plan_why" ;; esac
+        [ -z "$_plan_narrow_why" ] || _plan_reason+="; $_plan_narrow_why"
       fi
     fi
     if [ "$action" = run ] && [ -z "${STEP_INPUTS[$step]-}" ] && f="$(devbox_map_untraced "$step")" && [ -n "$f" ]; then

@@ -106,14 +106,14 @@ reason_of() { printf '%s' "${PLAN_REASON[$1]}"; }
 # Write the record of the gate that ran the plan in $P over the manifest $M.
 # A step whose plan is carry is `carried`, any other passes, unless an argument
 # `<step>=<outcome>:<code>` says otherwise. An argument
-# `file=<step>:<runner>:<path>:<outcome>` adds a file line. GATE_COMPLETE and
-# GATE_SCOPE set the header. Sets LAST_RUN.
+# `file=<step>:<runner>:<path>:<outcome>` adds a file line. GATE_COMPLETE,
+# GATE_SCOPE and GATE_BRANCH set the header. Sets LAST_RUN.
 gate() {
   local run kind name action key outcome code mode o v s r p oc
   SEQ=$((SEQ + 1)) AT=$((AT + 1))
   run="0123456789abcdef.$SEQ"
   {
-    printf 'run\t%s\nat\t%s\nclient\t3.3.0\nbranch\tmain\ncommit\t-\ntarget\tlan1\n' "$run" "$AT"
+    printf 'run\t%s\nat\t%s\nclient\t3.3.0\nbranch\t%s\ncommit\t-\ntarget\tlan1\n' "$run" "$AT" "${GATE_BRANCH:-main}"
     printf 'scope\t%s\ncomplete\t%s\n' "${GATE_SCOPE:-full}" "${GATE_COMPLETE:-1}"
     while IFS=$'\t' read -r kind name action key _; do
       [ "$kind" = step ] || continue
@@ -321,6 +321,29 @@ assert_eq "test=run" "$(actions)" "a failure with no failed file runs in full"
 GATE_COMPLETE=0 gate test=fail:1 file=test:pytest:apps/worker/tests/test_a.py:fail
 plan changed
 assert_eq "test=run" "$(actions)" "a complete 0 failure is never the last result"
+
+echo "-- gate fixes 4.0.1: a narrow reads this branch's record alone"
+# A narrow runs a step's failed files only, and trusts the record it reads for
+# every other file. MEASURED: a resume narrowed by another branch's newer
+# record read green without running this branch's own failed files (D1). A
+# fresh gate narrowed by another branch's record has the same hole.
+new_repo d6-branch
+no_steps
+add_step test "apps/worker/" runner=pytest narrow=failed
+plan changed
+GATE_BRANCH=other gate test=fail:1 \
+  file=test:pytest:apps/worker/tests/test_a.py:fail file=test:pytest:apps/worker/tests/test_b.py:fail
+other_run="$LAST_RUN"
+plan changed
+assert_eq "test=run" "$(actions)" "a newer failure of another branch, and none of this one: the narrow step runs in full"
+assert_eq "" "$(files_of test)" "with no file line"
+assert_ok "and the reason names why it did not narrow" contains "no record of branch main to narrow by" "$(reason_of test)"
+assert_fail "the reason names no run of another branch" contains "$other_run" "$(reason_of test)"
+gate test=fail:1 file=test:pytest:apps/worker/tests/test_c.py:fail
+GATE_BRANCH=other gate test=fail:1 file=test:pytest:apps/worker/tests/test_a.py:fail
+plan changed
+assert_eq "test=narrow" "$(actions)" "with a failure of this branch, the step narrows"
+assert_eq "apps/worker/tests/test_c.py" "$(files_of test)" "to this branch's failed file, though another branch's record is newer"
 
 echo "-- the plan never says related"
 new_repo norelated

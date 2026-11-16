@@ -207,19 +207,24 @@ assert_fail "D7: never that it was stopped by SIGTERM" contains "stopped by SIGT
 assert_ok "D7: the cancel verb named the first gate's run on lan1" grep -qE " $A_LAN1 cancel ${LANES[0]} [0-9a-f]+ $RUN_PREFIX\.$first_pid$" "$HOLD_LOG"
 first_rec="$RECORDS/$RUN_PREFIX.$first_pid.record"
 assert_eq "0" "$(field "$first_rec" complete)" "D10: the cancelled gate's record is complete 0"
+assert_eq "cancelled by a newer gate of this checkout" "$(field "$first_rec" reason)" \
+  "D7 (gate fixes 4.0.1): the record names the cancel as the reason it does not carry"
 assert_fail "D7: the second gate's marker went with it" test -e "$MARKER"
 
 # ═══ D7a: a SIGTERM from anything else exits 143 ══════════════════════════════
 reset
 start_hung_gate term --target lan1 --full
 # The client's own pid, from its marker: BG is the subshell that waits for it.
-kill -TERM "$(awk '{ print $1 }' "$MARKER")"
+term_pid="$(awk '{ print $1 }' "$MARKER")"
+kill -TERM "$term_pid"
 term_rc="$(wait_code term)"
 term_out="$(cat "$TMP/term.out")"
 kill_hang
 assert_eq "143" "$term_rc" "D7a: a TERM from outside exits 143"
 assert_ok "D7a: with stopped by SIGTERM" contains "devbox verify: stopped by SIGTERM" "$term_out"
 assert_fail "D7a: and never claims a newer gate" contains "cancelled by a newer gate" "$term_out"
+assert_eq "stopped by SIGTERM" "$(field "$RECORDS/$RUN_PREFIX.$term_pid.record" reason)" \
+  "D7 (gate fixes 4.0.1): the record names the TERM as the reason it does not carry"
 assert_fail "D7a: its marker went with it" test -e "$MARKER"
 
 # A gate on this laptop runs as a background job of the client, so the TERM

@@ -75,8 +75,8 @@ devbox_kv_parse() {
 DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_REQUIRES \
 DEVBOX_FORWARD_ENV DEVBOX_RUNPOD_IMAGE \
 DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
-DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS DEVBOX_LOCAL_GATE \
-DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_WORKER_MEMORY "
+DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SETUP_OUTPUTS DEVBOX_SHARED_INPUTS \
+DEVBOX_LOCAL_GATE DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_WORKER_MEMORY "
 
 # The replacement of each key that release 4.0 removed from .devbox/config.env
 # (docs/specs/2026-11-14-learned-selection-design.md, section 11). Each is
@@ -94,17 +94,24 @@ devbox_config_removed_key() {
   esac
 }
 
-# A path of DEVBOX_SETUP_INPUTS or DEVBOX_SHARED_INPUTS, relative to the
-# checkout root. The laptop hashes each one, and the steps hand them to other
-# tools, so a path that leaves the checkout, starts with a dash, or holds a
-# glob, a quote or a space is refused here, once, before anything reads it.
+# A path of DEVBOX_SETUP_INPUTS, DEVBOX_SETUP_OUTPUTS or DEVBOX_SHARED_INPUTS,
+# relative to the checkout root. The laptop hashes each one, and the steps hand
+# them to other tools, so a path that leaves the checkout, starts with a dash,
+# or holds a glob, a quote or a space is refused here, once, before anything
+# reads it. A DEVBOX_SETUP_OUTPUTS path may also start with `~/`: a setup that
+# fills a browser or a download cache writes it under the home directory.
+# `devbox ci cache` prints each path as written, so no path may hold a
+# character that needs a JSON escape.
 devbox_config_paths_ok() {
-  local key="$1" value="$2" file="$3" path
+  local key="$1" value="$2" file="$3" path rel home=""
   local -a paths=()
+  [ "$key" != DEVBOX_SETUP_OUTPUTS ] || home=" or to '~/'"
   read -r -a paths <<<"$value"
   for path in ${paths[@]+"${paths[@]}"}; do
-    if [[ ! "$path" =~ ^[A-Za-z0-9._+@][A-Za-z0-9._+@/-]*$ ]] || [[ "/$path/" == */../* ]]; then
-      echo "devbox: $file: refusing $key '$path': write paths relative to the checkout root, separated by spaces, with no '..', no leading '/' or '-', and only letters, digits and . _ + @ / -" >&2
+    rel="$path"
+    [ -z "$home" ] || rel="${path#\~/}"
+    if [[ ! "$rel" =~ ^[A-Za-z0-9._+@][A-Za-z0-9._+@/-]*$ ]] || [[ "/$rel/" == */../* ]]; then
+      echo "devbox: $file: refusing $key '$path': write paths relative to the checkout root$home, separated by spaces, with no '..', no leading '/' or '-', and only letters, digits and . _ + @ / -" >&2
       return 2
     fi
   done
@@ -184,11 +191,13 @@ devbox_config_parse() {
       esac ;;
     *) DEVBOX_RERUN_CONFIG="" ;;
   esac
-  # The two input lists and the local gate rule come from the committed file
+  # The three path lists and the local gate rule come from the committed file
   # alone, as DEVBOX_LANES does: an exported DEVBOX_SETUP_INPUTS would skip a
-  # setup the project's lock files say must run, and an exported
-  # DEVBOX_LOCAL_GATE would run a gate on a laptop the project refused (D11).
-  for key in DEVBOX_SETUP_INPUTS DEVBOX_SHARED_INPUTS; do
+  # setup the project's lock files say must run, an exported
+  # DEVBOX_SETUP_OUTPUTS would let a CI cache restore a skip record without
+  # the outputs the setup makes, and an exported DEVBOX_LOCAL_GATE would run a
+  # gate on a laptop the project refused (D11).
+  for key in DEVBOX_SETUP_INPUTS DEVBOX_SETUP_OUTPUTS DEVBOX_SHARED_INPUTS; do
     case "$DEVBOX_KV_SEEN" in
       *" $key "*) devbox_config_paths_ok "$key" "${!key}" "$file" || return 2 ;;
       *) printf -v "$key" '%s' "" ;;
@@ -342,15 +351,17 @@ devbox_local_gate_allowed() {
   return 1
 }
 
-# Print the lock files the default setup installs, one per line: each uv.lock
-# and package-lock.json that git tracks in the checkout in $PWD, outside
-# node_modules/ and .venv/. These are the two lock files whose outputs, .venv/
-# and node_modules/ beside them, the setup skip and the plan's setup key
-# already know. A tracked file is a file the sync sends unless an exclude rule
-# holds it back, and the hooks skip a lock file that did not arrive.
+# Print the lock files the default setup installs, one per line: each uv.lock,
+# package-lock.json, pnpm-lock.yaml and yarn.lock that git tracks in the
+# checkout in $PWD, outside node_modules/ and .venv/. The setup skip, the plan's
+# setup key and `devbox ci cache` know their outputs: .venv/ beside a uv.lock,
+# node_modules/ beside the other three. A tracked file is a file the sync sends
+# unless an exclude rule holds it back, and the hooks skip a lock file that did
+# not arrive.
 devbox_lock_files() {
   local out path
-  out="$(git ls-files -- ':(glob)**/uv.lock' ':(glob)**/package-lock.json')" || {
+  out="$(git ls-files -- ':(glob)**/uv.lock' ':(glob)**/package-lock.json' \
+    ':(glob)**/pnpm-lock.yaml' ':(glob)**/yarn.lock')" || {
     echo "devbox: git ls-files failed in $PWD, so the lock files of the setup are unknown" >&2
     return 1
   }
@@ -364,9 +375,12 @@ devbox_lock_files() {
 # With no DEVBOX_SETUP in the file $1, the setup is devbox_install_locks, and
 # with no DEVBOX_SETUP_INPUTS either, the setup skip keys on the lock files it
 # installs, through the same DEVBOX_SETUP_INPUTS path a project would write.
-# A pnpm or yarn lock file refuses the default: the image carries pnpm only as
-# a feature, and a default that left those packages out would run the gate
-# with no dependencies, the silent skip this repository keeps finding.
+# A pnpm or yarn lock file was refused here until every project with one wrote
+# its own install: a default that left those packages out would run the gate
+# with no dependencies, the silent skip this repository keeps finding. The
+# default installs them now, and a machine with no pnpm or yarn fails the
+# setup by name (_devbox_install_lock), so the gate still never runs without
+# its dependencies.
 #
 # DEVBOX_SETUP_LOCKS, the lock files devbox_install_locks installs, is fixed
 # here, before a caller such as devbox-probe empties DEVBOX_SETUP_INPUTS to
@@ -374,27 +388,20 @@ devbox_lock_files() {
 # one, else every tracked one. MEASURED: a project may track a lock file its setup
 # never installed, such as one of a second app in the same repository.
 devbox_config_default_setup() {
-  local file="$1" other locks path
+  local file="$1" locks path
   local -a inputs=()
   DEVBOX_SETUP_LOCKS=""
   case "$DEVBOX_SETUP" in *devbox_install_locks*) ;; *) return 0 ;; esac
   read -r -a inputs <<<"$DEVBOX_SETUP_INPUTS"
   for path in ${inputs[@]+"${inputs[@]}"}; do
-    case "${path##*/}" in uv.lock|package-lock.json) DEVBOX_SETUP_LOCKS+="$path"$'\n' ;; esac
+    case "${path##*/}" in
+      uv.lock|package-lock.json|pnpm-lock.yaml|yarn.lock) DEVBOX_SETUP_LOCKS+="$path"$'\n' ;;
+    esac
   done
   if [ -z "$DEVBOX_SETUP_LOCKS" ]; then
     DEVBOX_SETUP_LOCKS="$(devbox_lock_files)" || return 2
   fi
   [ "$DEVBOX_SETUP_DEFAULT" = 1 ] || return 0
-  other="$(git ls-files -- ':(glob)**/pnpm-lock.yaml' ':(glob)**/yarn.lock')" || {
-    echo "devbox: git ls-files failed in $PWD, so the lock files of the setup are unknown" >&2
-    return 2
-  }
-  other="$(awk '!/(^|\/)node_modules\// { print; exit }' <<<"$other")"
-  if [ -n "$other" ]; then
-    echo "devbox: $file sets no DEVBOX_SETUP, and the default installs only uv.lock and package-lock.json; $other needs a DEVBOX_SETUP" >&2
-    return 2
-  fi
   [ -z "$DEVBOX_SETUP_INPUTS" ] || return 0
   locks="$(printf '%s' "$DEVBOX_SETUP_LOCKS" | tr '\n' ' ')"
   devbox_config_paths_ok DEVBOX_SETUP_INPUTS "$locks" "$file" || return 2
@@ -668,19 +675,36 @@ devbox_forward_name() {
 # a collected workspace loses with its node_modules/. A caller that runs the
 # hooks on this machine sets it to a directory of its own before it calls
 # devbox_hooks_script; the value is fixed into the text here.
+#
+# The key file holds the key on its first line, the only line a reader of the
+# key takes, and the lines of devbox_setup_key_lines after it, so a setup that
+# runs names the input that changed. MEASURED: a seed copied a warm sibling into
+# new workspaces, and most of them then ran the whole setup with the same lock
+# files as the sibling. The key held one hash, so the gate could not say why.
+# Most of those had committed a change to the setup script their
+# DEVBOX_SETUP_INPUTS names, which is part of the key by design: a setup
+# script that gains an install must run. A workspace that skipped had changed
+# no input of its key.
+#
+# DEVBOX_HOOKS_TARGET is `local` when the hooks run on this machine, as
+# `devbox verify --local` runs them, set as a prefix of the call, and unset for
+# a workspace. A local setup gets no _devbox_repair_links: that repair is for a
+# synced workspace, which received a dangling link, and in a checkout on this
+# machine a .venv or node_modules symlink below the root is the developer's
+# own. The repair would delete it on every local setup. Unset here, when this
+# file is sourced: an exported value would strip the repair from the hooks
+# every workspace receives, and bring back the dangling venv that
+# devbox_repair_hooks records.
+unset DEVBOX_HOOKS_TARGET
 DEVBOX_SETUP_KEY_DIR=/home/dev/.devbox/setup
 devbox_hooks_script() {
-  local key="" locks repair
+  local key="" lines="" locks repair=""
   if [ -n "${DEVBOX_SETUP_INPUTS:-}" ]; then
-    key="$(devbox_setup_key)" || return 1
+    lines="$(devbox_setup_key_lines)" || return 1
+    key="$(devbox_setup_key "$lines")" || return 1
   fi
   printf 'devbox_environment() {\n%s\n}\n' "${DEVBOX_ENVIRONMENT:-:}"
   [ -z "${DEVBOX_PROVISION:-}" ] || printf 'devbox_provision() {\n%s\n}\n' "$DEVBOX_PROVISION"
-  # Outside a git checkout no lock file is known: a test fixture that calls
-  # this function with a setup of its own, which repairs nothing below the
-  # root. A setup that installs lock files had its list from
-  # devbox_config_load, which refuses a checkout git cannot list.
-  locks="$(devbox_lock_files 2>/dev/null)" || locks=""
   case "${DEVBOX_SETUP-}" in
     *devbox_install_locks*)
       if [ -z "${DEVBOX_SETUP_LOCKS+x}" ]; then
@@ -689,17 +713,86 @@ devbox_hooks_script() {
       fi
       devbox_install_hooks "$DEVBOX_SETUP_LOCKS" ;;
   esac
-  repair="$(devbox_repair_hooks "$locks")"
+  if [ "${DEVBOX_HOOKS_TARGET-}" != local ]; then
+    # Outside a git checkout no lock file is known: a test fixture that calls
+    # this function with a setup of its own, which repairs nothing below the
+    # root. A setup that installs lock files had its list from
+    # devbox_config_load, which refuses a checkout git cannot list.
+    locks="$(devbox_lock_files 2>/dev/null)" || locks=""
+    repair="$(devbox_repair_hooks "$locks")"
+  fi
   [ -z "$repair" ] || printf '%s\n' "$repair"
   if [ -z "$key" ]; then
-    printf 'devbox_setup() {\n%s%s\n}\n' "${repair:+_devbox_repair_links$'\n'}" "$DEVBOX_SETUP"
+    # A setup with no inputs removes the key file first. devbox-probe sends
+    # its setup with no inputs, to install the lock files of another revision,
+    # and the key a keyed setup wrote before stayed beside them. The seed takes
+    # any workspace with a key file as a source, so a new workspace whose
+    # inputs equal that stale key would skip its setup and run on another
+    # revision's node_modules/. Found reading the code for D9 of
+    # docs/specs/2026-11-15-gate-fixes-4-0-1-design.md, and reproduced in
+    # tests/test-seed.sh before this line was added. With no key file the
+    # workspace is no source until a setup with inputs writes one.
+    printf 'devbox_setup() {\n'
+    [ -z "${DEVBOX_PROJECT:-}" ] ||
+      printf 'rm -f -- %q || return\n' "$DEVBOX_SETUP_KEY_DIR/$DEVBOX_PROJECT.key"
+    printf '%s%s\n}\n' "${repair:+_devbox_repair_links$'\n'}" "$DEVBOX_SETUP"
   else
     printf '_devbox_setup_body() {\n%s\n}\n' "$DEVBOX_SETUP"
+    cat <<'WHY'
+# Print why the setup runs, from devbox_setup's locals: no key, an output
+# gone, or each line of the key this workspace's key file does not hold.
+_devbox_setup_why() {
+  local _had _line _kind _path _names="" _n
+  local -a _rec=()
+  if [ -z "$_devbox_setup_have" ]; then
+    echo "this workspace has no key of a setup that passed"
+    return 0
+  fi
+  if [ "$_devbox_setup_want" = "$_devbox_setup_have" ]; then
+    read -r -a _rec <<<"$_devbox_setup_gone"
+    _n=is
+    [ "${#_rec[@]}" -lt 2 ] || _n=are
+    echo "the key matches, and ${_rec[*]} $_n missing"
+    return 0
+  fi
+  # A key file that cannot be read now reads as one with no lines: the
+  # message below says so, and the setup runs either way.
+  mapfile -t -s 1 _rec <"$_devbox_setup_file" 2>/dev/null || _rec=()
+  if [ "${#_rec[@]}" -eq 0 ]; then
+    echo "the key in this workspace differs, and the client that wrote it kept no inputs to compare"
+    return 0
+  fi
+  _had="$(printf '%s\n' "${_rec[@]}")"
+  while IFS= read -r _line; do
+    case $'\n'"$_had"$'\n' in *$'\n'"$_line"$'\n'*) continue ;; esac
+    read -r _kind _path _ <<<"$_line"
+    case "$_kind" in
+      setup) _names+=" DEVBOX_SETUP" ;;
+      install) _names+=" the client's install of the lock files" ;;
+      file|missing) _names+=" $_path" ;;
+    esac
+  done <<<"$_devbox_setup_lines"
+  while read -r _kind _path _; do
+    case "$_kind" in file|missing) ;; *) continue ;; esac
+    case $'\n'"$_devbox_setup_lines"$'\n' in
+      *$'\n'"file $_path "*|*$'\n'"missing $_path"$'\n'*) ;;
+      *) _names+=" $_path" ;;
+    esac
+  done <<<"$_had"
+  if [ -z "$_names" ]; then
+    echo "the order of DEVBOX_SETUP_INPUTS changed since the setup that wrote this workspace's key"
+  else
+    echo "${_names# } changed since the setup that wrote this workspace's key"
+  fi
+}
+WHY
     printf 'devbox_setup() {\n'
     printf '  local _devbox_setup_dir=%q _devbox_setup_want=%q _devbox_setup_inputs=%q\n' \
       "$DEVBOX_SETUP_KEY_DIR" "$key" "$DEVBOX_SETUP_INPUTS"
     printf '  local _devbox_setup_file=%q _devbox_setup_have="" _devbox_setup_rc\n' \
       "$DEVBOX_SETUP_KEY_DIR/$DEVBOX_PROJECT.key"
+    printf '  local _devbox_setup_lines=%q\n' "$lines"
+    printf '  local _devbox_setup_outputs=%q\n' "${DEVBOX_SETUP_OUTPUTS:-}"
     # Before the skip test, which reads .venv/ and node_modules/ as outputs: a
     # symlink there is never one.
     [ -z "$repair" ] || printf '  _devbox_repair_links\n'
@@ -711,19 +804,27 @@ devbox_hooks_script() {
   # lock file the inputs name asks for its output, beside it: a lock file
   # the setup does not install gets no output, and a test of every root lock
   # file ran the whole setup on every gate, MEASURED.
-  local _devbox_setup_in _devbox_setup_d _devbox_setup_out=1
+  local _devbox_setup_in _devbox_setup_d _devbox_setup_gone=""
   for _devbox_setup_in in $_devbox_setup_inputs; do
     [ -f "$_devbox_setup_in" ] || continue
     case "$_devbox_setup_in" in */*) _devbox_setup_d="${_devbox_setup_in%/*}" ;; *) _devbox_setup_d=. ;; esac
     case "${_devbox_setup_in##*/}" in
-      package-lock.json) [ -d "$_devbox_setup_d/node_modules" ] || _devbox_setup_out=0 ;;
-      uv.lock) [ -d "$_devbox_setup_d/.venv" ] || _devbox_setup_out=0 ;;
+      package-lock.json|pnpm-lock.yaml|yarn.lock) [ -d "$_devbox_setup_d/node_modules" ] || _devbox_setup_gone+=" $_devbox_setup_d/node_modules" ;;
+      uv.lock) [ -d "$_devbox_setup_d/.venv" ] || _devbox_setup_gone+=" $_devbox_setup_d/.venv" ;;
     esac
   done
-  if [ "$_devbox_setup_want" = "$_devbox_setup_have" ] && [ "$_devbox_setup_out" = 1 ]; then
+  # DEVBOX_SETUP_OUTPUTS, the outputs a setup writes beside no lock file. A CI
+  # cache restores them with the key file, and a key restored without one of
+  # them would skip the setup that makes it.
+  for _devbox_setup_in in $_devbox_setup_outputs; do
+    case "$_devbox_setup_in" in "~/"*) _devbox_setup_in="$HOME/${_devbox_setup_in#\~/}" ;; esac
+    [ -e "$_devbox_setup_in" ] || _devbox_setup_gone+=" $_devbox_setup_in"
+  done
+  if [ "$_devbox_setup_want" = "$_devbox_setup_have" ] && [ -z "$_devbox_setup_gone" ]; then
     echo "==> setup: skipped, $_devbox_setup_inputs unchanged since the last setup here"
     return 0
   fi
+  echo "==> setup: runs, $(_devbox_setup_why)"
   # Removed before the setup runs: a setup that fails halfway must not leave
   # the key of the last one that passed.
   rm -f -- "$_devbox_setup_file" || return
@@ -731,7 +832,7 @@ devbox_hooks_script() {
   _devbox_setup_rc=$?
   [ "$_devbox_setup_rc" -eq 0 ] || return "$_devbox_setup_rc"
   if ! { mkdir -p -- "$_devbox_setup_dir" &&
-    printf '%s\n' "$_devbox_setup_want" >"$_devbox_setup_file.tmp" &&
+    printf '%s\n%s\n' "$_devbox_setup_want" "$_devbox_setup_lines" >"$_devbox_setup_file.tmp" &&
     mv -f -- "$_devbox_setup_file.tmp" "$_devbox_setup_file"; }; then
     echo "devbox: the setup passed, and $_devbox_setup_file could not be written, so the next gate here runs the setup again" >&2
   fi
@@ -758,6 +859,43 @@ SETUP
   fi
 }
 
+# DEVBOX_SETUP on this machine, in the checkout in $PWD after
+# devbox_config_load: `devbox setup`, and `devbox verify --local` before its
+# steps. $1 names the program in messages. Returns the setup's status.
+#
+# A gate on this machine ran no setup, so every consumer's CI job repeated its
+# install commands in the workflow before `devbox verify --local --step <s>
+# --shard <i>/<n>`, a second copy of the setup that drifts from the config.
+# One workflow said so in a comment beside its `npm ci`.
+#
+# The order of a remote gate: the setup phase runs devbox_environment and
+# devbox_setup in a bash of their own, and the gate starts the declared
+# services only after it. A failed setup returns its own status after its own
+# output, with no message of devbox's, as a failed remote setup does. The
+# caller exits with it.
+#
+# The setup key lives in this worktree's own git dir, <git common dir>/
+# worktrees/<name>/ for a linked worktree, beside the node_modules/ and .venv/
+# it describes. One key in the common dir would let one worktree's setup skip
+# another's, whose outputs exist and are stale. The private dir is under
+# XDG_RUNTIME_DIR or TMPDIR, which a logout or a reboot clears while the
+# outputs stay. `git worktree remove` removes the git dir with the outputs.
+# `devbox ci cache` names the same directory, so a CI cache restores the key
+# with the outputs.
+devbox_setup_local() {
+  local who="$1" git_dir setup_hooks
+  git_dir="$(git rev-parse --path-format=absolute --git-dir)" || {
+    echo "$who: git could not name the git dir of $PWD, so the setup has no key directory and did not run" >&2
+    return 1
+  }
+  setup_hooks="$(DEVBOX_SETUP_KEY_DIR="$git_dir/devbox/setup" DEVBOX_STEPS_HOOKS='' DEVBOX_SERVICES='' DEVBOX_HOOKS_TARGET=local devbox_hooks_script)" || {
+    echo "$who: could not build the hooks of the setup, so it did not run" >&2
+    return 1
+  }
+  echo "==> setup"
+  bash -c "$setup_hooks"$'\n''devbox_environment && devbox_setup'
+}
+
 # The install of one lock file in the workspace, by its name: `uv sync
 # --locked --all-packages` beside a uv.lock, `npm ci` beside a package-lock.json,
 # the install each project wrote in a setup of its own. --locked, not --frozen:
@@ -766,13 +904,32 @@ SETUP
 # projects are workspaces whose members the root sync leaves out. A lock file an exclude rule held
 # back did not arrive, and is named, not installed. The workspace bash expands
 # this text, never this one.
+#
+# `pnpm install --frozen-lockfile` beside a pnpm-lock.yaml, and `yarn install`
+# beside a yarn.lock: `--immutable` for yarn berry, which a .yarnrc.yml beside
+# the lock file marks, and `--frozen-lockfile` for yarn classic, which refuses
+# `--immutable`. Each fails on a lock file its package.json has outgrown, as
+# --locked does for uv. A machine without the tool fails the setup by name:
+# the image carries pnpm only as a feature, and a setup that went on without
+# the install would run the gate with no dependencies, the silent skip this
+# repository keeps finding.
 # shellcheck disable=SC2016
 DEVBOX_INSTALL_LOCK_FN='_devbox_install_lock() {
-  local _dir="${1%/*}"
+  local _dir="${1%/*}" _tool
   [ "$_dir" != "$1" ] || _dir=.
   if [ ! -f "$1" ]; then
     echo "==> setup: $1 did not sync, so it is not installed"
     return 0
+  fi
+  case "${1##*/}" in
+    uv.lock) _tool=uv ;;
+    package-lock.json) _tool=npm ;;
+    pnpm-lock.yaml) _tool=pnpm ;;
+    yarn.lock) _tool=yarn ;;
+  esac
+  if ! command -v "$_tool" >/dev/null; then
+    echo "devbox: $1 needs $_tool, which this machine does not have" >&2
+    return 127
   fi
   case "${1##*/}" in
     uv.lock)
@@ -781,6 +938,17 @@ DEVBOX_INSTALL_LOCK_FN='_devbox_install_lock() {
     package-lock.json)
       echo "==> setup: npm ci in $_dir/"
       npm ci --prefix "$_dir" --no-audit --no-fund ;;
+    pnpm-lock.yaml)
+      echo "==> setup: pnpm install --frozen-lockfile in $_dir/"
+      pnpm install --frozen-lockfile --dir "$_dir" ;;
+    yarn.lock)
+      if [ -f "$_dir/.yarnrc.yml" ]; then
+        echo "==> setup: yarn install --immutable in $_dir/"
+        (cd "$_dir" && yarn install --immutable)
+      else
+        echo "==> setup: yarn install --frozen-lockfile in $_dir/"
+        (cd "$_dir" && yarn install --frozen-lockfile)
+      fi ;;
   esac
 }'
 
@@ -828,14 +996,14 @@ devbox_repair_hooks() {
   printf '    done\n  done\n}\n'
 }
 
-# Print the setup key: the sha256 of the DEVBOX_SETUP text and of each
-# DEVBOX_SETUP_INPUTS file, in the list's order, read on the laptop from the
-# checkout in $PWD, before the sync sends the same files. A missing file
+# Print the lines the setup key hashes: the sha256 of the DEVBOX_SETUP text and
+# of each DEVBOX_SETUP_INPUTS file, in the list's order, read on the laptop from
+# the checkout in $PWD, before the sync sends the same files. A missing file
 # enters the key as `missing <path>`, never as an error: a lock file the
 # project deleted changes the key, so the setup runs. Every line is fixed in
 # form, and the setup text enters as its own hash, so no setup text can pose
 # as a file line.
-devbox_setup_key() {
+devbox_setup_key_lines() {
   local path sum text
   local -a paths=()
   sum="$(printf '%s' "${DEVBOX_SETUP-}" | sha256sum)" || return 1
@@ -860,7 +1028,17 @@ devbox_setup_key() {
       text+="missing $path"$'\n'
     fi
   done
-  sum="$(printf '%s' "$text" | sha256sum)" || return 1
+  printf '%s' "$text"
+}
+
+# Print the setup key: the sha256 of devbox_setup_key_lines, every line with
+# its newline, the same bytes the key hashed before the lines were kept.
+# $1, when given, is the output of devbox_setup_key_lines, read once by a
+# caller that needs both.
+devbox_setup_key() {
+  local lines="${1-}" sum
+  [ "$#" -gt 0 ] || lines="$(devbox_setup_key_lines)" || return 1
+  sum="$(printf '%s\n' "$lines" | sha256sum)" || return 1
   printf '%s\n' "${sum%% *}"
 }
 

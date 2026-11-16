@@ -23,6 +23,7 @@ import builtins
 import errno
 import importlib
 import os
+import re
 import sys
 import sysconfig
 import time
@@ -563,6 +564,12 @@ class Tracer:
                     out.add("partial\t%s\t%s\n" % (label, reason))
 
         def add(label, kind, path):
+            # The git database of a workspace, the `.git` file of a worktree
+            # and `.git-common/`, changes with every commit and is no synced
+            # input. A test that ran git once recorded reads of
+            # `.git-common/refs/`, so a commit selected it (4.0.1 D3b).
+            if path.split("/", 1)[0] in (".git", ".git-common"):
+                return
             # A path with a tab or a newline cannot be one field. Dropped, it
             # would be a read nobody records, so the test file is partial.
             if valid_unit(path):
@@ -647,18 +654,46 @@ def _child_command(event, args):
         return ("child process (%s -)" % event, None, cwd, ())
     if isinstance(argv, (str, bytes)) or not hasattr(argv, "__iter__"):
         argv = [argv]
+    argv = [_text(arg) for arg in argv]
     words = []
     for arg in argv:
-        words.extend(_text(arg).split())
+        words.extend(arg.split())
     program = _text(program) if program is not None else (words[0] if words else "")
     # On a real suite every test file was partial through one session fixture
     # whose library ran `git rev-parse HEAD`; the name in the reason is what
     # tells that child from one that reads the repository. os.system runs the
-    # shell, and the reason names the command's first word.
-    shown = words[2:3] if event == "os.system" else [program]
+    # shell, and the reason names the command's first word. The shell of one
+    # plain command is judged by that command, and the reason names it.
+    inner = _plain_shell_command(program, argv)
+    if inner is not None:
+        program, words = inner[0], inner
+    shown = words[2:3] if event == "os.system" and inner is None else [program]
     name = os.path.basename(shown[0]) if shown else ""
     reason = "child process (%s %s)" % (event, name if name and valid_unit(name) else "-")
     return (reason, _resolve_program(program, cwd, env), cwd, tuple(words))
+
+
+# 4.0.1 D3: the shell of one plain command runs that command. On real suites a
+# `git rev-parse --short HEAD` through a shell reached the trace as `/bin/sh -c
+# "git rev-parse ..."`, and sh is an interpreter, so its test file was partial,
+# although git run directly is not. Only `sh -c` or `bash -c` with one command
+# string unwraps, and only when every character of that string is a plain word
+# character or a blank. Any other character, a `;`, `&&`, a pipe, `$`, a
+# backquote, a redirection, a quote, a glob, a brace or a tilde, is shell
+# syntax: the shell then runs other words than the ones split here, and a
+# quote, a glob or a variable can name a repository file no word names.
+# devbox-trace-hook.mjs holds the same rule for vitest.
+SHELLS = frozenset(("sh", "bash"))
+PLAIN_COMMAND = re.compile(r"[A-Za-z0-9_.,:=+@%/ \t-]+")
+
+
+def _plain_shell_command(program, argv):
+    """The words of the command a shell of one plain command runs, or None."""
+    if os.path.basename(program) not in SHELLS or len(argv) != 3 or argv[1] != "-c":
+        return None
+    if PLAIN_COMMAND.fullmatch(argv[2]) is None:
+        return None
+    return argv[2].split() or None
 
 
 def _resolve_program(program, cwd, env):
@@ -688,7 +723,12 @@ def _child_may_read(program, cwd, words, bases):
     exists inside it, relative to the child's working directory or to the root,
     and no word names an interpreter or a build tool. Every word, the program
     included, is checked against that list, because a launcher such as
-    `/usr/bin/env python3` names the interpreter in an argument."""
+    `/usr/bin/env python3` names the interpreter in an argument.
+
+    A program under .venv/ or node_modules/ is inside the repository, so it
+    stays partial. esbuild's service binary is one: its build() reads entry
+    files of the repository inside the binary, where no trace sees them, and a
+    test file that called it would look complete with those reads missing."""
 
     def inside(path):
         for candidate in (path, os.path.realpath(path)):

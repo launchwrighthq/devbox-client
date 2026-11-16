@@ -93,10 +93,11 @@ fs.readFileSync(new URL(pathToFileURL(path.join(proj, 'fixtures/one.txt'))));
 // isolate: false: b imports the helper from the module cache, so it reads nothing.
 set('src/b.test.mjs');
 await import(pathToFileURL(path.join(proj, 'src/helper.mjs')).href);
+// A shell command with shell syntax may read a repository file (4.0.1 D3).
 set('src/c.test.mjs');
-execSync('true');
+execSync('true; true');
 set(null);
-execSync('true');
+execSync('true; true');
 process.stdout.write(`wrapped=${String(fs.readFileSync).includes('record(kind, target)')}\n`);
 JS
 
@@ -178,6 +179,89 @@ assert_ok "section 5.4: /usr/bin/env python3 -c names an interpreter, so it mark
 assert_ok "section 5.4: a program that resolves inside the repository through PATH marks partial" \
   has_line "$TC" $'partial\tsrc/tool.test.mjs\tchild_process'
 assert_fail "section 5.4: deciding a child records no read of the paths it tested" grep -q '^read' <<<"$TC"
+
+# 4.0.1 D3, D3a and D3b. On real suites `execSync("git rev-parse --short
+# HEAD")` reached the hook as `/bin/sh -c "git rev-parse ..."`, and sh is an
+# interpreter, so the file was partial; and a test that ran git recorded reads
+# of .git-common/. The shell of one plain command is judged by the command it
+# runs. A command string with any character of shell syntax stays partial,
+# because the words the hook splits are then not the words the shell runs: a
+# quote, a glob or a variable can name a repository file no word names.
+# esbuild's service binary under node_modules/ stays partial, with no word
+# that names a repository file: its build() reads entry files inside the
+# binary, where the hook sees nothing. A script there stays partial too.
+mkdir -p "$PROJ/node_modules/@esbuild/linux-x64/bin" "$PROJ/node_modules/.bin" "$PROJ/.git-common/refs/heads" "$PROJ/.github"
+cp "$(type -P true)" "$PROJ/node_modules/@esbuild/linux-x64/bin/esbuild"
+printf '#!/bin/sh\nexit 0\n' >"$PROJ/node_modules/.bin/tool"
+chmod +x "$PROJ/node_modules/.bin/tool"
+printf 'gitdir: /nowhere/.git-common/worktrees/app\n' >"$PROJ/.git"
+printf 'ref: refs/heads/main\n' >"$PROJ/.git-common/HEAD"
+printf '0123\n' >"$PROJ/.git-common/refs/heads/main"
+printf 'on: push\n' >"$PROJ/.github/ci.yml"
+cat >"$TMP/shell-driver.mjs" <<'JS'
+import fs from 'node:fs';
+import path from 'node:path';
+import { execSync, spawnSync } from 'node:child_process';
+const [proj] = process.argv.slice(2);
+process.chdir(proj);
+const set = (file) => { globalThis.__vitest_worker__ = { filepath: path.join(proj, file), config: { root: proj } }; };
+const shell = (command) => {
+  try {
+    execSync(command, { stdio: 'ignore' });
+  } catch {
+    // The fixture is no git repository, and the exit code is no input here.
+  }
+};
+const esbuild = path.join(proj, 'node_modules/@esbuild/linux-x64/bin/esbuild');
+set('src/sh-plain.test.mjs');
+shell('git rev-parse --short HEAD');
+spawnSync('/bin/sh', ['-c', 'git rev-parse HEAD'], { stdio: 'ignore' });
+spawnSync('bash', ['-c', 'git rev-parse HEAD'], { stdio: 'ignore' });
+spawnSync('git', ['status', '--porcelain'], { shell: true, stdio: 'ignore' });
+set('src/sh-semicolon.test.mjs');
+shell('git rev-parse HEAD; true');
+set('src/sh-and.test.mjs');
+shell('true && git rev-parse HEAD');
+set('src/sh-quote.test.mjs');
+shell('cat "data/data.json"');
+set('src/sh-glob.test.mjs');
+shell('cat data/*.json');
+set('src/sh-variable.test.mjs');
+shell('cat $HOME/x');
+set('src/sh-file.test.mjs');
+shell('cat data/data.json');
+set('src/sh-args.test.mjs');
+spawnSync('sh', ['-c', 'git rev-parse HEAD', 'data/data.json'], { stdio: 'ignore' });
+set('src/esbuild.test.mjs');
+spawnSync(esbuild, ['--service=0.25.12', '--ping'], { stdio: 'ignore' });
+set('src/setup-script.test.mjs');
+spawnSync('node_modules/.bin/tool', [], { stdio: 'ignore' });
+set('src/git.test.mjs');
+fs.existsSync('.git');
+fs.readFileSync('.git-common/HEAD');
+fs.readdirSync('.git-common/refs/heads');
+fs.statSync('.git-common');
+fs.readFileSync('.github/ci.yml');
+JS
+TR="$TMP/trace-shell"
+mkdir -p "$TR"
+out="$(DEVBOX_TRACE_DIR="$TR" NODE_OPTIONS="--import=$HOOK" node "$TMP/shell-driver.mjs" "$PROJ" 2>&1)"; rc=$?
+assert_eq "0" "$rc" "the shell driver runs: $(head -3 <<<"$out")"
+TSH="$(traces "$TR")"
+assert_fail "4.0.1 D3: sh -c, /bin/sh -c, bash -c and shell: true of one plain git command mark nothing partial" \
+  grep -qF $'partial\tsrc/sh-plain.test.mjs' <<<"$TSH"
+for f in semicolon and quote glob variable file args; do
+  assert_ok "4.0.1 D3: a shell command with $f stays partial" has_line "$TSH" $'partial\tsrc/sh-'"$f"$'.test.mjs\tchild_process'
+done
+assert_ok "4.0.1 D3a: a binary under node_modules/ stays partial, though no word names a repository file" \
+  has_line "$TSH" $'partial\tsrc/esbuild.test.mjs\tchild_process'
+assert_fail "4.0.1 D3a: and gives its test file no setup line in place of the partial" \
+  has_line "$TSH" $'setup\tsrc/esbuild.test.mjs'
+assert_ok "4.0.1 D3a: a script under node_modules/ stays partial" \
+  has_line "$TSH" $'partial\tsrc/setup-script.test.mjs\tchild_process'
+assert_eq $'read\tsrc/git.test.mjs\t.github/ci.yml' "$(grep -F 'src/git.test.mjs' <<<"$TSH")" \
+  "4.0.1 D3b: reads of .git and .git-common leave no line, and .github is kept"
+rm -rf "$PROJ/node_modules/@esbuild" "$PROJ/node_modules/.bin" "$PROJ/.git" "$PROJ/.git-common" "$PROJ/.github"
 
 # A path holding a tab cannot be written as a line, so its test file is partial.
 TR="$TMP/trace-tab"

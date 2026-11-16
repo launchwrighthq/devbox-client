@@ -1,7 +1,7 @@
 #!/bin/bash
 # `devbox ci matrix`: the GitHub Actions matrix of this checkout's gate, from
 # .devbox/steps (docs/specs/2026-11-14-learned-selection-design.md, D10 and
-# section 9).
+# section 9). `devbox ci cache`: the cache key and paths of its setup, below.
 #
 # Every consumer's CI wrote its step list a second time, with its own path
 # filters and shard tables, and ran no client, so CI and the gate drifted
@@ -13,23 +13,153 @@
 # A CI job runs `devbox verify --local --step <step> --shard <shard>` per entry.
 #
 # Exit 0, 2 for a usage error, a directory outside a git checkout, or a steps
-# file that is missing, broken or names no step, the refusals of verify.
+# file that is missing, broken or names no step, the refusals of verify. For
+# `cache`, 2 also for a config.env that devbox refuses, and 1 when a file of
+# the setup key could not be read.
 set -euo pipefail
+# The shared library is the compatibility surface between the two halves, so it
+# is resolved rather than assumed: beside the checkout or package two levels up,
+# and /usr/local/lib/devbox on a provisioned server, where the server installer puts it.
 _here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DEVBOX_LIB=""
+for _c in "$_here/../../lib/devbox-lib.sh" /usr/local/lib/devbox/devbox-lib.sh; do
+  [ -r "$_c" ] && { DEVBOX_LIB="$_c"; break; }
+done
+[ -n "$DEVBOX_LIB" ] || { echo "devbox ci: no devbox-lib.sh beside $_here or in /usr/local/lib/devbox" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$DEVBOX_LIB"
+# shellcheck source=client/libexec/devbox-config
+source "$_here/devbox-config"
 # shellcheck source=client/libexec/devbox-steps-file
 source "$_here/devbox-steps-file"
+# shellcheck disable=SC2034  # read by the guards in lib/devbox-lib.sh, a source shellcheck does not follow
+DEVBOX_GUARD_WHO="devbox ci"
 
 usage() {
-  echo "usage: devbox ci matrix" >&2
+  echo "usage: devbox ci matrix|cache" >&2
   exit 2
 }
 [ "$#" -eq 1 ] || usage
-[ "$1" = matrix ] || usage
+case "$1" in matrix|cache) ;; *) usage ;; esac
 
 root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "devbox ci: $PWD is not inside a git checkout" >&2
   exit 2
 }
+
+# A JSON string of $1. A lock file path is git's, and may hold a quote or a
+# backslash; a DEVBOX_SETUP_OUTPUTS path holds neither (devbox_config_paths_ok).
+json_str() {
+  local s="${1//\\/\\\\}"
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+# `devbox ci cache`: one JSON object, the key and the paths of the CI cache of
+# the setup, for the shared workflow's setup job and its step jobs:
+#
+#   {"key":"devbox-setup-<sha256>","paths":["app/.venv","web/node_modules",".git/devbox/setup"]}
+#
+# The key is the sha256 of the setup key, the value the key file of the setup
+# skip holds, and of `uname -s -m`: a .venv built on one CPU does not run on
+# another. The workflow adds the runner's OS image itself. The paths, relative
+# to the checkout root: the output beside each lock file the setup installs,
+# .venv/ for a uv.lock and node_modules/ for the other three; each path of
+# DEVBOX_SETUP_OUTPUTS, as written; and the key directory of
+# devbox_setup_local, so a step job restores the key with the outputs it
+# describes, and its setup skips.
+#
+# A setup that is not exactly devbox_install_locks and declares no
+# DEVBOX_SETUP_OUTPUTS gets `"paths":[]`, and the workflow then caches
+# nothing. Its outputs are unknown, and a key restored without every output
+# would skip a setup whose outputs are missing: the gate would run with no
+# dependencies, the silent skip this repository keeps finding. A composed
+# setup, `devbox_install_locks && <more>`, counts as such a setup, because its
+# second part writes outputs no lock file names. A checkout with no lock file
+# and no DEVBOX_SETUP has no setup to cache, and gets `"paths":[]` too.
+# The node_modules folders a lock file $1 installs below its own folder, one
+# per line, relative to that folder: an npm workspace member that holds its
+# own copy of a package (a `<member>/node_modules/<package>` entry of
+# "packages"), and a pnpm workspace member with dependencies (an importer
+# other than `.`). MEASURED: a pnpm workspace cached only the root
+# node_modules, so a restored key skipped the setup and every member resolved
+# no package; npm workspaces had to list a member's own node_modules in
+# DEVBOX_SETUP_OUTPUTS by hand. A folder inside the root
+# node_modules is cached with it and is not printed.
+lock_member_modules() {
+  case "${1##*/}" in
+    package-lock.json)
+      awk '
+        /^ *"[^"]+": \{/ {
+          k = $0; sub(/^ *"/, "", k); sub(/": \{.*/, "", k)
+          if (k ~ /^node_modules\//) next
+          i = index(k, "/node_modules/")
+          if (i > 0) print substr(k, 1, i - 1) "/node_modules"
+        }' "$1" ;;
+    pnpm-lock.yaml)
+      awk '
+        /^[^ ]/ { inimp = ($0 == "importers:"); imp = ""; next }
+        !inimp { next }
+        /^  [^ ]/ { imp = $0; sub(/^  /, "", imp); sub(/:$/, "", imp); gsub(/^['\''"]|['\''"]$/, "", imp); next }
+        /^    (dependencies|devDependencies|optionalDependencies):$/ {
+          if (imp != "" && imp != ".") print imp "/node_modules"
+          imp = ""
+        }' "$1" ;;
+  esac | sort -u
+}
+
+ci_cache() {
+  local lock dir p m git_dir setup_key machine sum out sep=""
+  local -a paths=() outputs=()
+  local -A seen=()
+  cd "$root"
+  devbox_config_load || exit
+  if [ "$DEVBOX_SETUP" = devbox_install_locks ] || [ -n "$DEVBOX_SETUP_OUTPUTS" ]; then
+    while IFS= read -r lock; do
+      [ -n "$lock" ] || continue
+      dir="${lock%/*}/"
+      [ "$dir" != "$lock/" ] || dir=""
+      case "${lock##*/}" in uv.lock) p="${dir}.venv" ;; *) p="${dir}node_modules" ;; esac
+      [ -z "${seen[$p]+x}" ] || continue
+      seen[$p]=1
+      paths+=("$p")
+      m="$(lock_member_modules "$lock")" || {
+        echo "devbox ci: could not read $lock for its workspace members" >&2
+        exit 1
+      }
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        p="$dir$p"
+        [ -z "${seen[$p]+x}" ] || continue
+        seen[$p]=1
+        paths+=("$p")
+      done <<<"$m"
+    done <<<"$DEVBOX_SETUP_LOCKS"
+    read -r -a outputs <<<"$DEVBOX_SETUP_OUTPUTS"
+    for p in ${outputs[@]+"${outputs[@]}"}; do
+      [ -z "${seen[$p]+x}" ] || continue
+      seen[$p]=1
+      paths+=("$p")
+    done
+  fi
+  if [ "${#paths[@]}" -gt 0 ]; then
+    git_dir="$(git rev-parse --path-format=relative --git-dir)" || {
+      echo "devbox ci: git could not name the git dir of $root, so the cache has no key directory" >&2
+      exit 1
+    }
+    paths+=("$git_dir/devbox/setup")
+  fi
+  setup_key="$(devbox_setup_key)" || exit 1
+  machine="$(uname -s -m)" || { echo "devbox ci: uname failed, so the cache key names no machine" >&2; exit 1; }
+  sum="$(printf 'setup %s\nmachine %s\n' "$setup_key" "$machine" | sha256sum)" \
+    || { echo "devbox ci: sha256sum failed, so the cache has no key" >&2; exit 1; }
+  out="{\"key\":\"devbox-setup-${sum%% *}\",\"paths\":["
+  for p in ${paths[@]+"${paths[@]}"}; do
+    out+="$sep$(json_str "$p")"
+    sep=","
+  done
+  printf '%s]}\n' "$out"
+}
+[ "$1" = matrix ] || { ci_cache; exit 0; }
 [ -f "$root/.devbox/steps" ] || {
   echo "devbox ci: $root/.devbox/steps does not exist, and the matrix is made from it" >&2
   exit 2

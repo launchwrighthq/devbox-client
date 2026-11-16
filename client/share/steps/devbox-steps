@@ -184,24 +184,33 @@ ledger_step() {
 # The LAST record of a step decides, as devbox-ledger and the plug-ins decide
 # for their units: a `start` after a `pass` means a later run began the step
 # and did not finish it.
-declare -A LEDGER_PASSED=()
+declare -A LEDGER_PASSED=() LEDGER_FAILED=()
 if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ -f "$LEDGER" ]; then
-  while IFS= read -r name; do
-    LEDGER_PASSED[$name]=1
-  done < <(awk -F '\t' '$1 == "step" { last[$2] = $3 } END { for (s in last) if (last[s] == "pass") print s }' "$LEDGER")
+  while IFS=$'\t' read -r state name; do
+    case "$state" in
+      pass) LEDGER_PASSED[$name]=1 ;;
+      fail) LEDGER_FAILED[$name]=1 ;;
+    esac
+  done < <(awk -F '\t' '$1 == "step" { last[$2] = $3 } END { for (s in last) print last[s] "\t" s }' "$LEDGER")
 fi
 
 [ -z "$LEDGER" ] || { : >>"$LEDGER"; } 2>/dev/null || die "cannot append to the ledger $LEDGER"
 
 # The files of each runner whose LAST ledger record is `pass`, as
 # passedFiles() of ledger-core.mjs and devbox_ledger.py read them: a `start`
-# after a `pass` means a later run began the file and did not finish it.
-declare -A PASSED_FILES=()
+# after a `pass` means a later run began the file and did not finish it. And
+# the files this gate owes again: those whose last record is `fail`, or
+# `start`, a file the stop left open.
+declare -A PASSED_FILES=() OWED_FILES=()
 if [ -n "$LEDGER" ] && [ "$RESUME" = 1 ] && [ -f "$LEDGER" ]; then
   for r in vitest pytest; do
     PASSED_FILES[$r]="$(RUNNER_NAME="$r" awk -F '\t' '
       $1 == "file" && $2 == ENVIRON["RUNNER_NAME"] && NF >= 4 { last[$3] = $4 }
       END { for (f in last) if (last[f] == "pass") print f }' "$LEDGER")" || die "cannot read the ledger $LEDGER"
+    OWED_FILES[$r]="$(RUNNER_NAME="$r" awk -F '\t' '
+      $1 == "file" && $2 == ENVIRON["RUNNER_NAME"] && NF >= 4 { last[$3] = $4 }
+      END { for (f in last) if (last[f] == "fail" || last[f] == "start") print f }' "$LEDGER")" \
+      || die "cannot read the ledger $LEDGER"
   done
 fi
 
@@ -211,6 +220,19 @@ fi
 # own `exclude` cannot hide the client's choice: a vitest 2 release ignored an
 # `--exclude` from the command line in a project that set its own, and ran
 # every passed file again. A step that is given no list runs its whole suite.
+#
+# A resume owes what this gate's own ledger left (gate-fixes-4.0.1 spec, D1).
+# MEASURED: a stopped gate's vitest step failed two files, and the plan of its
+# resume narrowed the step to the failed files of another branch's newer
+# record. Every file on that list had passed in this gate, so the step resumed
+# as passed, and the gate read green while its own two failed files never ran
+# again. So on a resume a narrow step, whose list stands on an earlier gate's
+# result, runs its test lines; a select step, whose other files its map
+# proves, keeps its list; and each adds every file of its own lines that this
+# gate failed or left open. A step whose ledger says it failed never resumes
+# as passed.
+RESUMING=0
+[ "$RESUME" != 1 ] || [ -z "$LEDGER" ] || RESUMING=1
 declare -A RUNLIST=() HASLIST=() RESUMED_ALL=()
 for name in "${NAMES[@]}"; do
   [ "${RUNNER[$name]}" != - ] || continue
@@ -218,16 +240,30 @@ for name in "${NAMES[@]}"; do
   [ -z "${LEDGER_PASSED[$name]+x}" ] || continue
   base=""
   case "${MODE[$name]}" in
-    narrow | select) base="${FILES[$name]}" ;;
-    run) [ "$RESUME" != 1 ] || [ -z "$LEDGER" ] || base="${TESTS[$name]}" ;;
+    select) base="${FILES[$name]}" ;;
+    narrow) if [ "$RESUMING" = 1 ]; then base="${TESTS[$name]}"; else base="${FILES[$name]}"; fi ;;
+    run) [ "$RESUMING" = 0 ] || base="${TESTS[$name]}" ;;
   esac
   [ -n "$base" ] || continue
+  if [ -n "${OWED_FILES[${RUNNER[$name]}]-}" ]; then
+    # The owed files join in the order of the step's own lines, so one ledger
+    # gives one command line.
+    base="$(awk '
+      phase == "base" { if ($0 != "") { have[$0] = 1; print }; next }
+      phase == "owed" { if ($0 != "") owed[$0] = 1; next }
+      $0 != "" && ($0 in owed) && !($0 in have) { have[$0] = 1; print }' \
+      phase=base <(printf '%s' "$base") phase=owed <(printf '%s\n' "${OWED_FILES[${RUNNER[$name]}]}") \
+      phase=own <(printf '%s%s' "${TESTS[$name]}" "${FILES[$name]}"))"$'\n' || die "cannot add the owed files of $name"
+  fi
   list="$base"
   if [ -n "${PASSED_FILES[${RUNNER[$name]}]-}" ]; then
     list="$(awk 'NR == FNR { passed[$0] = 1; next } !($0 in passed)' \
       <(printf '%s\n' "${PASSED_FILES[${RUNNER[$name]}]}") <(printf '%s' "$base"))" || die "cannot subtract the passed files of $name"
     [ -z "$list" ] || list+=$'\n'
   fi
+  # A step that failed while every file it runs passed failed outside those
+  # files, so it runs them all again.
+  [ -n "$list" ] || [ -z "${LEDGER_FAILED[$name]+x}" ] || list="$base"
   HASLIST[$name]=1
   RUNLIST[$name]="$list"
   # Every file this step would run passed in an earlier run of this gate. An
@@ -530,8 +566,11 @@ function emit(kind, a,    rel) {
   else if (substr(a, 1, length(root) + 1) == root "/") rel = substr(a, length(root) + 2)
   else if (substr(a, 1, length(proot) + 1) == proot "/") rel = substr(a, length(proot) + 2)
   else return
-  # The repository database is not synced and changes with every commit.
-  if (rel ~ /^\.git(\/|$)/) return
+  # The repository database is not synced and changes with every commit. A
+  # workspace holds it as the `.git` file of a worktree and `.git-common/`, and
+  # a test that ran `git rev-parse` once recorded reads of `.git-common/refs/`
+  # and `.git-common/worktrees/`, so a commit selected it (4.0.1 D3b).
+  if (rel ~ /^\.git(-common)?(\/|$)/) return
   if (rel ~ /(^|\/)(node_modules|\.venv)(\/|$)/) { if (!setup) print "setup\t-"; setup = 1; return }
   if (rel ~ /[\t\n]/) { if (!badpath) print "partial\t-\ta path holds a tab or a newline"; badpath = 1; return }
   if (kind == "list") print "list\t-\t" (rel == "" ? "." : rel) "/"
@@ -664,8 +703,12 @@ run_command() {
   local name="$1" script="$2" log="$3" rc=0
   shift 3
   if [ "$name" = "$STREAM" ]; then
-    # pipefail is on, so the status is the command's unless tee itself fails.
-    (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null 2>&1 | tee -a "$log" || rc=$?
+    # The status is the command's, also when tee cannot write the log. A
+    # strace log of a long step filled the 10% tmpfs of $XDG_RUNTIME_DIR on a
+    # CI runner, and tee's ENOSPC failed a step whose command passed. GNU tee
+    # keeps streaming to stdout after a file write fails.
+    (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null 2>&1 \
+      | { tee -a "$log" || echo "devbox-steps: could not write all of the log $log" >&2; } || rc=$?
   else
     (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null >>"$log" 2>&1 || rc=$?
   fi
