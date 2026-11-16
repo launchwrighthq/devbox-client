@@ -63,7 +63,7 @@ manifest() {
 no_steps() {
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
-    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=()
+    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=() STEP_MEMORY=()
 }
 
 # Add one step: $1 name, $2 inputs (one per line), then key=value attributes.
@@ -428,5 +428,14 @@ assert_ok "x.spec.ts is a vitest test file" devbox_plan_is_test_file src/x.spec.
 assert_fail "x.test.ts is not a pytest test file" devbox_plan_is_test_file src/x.test.ts pytest
 assert_fail "a test fixture's JSON is no test file" devbox_plan_is_test_file tests/data.json vitest
 assert_fail "a source file is no test file" devbox_plan_is_test_file src/x.ts vitest
+
+echo "-- memory=: one memory line per step that sets it (step-memory-budget spec, D4)"
+new_repo mem
+disjoint_steps
+STEP_MEMORY[lint]=3221225472
+STEP_MEMORY[pytest]=1073741824
+plan changed
+assert_eq $'memory\tlint\t3221225472\nmemory\tpytest\t1073741824' "$(grep '^memory' "$P")" \
+  "the plan carries the memory= of lint and pytest as byte counts, and no line for the other steps"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

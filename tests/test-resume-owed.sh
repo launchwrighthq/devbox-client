@@ -112,7 +112,6 @@ printf 'test runner=vitest narrow=failed -- npx vitest run\n' >"$CO/.devbox/step
   echo 'DEVBOX_GATE_PASSWORD=fixture-gate-password'
 } >"$CO/.devbox.env"
 DEVBOX_DIR="$CO/.git/devbox"
-MAP="$DEVBOX_DIR/maps/test.map"
 
 out="" rc=0
 verify() {
@@ -149,11 +148,14 @@ echo "-- D4"
 rm -rf "$DEVBOX_DIR/records" "$DEVBOX_DIR/maps" "$TMP/run/devbox/ledgers" "${TMP:?}/ws/"*
 verify --target lan1
 assert_eq 0 "$rc" "a full gate passes and writes the map"
+MAP="$(printf '%s\n' "$DEVBOX_DIR"/maps/test.*.map)"
+assert_ok "one map of the step's context" test -f "$MAP"
 assert_ok "the map holds a's read" grep -q $'^path\t[0-9]*\tsrc/a.ts$' "$MAP"
-# Another config is another context: the map's passes were under the old one.
-printf '# a comment changes the bytes of config.env\n' >>"$CO/.devbox/config.env"
+# The map's passes are under an older run. A config change once forced this
+# run, but a config change now gives a runner step a map of its own
+# (gate overload D8), so --full runs every file under the same context.
 printf '1\n' >"$FAKE_STOP_FILE"
-FAKE_STOP_AT=c.test.ts verify --target lan1
+FAKE_STOP_AT=c.test.ts verify --target lan1 --full
 assert_ok "the gate was stopped at c" contains "the watchdog on lan1 stopped this gate" "$out"
 assert_eq "resume=1 c.test.ts d.test.ts" "$(sed -n 2p "$VITEST_LOG")" "the resume ran the open and the unstarted files"
 assert_eq 0 "$rc" "the resumed gate passes"

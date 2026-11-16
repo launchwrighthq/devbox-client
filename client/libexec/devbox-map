@@ -12,11 +12,18 @@
 # test file and step really read, from the traces the runner sends back, so the
 # plan hashes those files alone and runs only the test files a change reaches.
 #
-# One file per step, <git common dir>/devbox/maps/<step>.map, one field per
-# tab, written by rename:
+# One file per step and context, <git common dir>/devbox/maps/<step>.<ctx>.map
+# (docs/specs/2026-11-16-gate-overload-design.md, section 6), one field per
+# tab, written by rename. <ctx> is devbox_map_ctx of what the map's passes
+# depend on, which devbox-plan chooses: the map base and the setup key for a
+# runner step, the trace base for a step with no runner. MEASURED: one map per
+# step held one context, and worktrees of one checkout pinned three client
+# versions, so each gate's update reset the other contexts' run ids, select
+# answered "another context" for each of them, and about 4 in 10 runs of one
+# project's test steps in a day ran in full. The format:
 #
 #   map       1
-#   context   <base hash>  <setup key>
+#   context   <map base>  <setup key>
 #   untraced  <reason>                     the last run sent no usable trace
 #   path      <id>  <repository path>
 #   dir       <id>  <repository path>/
@@ -27,13 +34,17 @@
 # `setup` marks a read under a setup output (node_modules/, .venv/). The
 # `step` line holds the reads of the step's own process, the `-` owner of the
 # trace; a runner step's inputs are those, every test file's reads and the test
-# files themselves. The context is the base of the step key (the client, the
+# files themselves. The context is the map base (DEVBOX_TRACE_FORMAT, the
 # config, the step line and the forwarded values) and the setup key the run
 # had: a file's last pass proves nothing about a run under another context.
-# <traced under> is the hash of the step line, the config and the client
-# version that step's own trace was taken under, `-` for none: strace made a
-# type check and a lint run several times as long (learned-selection spec, P3), so a step
-# is traced again only when one of those changed (D4).
+# <traced under> is the trace base, the hash of DEVBOX_TRACE_FORMAT, the config
+# and the step line that step's own trace was taken under, `-` for none: strace
+# made a type check and a lint run several times as long (learned-selection
+# spec, P3), so a step is traced again only when one of those changed (D4).
+#
+# A legacy <step>.map, one map per step, is never read, written, renamed or
+# removed (D10): a worktree on an older client still reads and writes it, and
+# its context hashed the client VERSION, which no context here does.
 #
 # A test file's run id names the record whose manifest, `<run-id>.files`,
 # holds the hashes of the tree it passed on. A record that was pruned leaves
@@ -98,20 +109,80 @@ devbox_map_dir() {
   printf '%s/devbox/maps\n' "$common"
 }
 
-# Set the variable named $1 to the map file of step $2.
-_devbox_map_file() {
-  local _dir
-  _dir="$(devbox_map_dir)" || return 1
-  printf -v "$1" '%s/%s.map' "$_dir" "$2"
+# The format of the traces and of what a map records of them. The map base
+# and the trace base hash it in place of the client VERSION (gate-overload
+# spec, D11). Both hashed the VERSION, so every release, a patch included,
+# reset the passes of every map, and traced each step with no runner again
+# under strace, which made a type check and a lint run several times as long.
+# Raise it when the trace, the map format or the meaning of a recorded read
+# changes, as the 4.0.1 change that dropped the reads of .git-common/ did.
+# shellcheck disable=SC2034  # read by devbox-plan, which sources this file
+DEVBOX_TRACE_FORMAT=1
+
+# The maps of one step a write keeps (D9). The maps of one measured project
+# held tens of megabytes in all, so 8 contexts bound its directory to eight times that.
+DEVBOX_MAP_KEEP=8
+
+# devbox_map_ctx <value>...
+# Print the context id of a map: the first 16 hex digits of the sha256 of the
+# values, each followed by a newline. devbox-plan passes the map base and the
+# setup key of a runner step, and the trace base of a step with no runner.
+devbox_map_ctx() {
+  local sum
+  sum="$(printf '%s\n' "$@" | sha256sum)" || return 1
+  printf '%s\n' "${sum:0:16}"
 }
 
-# Run the awk program $2 over the map of step $1 after the map reader. The
-# program sees every line through map_line, then its own END. Returns 1 when
-# no map exists, 2 when the map cannot be read or breaks the format.
+# Set the variable named $1 to the map file of step $2 under the context id
+# $3. Returns 2 for a step name or a context id that breaks its rule: both
+# become a file name, and the prune of D9 tells the maps of one step from
+# another's by that rule alone.
+_devbox_map_file() {
+  local _dir
+  if ! [[ "$2" =~ ^[a-z0-9][a-z0-9:_-]*$ ]] || ! [[ "$3" =~ ^[0-9a-f]{16}$ ]]; then
+    echo "devbox verify: refusing the map of step '$2' under context '$3': a step name or a context id that breaks its rule" >&2
+    return 2
+  fi
+  _dir="$(devbox_map_dir)" || return 1
+  printf -v "$1" '%s/%s.%s.map' "$_dir" "$2" "$3"
+}
+
+# Remove the oldest maps of step $1 by modification time until
+# DEVBOX_MAP_KEEP remain, the map $2 that was just written among them (D9).
+# Only a name of the form <step>.<16 hex digits>.map is a context map of the
+# step: a step name holds no dot, so another step whose name starts with this
+# one, the legacy <step>.map and a temporary file all fail that form.
+_devbox_map_prune() {
+  local step="$1" keep="$2" dir f i oldest
+  local -a maps=()
+  dir="${keep%/*}"
+  for f in "$dir/$step".*.map; do
+    [[ "${f#"$dir/$step".}" =~ ^[0-9a-f]{16}\.map$ ]] || continue
+    [ "$f" = "$keep" ] || maps+=("$f")
+  done
+  while [ "${#maps[@]}" -ge "$DEVBOX_MAP_KEEP" ]; do
+    oldest=0
+    for i in "${!maps[@]}"; do
+      if [ "${maps[$i]}" -ot "${maps[$oldest]}" ]; then oldest="$i"; fi
+    done
+    rm -f -- "${maps[$oldest]}" || {
+      echo "devbox verify: could not remove the old map ${maps[$oldest]} of step $step" >&2
+      return 1
+    }
+    unset 'maps[$oldest]'
+    maps=("${maps[@]}")
+  done
+}
+
+# _devbox_map_awk <step> <ctx> <program> [<awk argument>...]
+# Run the awk program over the map of the step under that context id after
+# the map reader. The program sees every line through map_line, then its own
+# END. Returns 1 when no map exists, 2 when the map cannot be read or breaks
+# the format.
 _devbox_map_awk() {
-  local step="$1" program="$2" file
-  shift 2
-  _devbox_map_file file "$step" || return 2
+  local program="$3" file
+  _devbox_map_file file "$1" "$2" || return 2
+  shift 3
   [ -e "$file" ] || return 1
   [ -r "$file" ] || return 2
   awk -F'\t' "$_DEVBOX_MAP_AWK_READ"'
@@ -120,10 +191,13 @@ _devbox_map_awk() {
     '"$program" "$@" "$file"
 }
 
+# Each reader below takes <step> <ctx> and reads the map of that step under
+# that context id alone: a run never reads the map of another context.
+#
 # Print `none`, `bad` or `ok` for the map of step $1.
 devbox_map_state() {
   local rc=0
-  _devbox_map_awk "$1" 'function report() { }' || rc=$?
+  _devbox_map_awk "$1" "${2-}" 'function report() { }' || rc=$?
   case "$rc" in 0) echo ok ;; 1) echo none ;; *) echo bad ;; esac
 }
 
@@ -144,7 +218,7 @@ devbox_map_state() {
 # as partial, and none of them read the edited file.
 devbox_map_step_inputs() {
   local out
-  out="$(_devbox_map_awk "$1" '
+  out="$(_devbox_map_awk "$1" "${2-}" '
     function add(ids,   n, a, i) {
       n = split(ids, a, ",")
       for (i = 1; i <= n; i++) if ((a[i] in m_path) && map_input(m_path[a[i]])) print m_path[a[i]]
@@ -160,7 +234,7 @@ devbox_map_step_inputs() {
 # True when step $1 or any of its test files read under a setup output, so the
 # setup key belongs in its key (D4a).
 devbox_map_reads_setup() {
-  _devbox_map_awk "$1" '
+  _devbox_map_awk "$1" "${2-}" '
     function report(   i) {
       if (("," m_sids ",") ~ /,setup,/) exit 0
       for (i = 1; i <= m_nf; i++) if (("," m_fids[m_file[i]] ",") ~ /,setup,/) exit 0
@@ -170,17 +244,17 @@ devbox_map_reads_setup() {
 
 # Print the test files of step $1's map, in map order.
 devbox_map_test_files() {
-  _devbox_map_awk "$1" 'function report(   i) { for (i = 1; i <= m_nf; i++) print m_file[i] }'
+  _devbox_map_awk "$1" "${2-}" 'function report(   i) { for (i = 1; i <= m_nf; i++) print m_file[i] }'
 }
 
-# Print `<base> <setup key>` of step $1's map.
+# Print `<map base> <setup key>` of step $1's map.
 devbox_map_context() {
-  _devbox_map_awk "$1" 'function report() { if (m_base != "") print m_base " " m_setup }'
+  _devbox_map_awk "$1" "${2-}" 'function report() { if (m_base != "") print m_base " " m_setup }'
 }
 
 # Print the reason step $1's last run sent no usable trace, or nothing.
 devbox_map_untraced() {
-  _devbox_map_awk "$1" 'function report() { if (m_untraced != "") print m_untraced }'
+  _devbox_map_awk "$1" "${2-}" 'function report() { if (m_untraced != "") print m_untraced }'
 }
 
 # Print what step $1's own trace was taken under, the <traced under> of its
@@ -188,7 +262,7 @@ devbox_map_untraced() {
 # line no full run wrote, or a partial one, which missed what a child process
 # read and must be taken again.
 devbox_map_step_traced() {
-  _devbox_map_awk "$1" '
+  _devbox_map_awk "$1" "${2-}" '
     function report() {
       if (!m_hasstep || m_srun == "-" || m_spart == "partial" || m_straced == "-") exit 1
       print m_straced
@@ -197,10 +271,10 @@ devbox_map_step_traced() {
 
 # Print the run id of step $1's last full trace, or nothing.
 devbox_map_step_run() {
-  _devbox_map_awk "$1" 'function report() { if (m_hasstep && m_srun != "-") print m_srun }'
+  _devbox_map_awk "$1" "${2-}" 'function report() { if (m_hasstep && m_srun != "-") print m_srun }'
 }
 
-# devbox_map_select <step> <manifest> [<base> <setup key>]
+# devbox_map_select <step> <manifest> <ctx> [<map base> <setup key>]
 # Print `<path>\t<reason>` for each test file of the map that this run must run,
 # by section 6: `changed` when the file itself differs from its last pass,
 # `no trace` when it never passed or its pass's manifest is gone, `partial`
@@ -210,14 +284,14 @@ devbox_map_step_run() {
 # is gone and prints nothing.
 #
 # The caller calls it only when the step's key changed, so for a partial file
-# an input of its step changed. With <base> and <setup key>, it returns 3 when
-# the map was written under another context, because then a pass under the old
-# context proves nothing. Returns 1 with no map, 2 for a map that cannot be
-# read.
+# an input of its step changed. It reads the map of context id <ctx>. With
+# <map base> and <setup key>, it returns 3 when that map's context line names
+# another context, because then a pass under the old context proves nothing.
+# Returns 1 with no map, 2 for a map that cannot be read.
 devbox_map_select() {
-  local step="$1" manifest="$2" base="${3-}" setup="${4-}" file rdir rc=0 run
+  local step="$1" manifest="$2" base="${4-}" setup="${5-}" file rdir rc=0 run
   local -a args=()
-  _devbox_map_file file "$step" || return 2
+  _devbox_map_file file "$step" "${3-}" || return 2
   [ -e "$file" ] || return 1
   [ -r "$file" ] && [ -r "$manifest" ] || return 2
   rdir="$(devbox_record_dir)" || return 2
@@ -283,8 +357,9 @@ devbox_map_select() {
   return "$rc"
 }
 
-# devbox_map_update <step> <run-id> <trace file> <mode> [<base> <setup key> [<traced under>]]
-# Merge one run's trace into step <step>'s map, by rename. <trace file> holds
+# devbox_map_update <step> <run-id> <trace file> <mode> <ctx> [<map base> <setup key> [<traced under>]]
+# Merge one run's trace into step <step>'s map of context id <ctx>, by rename,
+# then prune the step's maps to DEVBOX_MAP_KEEP (D9). <trace file> holds
 # the trace lines of section 5.6: `read`, `list`, `setup` and `partial`, each
 # with its owner, a test file or `-` for the step's own process. <mode> is the
 # plan's action: `run` makes this run the step's last full trace and replaces
@@ -308,17 +383,17 @@ devbox_map_select() {
 # `untraced`, with the reason its `partial` line gives (section 5.3). A `run`
 # with reads of the step's own process records <traced under> on the step line.
 devbox_map_update() {
-  local step="$1" run="$2" trace="$3" mode="$4" base="${5-}" setup="${6-}" traced="${7:--}"
+  local step="$1" run="$2" trace="$3" mode="$4" ctx="${5-}" base="${6-}" setup="${7-}" traced="${8:--}"
   local file dir rdir rec=/dev/null man=/dev/null old=/dev/null
   (require_run_id "$run" "the map of step $step") || return 2
   case "$mode" in run|select|narrow|resume) ;; *)
     echo "devbox verify: refusing the map mode '$mode' for step $step: write run, select, narrow or resume" >&2; return 2 ;;
   esac
   [ -r "$trace" ] || { echo "devbox verify: could not read the trace $trace of step $step, so its map did not change" >&2; return 1; }
-  _devbox_map_file file "$step" || return 1
+  _devbox_map_file file "$step" "$ctx" || return
   dir="${file%/*}"
   if [ -e "$file" ]; then
-    if [ "$(devbox_map_state "$step")" = ok ]; then
+    if [ "$(devbox_map_state "$step" "$ctx")" = ok ]; then
       old="$file"
     else
       echo "devbox verify: the map of step $step could not be read ($file), so this run's trace starts it again" >&2
@@ -464,4 +539,7 @@ devbox_map_update() {
     echo "devbox verify: could not write the map of step $step to $file, so the next plan of it uses the last map" >&2
     return 1
   fi
+  # The map is written, and a map the prune could not remove costs disk alone:
+  # the prune named it, and the result of this update stands.
+  _devbox_map_prune "$step" "$file" || :
 }

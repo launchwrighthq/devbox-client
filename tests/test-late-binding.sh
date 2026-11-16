@@ -477,4 +477,63 @@ verify --target vps1
 assert_ok "tokens: a want of 1 alone sends a floor of 1" grep -qE "devbox-gate@$A_VPS1 run [^ ]+ app 1 1 " "$SSH_LOG"
 write_config
 
+# ═══ a killed client ends the stdin of each queued run (gate overload, D2) ═══
+#
+# MEASURED: most tickets in one host's queue belonged to clients that
+# had exited tens of minutes earlier. A join's ssh outlives a devbox verify
+# that SIGKILL ended, and it still answers the host's keepalives, so the host
+# keeps the session. The host now ends a queued run at the end of its stdin,
+# which comes only when no process but devbox verify holds a write end of the
+# join's fifo. The fake ssh holds that fifo as its stdin, as the real one does,
+# and the real one passes its end to the host.
+#
+# The writers of fifo $1, from each process's fdinfo. find reads every link
+# with no fork per fd. A process can end between find and awk, and a fd of
+# another user cannot be read, so both drop their complaint.
+fifo_writers() {
+  local fd flags n=0
+  while IFS= read -r fd; do
+    flags="$(awk '$1 == "flags:" { print $2 }' "${fd%/fd/*}/fdinfo/${fd##*/}" 2>/dev/null)"
+    [ -n "$flags" ] || continue
+    [ $((8#$flags & 3)) -eq 0 ] || n=$((n + 1))
+  done < <(find /proc/[0-9]*/fd -maxdepth 1 -lname "$1" 2>/dev/null)
+  printf '%s' "$n"
+}
+reset_logs
+(cd "$CO" && exec env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" DEVBOX_LOCK_WAIT=30 \
+  FAKE_GRANT="$A_LAN1:never $A_VPS1:never $A_VPS2:never" \
+  bash "$REPO/client/libexec/devbox-verify" >"$TMP/k.out" 2>&1) &
+kv=$!
+for _ in $(seq 1 100); do
+  [ "$(find "$TMP/tickets" -type f | wc -l)" -lt 3 ] || break
+  sleep 0.1
+done
+mapfile -t kstubs < <(find "$TMP/tickets" -type f -printf '%f\n' | sed 's/.*\.//')
+assert_eq "3" "${#kstubs[@]}" "overload D2: the run queues on all three targets"
+kfifos=()
+for p in ${kstubs[@]+"${kstubs[@]}"}; do kfifos+=("$(readlink "/proc/$p/fd/0")"); done
+kheld=0
+for f in ${kfifos[@]+"${kfifos[@]}"}; do [ "$(fifo_writers "$f")" -eq 0 ] || kheld=$((kheld + 1)); done
+assert_eq "3" "$kheld" "overload D2: while devbox verify lives, it holds the write end of each queued run's stdin"
+kill -KILL "$kv"
+wait "$kv" 2>/dev/null  # bash names the job a signal ended, and its status is the 137 asked for
+# The main shell's own short children, such as the sleep of its wait, hold
+# the write end until they end, a fraction of a second.
+kleft=3
+for _ in $(seq 1 30); do
+  kleft=0
+  for f in ${kfifos[@]+"${kfifos[@]}"}; do [ "$(fifo_writers "$f")" -eq 0 ] || kleft=$((kleft + 1)); done
+  [ "$kleft" -ne 0 ] || break
+  sleep 0.1
+done
+assert_eq "0" "$kleft" "overload D2: once SIGKILL ends devbox verify, no process holds a write end, so each queued stdin ends"
+alive=0
+for p in ${kstubs[@]+"${kstubs[@]}"}; do ! kill -0 "$p" 2>/dev/null || alive=$((alive + 1)); done
+assert_eq "3" "$alive" "overload D2: while every join's ssh outlives it, as the host saw"
+# A stub that grants never waits forever, so the case ends them. Each one's
+# join job and its lane lock end with them.
+for p in ${kstubs[@]+"${kstubs[@]}"}; do kill "$p" 2>/dev/null; done  # one already gone is the end asked for
+tickets_left >/dev/null
+rm -f "$TMP/run/devbox/runs/"*
+
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

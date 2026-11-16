@@ -8,6 +8,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
 REPO="$(cd .. && pwd)"
+# shellcheck source=client/libexec/devbox-config
+source "$REPO/client/libexec/devbox-config"
 # shellcheck source=client/libexec/devbox-steps-file
 source "$REPO/client/libexec/devbox-steps-file"
 
@@ -90,6 +92,8 @@ refused "requires with a blank entry" 't requires=docker,,psql -- x' 1 'requires
 refused "requires with a semicolon" 't requires=a;b -- x' 1 'requires token "a;b" may hold only'
 refused "requires starting with a dash" 't requires=-x -- x' 1 'requires token "-x" may hold only'
 refused "requires all dots" 't requires=.. -- x' 1 'requires token ".." may hold only'
+refused "D4: memory that is not a size" 't memory=lots -- x' 1 'memory must be a whole number with K, M or G, such as 4G, not "lots"'
+refused "D4: memory of zero" 't memory=0 -- x' 1 'memory must be a whole number with K, M or G'
 refused "unknown runner" 't runner=jest -- npx jest' 1 'runner must be vitest or pytest, not "jest"'
 refused "unknown narrow" 't runner=vitest narrow=all -- npx vitest run' 1 'narrow must be failed, not "all"'
 refused "unknown rerun" 't rerun=never -- x' 1 'rerun must be always, not "never"'
@@ -194,6 +198,23 @@ f="$(source_of $'s runner=vitest shards=2 requires=docker,cmd:psql -- npx vitest
 g="$(source_of $'s runner=vitest shards=6 requires=cmd:psql,docker -- npx vitest run' s)"
 assert_ok "the source of a sharded step is computed" contains "s requires=cmd:psql,docker runner=vitest -- " "$f"
 assert_eq "$f" "$g" "the shard count and the token order do not change the source"
+
+# memory= (docs/specs/2026-11-16-step-memory-budget-design.md, D4): a byte
+# count in STEP_MEMORY, the same for every module of an each= line, and kept
+# out of the source, because it decides when a step starts, not what it runs.
+cat >"$STEPS" <<'EOF'
+lint memory=3G -- npm run lint
+mod:{name} each=apps/*/ runner=vitest memory=512M -- npx vitest run
+plain -- true
+EOF
+rc=0
+devbox_steps_load "$STEPS" "$ROOT" || rc=$?
+assert_eq 0 "$rc" "D4: memory= loads"
+assert_eq "3221225472|536870912|536870912|" \
+  "${STEP_MEMORY[lint]}|${STEP_MEMORY[mod:api]}|${STEP_MEMORY[mod:web]}|${STEP_MEMORY[plain]}" \
+  "D4: memory= is a byte count, given to each module of an each= line, and empty when unset"
+assert_eq "$(source_of $'lint -- npm run lint' lint)" "$(source_of $'lint memory=3G -- npm run lint' lint)" \
+  "D4: memory= does not change the source, so a step keeps its carried pass"
 
 # ── the caller's scope ───────────────────────────────────────────────────────
 

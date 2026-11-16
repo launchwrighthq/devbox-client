@@ -207,12 +207,15 @@ PRELUDE
 # reading at all, so a test that admits on it needs one that moves.
 # proc_stat_writer <file> <idle percent> starts a writer in the background that
 # adds <idle percent> idle and the rest user time every 0.1 s, each write by
-# rename, and sets PROC_STAT_WRITER to its pid. The caller kills it.
+# rename, and sets PROC_STAT_WRITER to its pid. The caller kills it. The writer
+# also ends by itself once the test shell that started it is gone, because a
+# KILL to that shell runs no EXIT trap and the writer would loop forever.
 proc_stat_writer() {
   local file="$1" idle="$2"
   (
     i=0; b=0
-    while :; do
+    # $$ in this subshell is the test shell's pid.
+    while kill -0 "$$" 2>/dev/null; do
       i=$((i + idle)); b=$((b + 100 - idle))
       printf 'cpu  %s 0 0 %s 0 0 0 0 0 0\ncpu0 %s 0 0 %s 0 0 0 0 0 0\n' "$b" "$i" "$b" "$i" >"$file.tmp" \
         && mv -f "$file.tmp" "$file"
@@ -221,4 +224,56 @@ proc_stat_writer() {
   ) </dev/null >/dev/null 2>&1 &
   # shellcheck disable=SC2034  # read by the test files that source this one
   PROC_STAT_WRITER=$!
+}
+
+# ── fixture gates that end with their test ───────────────────────────────────
+#
+# The pool tests run fake pool runs in the background, each around a gate that
+# loops until a stop file exists. MEASURED: hundreds of such gate loops and dozens
+# of fake pool runs outlived their test files, the oldest by almost two days,
+# and their load made timing tests on the same machine fail. Three
+# faults combined. The EXIT trap created the stop file and removed the temp
+# directory a few milliseconds later, so a gate that polls every 0.1 s missed
+# the file and then polled a deleted directory forever. A pool runs a gate
+# without --run-id in the foreground, and bash defers a trapped TERM until a
+# foreground child ends, so the TERM the trap sent left the pool waiting on
+# that gate. And the loop had no other way out.
+#
+# FIXTURE_GATE is that gate. It writes the DEVBOX_TOKENS it got to
+# $OUT/tokens-$NAME, then loops until $OUT/stop-$NAME or $OUT/stop-all exists,
+# its pool ($PPID) is gone, the test shell FIXTURE_TEST_PID is gone, or 120 s,
+# the limit run-tests.sh gives a whole file, have passed. A test that does not
+# set FIXTURE_TEST_PID gets gates that end at once, and its checks fail.
+# shellcheck disable=SC2016,SC2034  # expanded by the gate's own shell; read by the test files that source this one
+FIXTURE_GATE='printf "%s\n" "$DEVBOX_TOKENS" >"$OUT/tokens-$NAME"; until [ -e "$OUT/stop-$NAME" ] || [ -e "$OUT/stop-all" ] || [ "$SECONDS" -ge 120 ] || ! kill -0 "$PPID" 2>/dev/null || ! kill -0 "$FIXTURE_TEST_PID" 2>/dev/null; do sleep 0.1; done'
+
+# stop_fixture_jobs <out dir> [<pid>...] creates <out dir>/stop-all, sends TERM
+# to each pid, gives them 5 s to end, then sends KILL to the rest and reaps
+# them. A pool still queued ends on the TERM; a granted pool ends once its gate
+# sees the stop file. The caller removes the directory after this returns,
+# never before, or the gates never see the stop file.
+stop_fixture_jobs() {
+  local out="$1" n=0 p
+  local -a fixture_live
+  shift
+  # The directory is missing when the test failed before it made it, and then
+  # no gate waits on it either.
+  touch "$out/stop-all" 2>/dev/null
+  [ "$#" -gt 0 ] || return 0
+  # A pid that already ended has nothing to signal.
+  kill "$@" 2>/dev/null
+  while :; do
+    fixture_live=()
+    for p in "$@"; do
+      if kill -0 "$p" 2>/dev/null; then fixture_live+=("$p"); fi
+    done
+    if [ "${#fixture_live[@]}" -eq 0 ] || [ "$n" -ge 50 ]; then break; fi
+    sleep 0.1
+    n=$((n + 1))
+  done
+  # The same: one may end between the check above and this line.
+  [ "${#fixture_live[@]}" -eq 0 ] || kill -KILL "${fixture_live[@]}" 2>/dev/null
+  # Reaps them, and a pid that is not this shell's child is no error here.
+  wait "$@" 2>/dev/null
+  return 0
 }

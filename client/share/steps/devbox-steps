@@ -23,8 +23,13 @@
 #                        cores of nproc stand for it; also the most runner
 #                        steps that run at once
 #   DEVBOX_WORKER_MEMORY the memory one test worker needs, 1536M by default
+#   DEVBOX_STEP_MEMORY   the memory a step without a runner reserves, 2G by
+#                        default (docs/specs/2026-11-16-step-memory-budget-design.md)
 #   DEVBOX_CGROUP_ROOT   the cgroup v2 directory of this workspace, whose
-#                        memory.max caps the workers; /sys/fs/cgroup by default
+#                        memory.max caps the workers and sets the memory
+#                        budget of the steps; /sys/fs/cgroup by default
+#   DEVBOX_MEMINFO       the meminfo file read when no cgroup file holds a
+#                        limit; /proc/meminfo by default
 # The project directory is the current directory.
 #
 # Exit status: 0 when no step failed, 1 when one did, 2 for a refused plan or
@@ -32,7 +37,8 @@
 # written once steps run, 143 after SIGTERM and 130 after SIGINT.
 #
 # stdout: one line when a step starts, ends, carries or resumes, one line the
-# first time the grant holds runner steps back, one
+# first time the grant holds runner steps back, one line the first time the
+# memory budget holds a step back, one
 # `devbox-steps: untraced <name> <reason>` line for a step whose trace cannot
 # run, then a summary table, the full log of each failed step after
 # `== <name>: <log path>`, the `devbox-steps: trace <name> <seq> <chunk>` lines
@@ -59,7 +65,7 @@ VITEST_DIR=node_modules/.devbox-ledger
 # ── the plan ─────────────────────────────────────────────────────────────────
 
 NAMES=()
-declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=() TESTS=() DIR=() TRACE=()
+declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=() TESTS=() DIR=() TRACE=() MEM=()
 
 n=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -132,7 +138,19 @@ while IFS= read -r line || [ -n "$line" ]; do
       fi
       if [ "$kind" = file ]; then FILES[$name]+="$path"$'\n'; else TESTS[$name]+="$path"$'\n'; fi
       ;;
-    *) plan_die "$n" "a line starts with step, file or test, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
+    memory)
+      # The memory= of .devbox/steps as bytes (step-memory-budget spec, D4):
+      # one worker of a runner step, or the reservation of a step without one.
+      if [ "${#tabs}" -ne 2 ] || [ "${#fields[@]}" -ne 3 ]; then
+        plan_die "$n" "a memory line has 3 non-empty fields separated by one tab"
+      fi
+      name="${fields[1]}"
+      [ -n "${MODE[$name]+x}" ] || plan_die "$n" "a memory line names $(printf '%q' "$name"), which no step line above it plans"
+      [ -z "${MEM[$name]+x}" ] || plan_die "$n" "the memory of $name is given twice"
+      [[ "${fields[2]}" =~ ^[1-9][0-9]{0,17}$ ]] || plan_die "$n" "the memory of $name is $(printf '%q' "${fields[2]}"), not a byte count"
+      MEM[$name]="${fields[2]}"
+      ;;
+    *) plan_die "$n" "a line starts with step, file, test or memory, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
   esac
 done <"$DEVBOX_STEPS_PLAN"
 [ "${#NAMES[@]}" -gt 0 ] || die "the plan $DEVBOX_STEPS_PLAN holds no step"
@@ -421,14 +439,22 @@ for f in memory.max memory.high; do
   [ ! -r "${DEVBOX_CGROUP_ROOT:-/sys/fs/cgroup}/$f" ] || read -r v <"${DEVBOX_CGROUP_ROOT:-/sys/fs/cgroup}/$f" || v=""
   if [[ "$v" =~ ^[0-9]+$ ]]; then MEMORY_MAX="$v"; break; fi
 done
-if [ -z "$MEMORY_MAX" ] && [ -r /proc/meminfo ]; then
-  v="$(awk '$1 == "MemTotal:" { print $2 * 1024; exit }' /proc/meminfo)" || v=""
+MEMINFO="${DEVBOX_MEMINFO:-/proc/meminfo}"
+if [ -z "$MEMORY_MAX" ] && [ -r "$MEMINFO" ]; then
+  v="$(awk '$1 == "MemTotal:" { print $2 * 1024; exit }' "$MEMINFO")" || v=""
   [[ "$v" =~ ^[0-9]+$ ]] && MEMORY_MAX="$v"
 fi
-MEMORY_CAP=""
+if ! STEP_MEMORY="$(size_bytes "${DEVBOX_STEP_MEMORY:-2G}")" || [ "$STEP_MEMORY" -eq 0 ]; then
+  die "DEVBOX_STEP_MEMORY is $(printf '%q' "${DEVBOX_STEP_MEMORY-}"), not a size such as 2G"
+fi
+# The memory budget of the steps that run at once, the workspace limit less
+# 4 GiB for the shell, the services and the page cache (step-memory-budget
+# spec, D1). Empty on a machine whose memory cannot be read, which then holds
+# no step by memory.
+BUDGET=""
 if [ -n "$MEMORY_MAX" ]; then
-  MEMORY_CAP=$(((MEMORY_MAX - 4 * 1073741824) / WORKER_MEMORY))
-  [ "$MEMORY_CAP" -ge 1 ] || MEMORY_CAP=1
+  BUDGET=$((MEMORY_MAX - 4 * 1073741824))
+  [ "$BUDGET" -ge 0 ] || BUDGET=0
 fi
 
 # The number of files each runner step runs: its list, or its test lines.
@@ -440,11 +466,34 @@ for name in "${NAMES[@]}"; do
   [ -z "$files" ] || FILE_COUNT[$name]="$(printf '%s' "$files" | awk 'END { print NR }')"
 done
 
+# The memory one worker of runner step $1 needs: its memory=, else
+# DEVBOX_WORKER_MEMORY.
+worker_memory() { printf '%s\n' "${MEM[$1]:-$WORKER_MEMORY}"; }
+
+# What step $1 reserves of the budget while it runs with $2 workers (D2): its
+# workers times their memory, or for a step without a runner its memory=, else
+# DEVBOX_STEP_MEMORY.
+step_reservation() {
+  if [ "${RUNNER[$1]}" = - ]; then
+    printf '%s\n' "${MEM[$1]:-$STEP_MEMORY}"
+  else
+    printf '%s\n' "$(($2 * $(worker_memory "$1")))"
+  fi
+}
+
+# Bytes as GiB with one decimal, for the progress lines. LC_ALL=C, because
+# under a locale with a decimal comma awk printed 12,0G.
+gib() { LC_ALL=C awk -v b="$1" 'BEGIN { printf "%.1fG", b / 1073741824 }'; }
+
 # step_workers <name> <runner steps that run at the same time>
 step_workers() {
-  local name="$1" n
+  local name="$1" n cap
   n=$((TOKENS / ($2 > 0 ? $2 : 1)))
-  [ -z "$MEMORY_CAP" ] || [ "$n" -le "$MEMORY_CAP" ] || n="$MEMORY_CAP"
+  if [ -n "$BUDGET" ]; then
+    cap=$((BUDGET / $(worker_memory "$name")))
+    [ "$cap" -ge 1 ] || cap=1
+    [ "$n" -le "$cap" ] || n="$cap"
+  fi
   [ "${FILE_COUNT[$name]}" = 0 ] || [ "$n" -le "${FILE_COUNT[$name]}" ] || n="${FILE_COUNT[$name]}"
   [ "$n" -ge 1 ] || n=1
   printf '%s\n' "$n"
@@ -768,14 +817,19 @@ run_step() {
   mv -f "$STATE_DIR/$name.tmp" "$STATE_DIR/$name.done"
 }
 
+# start_step <name> <workers> <reservation in bytes>
 start_step() {
-  local name="$1" workers
-  workers="$(step_workers "$name" "$2")"
+  local name="$1" workers="$2"
   : >"$(log_of "$name")" || fatal "cannot write the log $(log_of "$name")"
   ledger_step "$name" start
+  RESERVED[$name]="$3"
   # Before the fork, so a streamed step's first line never comes before its
-  # header.
-  echo "$(stamp) $name started"
+  # header. The reservation is named only where a budget holds steps.
+  if [ -n "$BUDGET" ]; then
+    echo "$(stamp) $name started, reserving $(gib "$3")"
+  else
+    echo "$(stamp) $name started"
+  fi
   if [ -n "${UNTRACED[$name]+x}" ]; then
     echo "devbox-steps: untraced $name ${UNTRACED[$name]}"
     echo "devbox-steps: $name runs untraced: ${UNTRACED[$name]}" >>"$(log_of "$name")"
@@ -898,7 +952,20 @@ finish_step() {
 # a runner is not held: it runs no worker pool. A held step starts in a later
 # pass, after a runner step ends, so whenever a step is held the loop below
 # waits on a running one.
+#
+# Memory is the second hold (step-memory-budget spec, D3). MEASURED: a gate
+# whose grant matched the host's cores started one runner step per token
+# beside the steps without a runner, in one workspace, and about a quarter of
+# its steps timed out on memory reclaim while most of the host's cores stood
+# idle: each step had sized its workers from the whole workspace. Now a step
+# starts only while its reservation fits what the running steps leave of the
+# budget. A runner step that does not fit shrinks its workers to fit first. A
+# step that cannot fit waits for a running one to end, and when none runs the
+# next ready step starts whatever its size, so no reservation can stall the
+# gate.
+declare -A RESERVED=()
 HELD_SAID=0
+MEM_SAID=0
 while :; do
   # The steps that start in one pass share the grant with the runner steps
   # already running, so two suites that start together get half each, not
@@ -927,10 +994,43 @@ while :; do
     fi
     starting+=("$name")
   done
-  for name in ${starting[@]+"${starting[@]}"}; do start_step "$name" "$runners"; done
+  reserved=0
+  active=0
+  for name in "${NAMES[@]}"; do
+    [ "${STATUS[$name]}" = running ] || continue
+    reserved=$((reserved + RESERVED[$name]))
+    active=$((active + 1))
+  done
+  mem_held=0
+  mem_first=""
+  for name in ${starting[@]+"${starting[@]}"}; do
+    workers="$(step_workers "$name" "$runners")"
+    need="$(step_reservation "$name" "$workers")"
+    if [ -n "$BUDGET" ] && [ "$need" -gt $((BUDGET - reserved)) ]; then
+      fit=0
+      [ "${RUNNER[$name]}" = - ] || [ "$BUDGET" -le "$reserved" ] || fit=$(((BUDGET - reserved) / $(worker_memory "$name")))
+      if [ "$fit" -ge 1 ]; then
+        workers="$fit"
+        need="$(step_reservation "$name" "$workers")"
+      elif [ "$active" -gt 0 ]; then
+        mem_held=$((mem_held + 1))
+        [ -n "$mem_first" ] || mem_first="$name needs $(gib "$need")"
+        continue
+      fi
+    fi
+    start_step "$name" "$workers" "$need"
+    reserved=$((reserved + need))
+    active=$((active + 1))
+  done
   if [ "$held" -gt 0 ] && [ "$HELD_SAID" = 0 ]; then
     HELD_SAID=1
     echo "$(stamp) $held runner steps wait: at most $TOKENS run at once, one per token of the grant"
+  fi
+  if [ "$mem_held" -gt 0 ] && [ "$MEM_SAID" = 0 ]; then
+    MEM_SAID=1
+    free=$((BUDGET - reserved))
+    [ "$free" -ge 0 ] || free=0
+    echo "$(stamp) $mem_held steps wait for memory: $(gib "$free") of $(gib "$BUDGET") free, $mem_first"
   fi
   [ "$(running_names)" != nothing ] || break
   # The status is read from each step's result file below; wait -n only blocks

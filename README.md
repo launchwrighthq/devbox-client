@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.1.4"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.2.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.4"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.2.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.1.4"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.2.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.1.4 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.2.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -154,6 +154,7 @@ The gate itself is `.devbox/steps` beside this file. A `.devbox/config.env` with
 | `DEVBOX_SERVICES` | no | some of `postgres redis rabbitmq minio`, separated by spaces; see "Services" |
 | `DEVBOX_SERVICE_ENV` | no | `<name>=<VARIABLE>` pairs: the variable a service's value is exported under |
 | `DEVBOX_WORKER_MEMORY` | no | the memory one test worker needs, `1536M` by default; it caps the worker count |
+| `DEVBOX_STEP_MEMORY` | no | the memory a step without a runner reserves while it runs, `2G` by default |
 | `DEVBOX_RUNPOD_IMAGE` | no | the RunPod image; a value in `.devbox.env` wins |
 | `DEVBOX_GATE_MAX_SECONDS` | no | the gate's wall-clock limit on a deployed target, counted from the moment the gate starts; default `7200`, at most `14400` |
 | `DEVBOX_LANES` | no | how many workspaces this worktree may hold on each target, so that many of its runs can run there at once; default `2`, `1` to `4` |
@@ -204,7 +205,7 @@ before ` -- ` are the name and its attributes, and the words after it are the co
 ```
 <name> [each=<dir>/] [after=<step>,<step>] [runner=vitest|pytest] [narrow=failed]
        [dir=<dir>/] [shards=<n>] [requires=<token>,<token>] [inputs=<path>,<path>]
-       [rerun=always] -- <command>
+       [memory=<size>] [rerun=always] -- <command>
 ```
 
 | Attribute | Meaning |
@@ -217,6 +218,7 @@ before ` -- ` are the name and its attributes, and the words after it are the co
 | `shards=4` | the number of CI jobs `devbox ci matrix` gives this runner step |
 | `requires=tok,tok` | `DEVBOX_REQUIRES` tokens that only this step needs; a run asks the targets for the tokens of the steps it runs |
 | `inputs=src/,tests/` | an override of what the step reads; a step without a runner that sets it is never traced |
+| `memory=4G` | the memory of one worker of a runner step, or what a step without a runner reserves while it runs |
 | `rerun=always` | always run in full |
 
 `select=related` exits 2 since release 4.0, by its line: every runner step selects its test
@@ -241,8 +243,8 @@ ran` or `stopped by SIGTERM`. A step that passed while a test file of it failed 
 red, and `devbox verify` exits 1.
 
 **What a step reads.** A step without `inputs=` learns its inputs from `strace -f`. The runner
-traces it when it has no valid trace, when its line, `.devbox/config.env` or the client version
-changed since its trace, and on `--full`, and runs it untraced in between, because the trace
+traces it when it has no valid trace, when its line, `.devbox/config.env` or the client's trace
+format changed since its trace, and on `--full`, and runs it untraced in between, because the trace
 made a type check and a lint run several times as long. The key then covers the content of the
 files the trace read, the names of the entries directly in each directory it listed, and the
 lock files when it read under `node_modules/` or `.venv/`, so an edit to a file the step only
@@ -254,6 +256,14 @@ reporter and a hook in every vitest worker record what each test file opens, lis
 also through a cached module. When the step's key changed, it runs only the test files that
 can see the change: `changed`, `failed`, `new`, `no trace`, `partial` or `read <path>`. No such
 file carries the step with `no test read a changed file`. A missing map runs the step in full.
+
+**One map per context.** A step keeps one map per context, at
+`<git common dir>/devbox/maps/<step>.<context>.map`, and its 8 newest. A runner step's context
+is the config, its line, the forwarded values and the lock files; a step with no runner's is the
+config and its line. Neither holds the client version, so worktrees on other client versions or
+other lock files keep their own maps and never reset each other's passes. A lock file edit
+starts a new map for a runner step only. An older client's `<step>.map` is never read or
+changed.
 
 A `worker_threads` Worker, or a `node` child, that a test starts directly records its reads for
 that test file. A test file is partial, because its trace may miss reads, when:
@@ -273,8 +283,12 @@ pytest step `-n <n>` when pytest-xdist loads. `<n>` is the grant (`DEVBOX_TOKENS
 cores of `nproc` on a laptop) divided by the runner steps running at that moment, capped by the
 workspace memory less 4 GiB divided by `DEVBOX_WORKER_MEMORY`, and by the step's file count. A
 command that sets `--maxWorkers`, `--pool-options`, `-n` or `--numprocesses` keeps its value.
-At most as many runner steps as the grant has tokens run at once; a step without a runner never
-waits. The client never passes `--exclude`: a resumed or selected step gets the files it must
+At most as many runner steps as the grant has tokens run at once. The steps that run at once
+also share the workspace memory less 4 GiB: a runner step reserves its workers times their
+memory, any other step its `memory=`, else `DEVBOX_STEP_MEMORY`, else 2G. A step starts only
+while its reservation fits, a runner step first shrinks its workers to fit, and one line says
+`<n> steps wait for memory` the first time a step waits. When no step runs, the next one starts
+whatever its size. The client never passes `--exclude`: a resumed or selected step gets the files it must
 run, each under its `dir=` and a test file of its runner.
 
 Every gate writes a record under `<git common dir>/devbox/records/`. It gives each test file to

@@ -589,6 +589,13 @@ unset FAKE_CPU_LIMIT
 doctor
 assert_ok "the admission rule is an ok row with the host's readings" \
   contains "ok   admission on fixture: pressure: cpu idle 62.40 (at least 25), memory some 0.00 (limit 5), io full 0.00 (limit 10), settle 30s" "$out"
+# The busy wait of the gate-overload spec, D6: the host's text names the free
+# cores, the head's want and its wait left, and the client prints it as it
+# came, with no field of its own to parse.
+export FAKE_ADMISSION="ok pressure: cpu idle 31.25 (at least 25), memory some 0.00 (limit 5), io full 0.00 (limit 10), settle 30s, at most 3 jobs, busy wait up to 60s, 5 of 16 cores free, the head wants 12 and has 20s of its 35s busy wait left"
+doctor
+assert_ok "the admission row carries the busy wait the host names" \
+  contains "ok   admission on fixture: pressure: cpu idle 31.25 (at least 25), memory some 0.00 (limit 5), io full 0.00 (limit 10), settle 30s, at most 3 jobs, busy wait up to 60s, 5 of 16 cores free, the head wants 12 and has 20s of its 35s busy wait left" "$out"
 export FAKE_ADMISSION="skipped /proc/stat holds no cpu line this program reads, so every pass with a job running refuses"
 doctor
 assert_ok "an idle share the host cannot read is a skip row with its reason" \

@@ -29,7 +29,8 @@ TOOLS="$REPO/client/share/ledger"
 TMP="$(mktemp -d)" || { echo "mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 unset DEVBOX_STEPS_PLAN DEVBOX_STEPS_LOGS DEVBOX_LEDGER DEVBOX_RESUME DEVBOX_LEDGER_TOOLS \
-  DEVBOX_TOKENS DEVBOX_WORKER_MEMORY DEVBOX_CGROUP_ROOT DEVBOX_WORKERS DEVBOX_TRACE_DIR NODE_OPTIONS
+  DEVBOX_TOKENS DEVBOX_WORKER_MEMORY DEVBOX_CGROUP_ROOT DEVBOX_WORKERS DEVBOX_TRACE_DIR NODE_OPTIONS \
+  DEVBOX_STEP_MEMORY DEVBOX_MEMINFO
 
 PROJ="$TMP/project"
 BIN="$TMP/bin"
@@ -147,7 +148,7 @@ assert_eq "4" "$(awk -F '\t' '$1 == "step" && $3 == "pass" && NF == 4 && $4 ~ /^
   "each pass line is step, name, pass and whole seconds, the existing ledger format"
 assert_ok "a progress line names the step that ended and the steps still running" \
   grep -Eq '^\[[0-9]+ s\] b passed \([0-9]+ s\); running: c$' <<<"$OUT"
-assert_ok "a line says when a step starts" grep -Eq '^\[[0-9]+ s\] d started$' <<<"$OUT"
+assert_ok "a line says when a step starts, and what it reserves of the budget" grep -Eq '^\[[0-9]+ s\] d started, reserving 2\.0G$' <<<"$OUT"
 assert_ok "the summary table has one line per step with outcome, seconds and code" \
   grep -Eq '^  c +pass +[0-9]+ s  code 0$' <<<"$OUT"
 assert_eq "devbox-steps: result a pass
@@ -543,6 +544,120 @@ assert_eq "0" "$RC" "a 1-token grant runs four runner steps one at a time: $ERR"
 assert_eq "r1:start r1:end r2:start r2:end r3:start r3:end r4:start r4:end" "$(tr '\n' ' ' <"$CAP_EV" | sed 's/ $//')" \
   "in plan order, each after the one before ended, r3 after r1"
 
+# ── the step memory budget (docs/specs/2026-11-16-step-memory-budget-design.md)
+#
+# MEASURED: a gate whose grant matched the host's cores started one runner step
+# per token beside the steps without a runner, in one workspace, and about a
+# quarter of its steps timed out on memory reclaim while most of the host's
+# cores stood idle. Each step sized its workers from the whole workspace.
+
+# D1: the budget is the workspace limit less 4 GiB. A 16 GiB memory.max gives
+# 12 GiB, which one 12G step fills and a second 1-byte step then waits on.
+CG16="$TMP/cgroup-16g"
+mkdir -p "$CG16"
+printf '17179869184\n' >"$CG16/memory.max"
+BUD_EV="$TMP/budget-events"
+q_bud="$(printf '%q' "$BUD_EV")"
+: >"$BUD_EV"
+{
+  plan_step big run - - "echo big:start >>$q_bud; sleep 0.4; echo big:end >>$q_bud"
+  plan_step tiny run - - "echo tiny:start >>$q_bud; echo tiny:end >>$q_bud"
+  printf 'memory\tbig\t%s\n' 12884901888
+  printf 'memory\ttiny\t1\n'
+} >"$TMP/budget16.plan"
+run_steps budget16 "$TMP/budget16.plan" DEVBOX_CGROUP_ROOT="$CG16"
+assert_eq "0" "$RC" "D1: a plan whose steps fill the budget still passes: $ERR"
+assert_eq "big:start big:end tiny:start tiny:end" "$(tr '\n' ' ' <"$BUD_EV" | sed 's/ $//')" \
+  "D1: a 16 GiB workspace has a 12 GiB budget, so a 12G step leaves no room for a second step"
+assert_ok "D5: the wait line names the free memory, the budget and the need" \
+  grep -Eq '^\[[0-9]+ s\] 1 steps wait for memory: 0\.0G of 12\.0G free, tiny needs 0\.0G$' <<<"$OUT"
+
+# D1: a machine with no readable limit holds no step by memory, and its
+# progress lines name no reservation.
+NOCG="$TMP/cgroup-none"
+mkdir -p "$NOCG"
+: >"$BUD_EV"
+run_steps budget-none "$TMP/budget16.plan" DEVBOX_CGROUP_ROOT="$NOCG" DEVBOX_MEMINFO="$TMP/no-meminfo"
+assert_eq "0" "$RC" "D1: a workspace with no cgroup file and no meminfo runs its plan: $ERR"
+assert_eq "0" "$(grep -c 'wait for memory' <<<"$OUT")" "D1: no step is held when no limit can be read"
+assert_ok "D1: and a progress line names no reservation" grep -Eq '^\[[0-9]+ s\] big started$' <<<"$OUT"
+
+# D2: each reservation is named on its progress line: a runner step its
+# workers times its worker memory, a step without a runner its memory=, else
+# DEVBOX_STEP_MEMORY, else 2G.
+{
+  plan_step suite run vitest - 'npx vitest run'
+  plan_step lint run - - 'true'
+  plan_step docs run - - 'true'
+  printf 'memory\tlint\t%s\n' 3221225472
+} >"$TMP/reserve.plan"
+: >"$ARGV_LOG"
+run_steps reserve "$TMP/reserve.plan" DEVBOX_TOKENS=2 DEVBOX_CGROUP_ROOT="$CG16"
+assert_eq "0" "$RC" "D2: the three steps pass: $ERR"
+assert_ok "D2: a runner step reserves its workers times 1536M: 2 workers, 3.0G" \
+  grep -Eq '^\[[0-9]+ s\] suite started, reserving 3\.0G$' <<<"$OUT"
+assert_ok "D2: a step without a runner reserves its memory=, 3G" \
+  grep -Eq '^\[[0-9]+ s\] lint started, reserving 3\.0G$' <<<"$OUT"
+assert_ok "D2: a step with no memory= reserves 2G by default" \
+  grep -Eq '^\[[0-9]+ s\] docs started, reserving 2\.0G$' <<<"$OUT"
+run_steps reserve-env "$TMP/reserve.plan" DEVBOX_TOKENS=2 DEVBOX_CGROUP_ROOT="$CG16" DEVBOX_STEP_MEMORY=1073741824
+assert_ok "D2: DEVBOX_STEP_MEMORY replaces the 2G default" \
+  grep -Eq '^\[[0-9]+ s\] docs started, reserving 1\.0G$' <<<"$OUT"
+run_steps bad-step-memory "$TMP/reserve.plan" DEVBOX_STEP_MEMORY=lots
+assert_eq "2" "$RC" "a DEVBOX_STEP_MEMORY that is not a size is refused with exit 2"
+assert_ok "  naming DEVBOX_STEP_MEMORY" grep -q 'DEVBOX_STEP_MEMORY is lots' <<<"$ERR"
+
+# D3: with a 6 GiB budget (a 10 GiB memory.max), four 2G steps run at most
+# three at once.
+CG10="$TMP/cgroup-10g"
+mkdir -p "$CG10"
+printf '10737418240\n' >"$CG10/memory.max"
+: >"$BUD_EV"
+{
+  for s in a b c d; do
+    plan_step "$s" run - - "echo $s:start >>$q_bud; sleep 0.4; echo $s:end >>$q_bud"
+  done
+} >"$TMP/four.plan"
+run_steps four "$TMP/four.plan" DEVBOX_CGROUP_ROOT="$CG10"
+assert_eq "0" "$RC" "D3: four 2G steps in a 6 GiB budget all pass: $ERR"
+peak="$(awk -F: '{ n += ($2 == "start") ? 1 : -1; if (n > m) m = n } END { print m + 0 }' "$BUD_EV")"
+assert_eq "3" "$peak" "D3: at most three 2G steps run at once in a 6 GiB budget"
+assert_eq "1" "$(grep -c 'steps wait for memory' <<<"$OUT")" "D5: the wait line is printed once, however many passes hold a step"
+
+# D3: one step larger than the whole budget still starts when none runs.
+: >"$BUD_EV"
+{
+  plan_step huge run - - "echo huge:start >>$q_bud; echo huge:end >>$q_bud"
+  printf 'memory\thuge\t%s\n' 8589934592
+} >"$TMP/huge.plan"
+run_steps huge "$TMP/huge.plan" DEVBOX_CGROUP_ROOT="$CG10"
+assert_eq "0" "$RC" "D3: an 8G step in a 6 GiB budget passes: $ERR"
+assert_eq "huge:start huge:end" "$(tr '\n' ' ' <"$BUD_EV" | sed 's/ $//')" "D3: and it ran, because no step was running"
+
+# D3: a runner step shrinks its workers to what the budget leaves. A 3G step
+# without a runner starts first and leaves 3 GiB of 6, so a 4-token runner
+# step gets 2 workers of 1536M, not 3.
+{
+  plan_step build run - - 'sleep 0.4'
+  plan_step suite run vitest - 'npx vitest run'
+  printf 'memory\tbuild\t%s\n' 3221225472
+} >"$TMP/shrink.plan"
+: >"$ARGV_LOG"
+run_steps shrink "$TMP/shrink.plan" DEVBOX_TOKENS=4 DEVBOX_CGROUP_ROOT="$CG10"
+assert_eq "0" "$RC" "D3: the shrunk runner step passes: $ERR"
+assert_eq "$(printf '%s\n' run --maxWorkers=2)" "$(argv_call 1)" "D3: a runner step shrinks to the 2 workers that fit the 3 GiB left"
+
+# D4: memory= of a runner step is the memory of one of its workers. With 1G
+# workers, an 8 GiB memory.high (a 4 GiB budget) holds 4 of them.
+{
+  plan_step suite run vitest - 'npx vitest run'
+  printf 'memory\tsuite\t%s\n' 1073741824
+} >"$TMP/worker-mem.plan"
+: >"$ARGV_LOG"
+printf '8589934592\n' >"$CG8/memory.high"
+run_steps worker-mem "$TMP/worker-mem.plan" DEVBOX_TOKENS=12 DEVBOX_CGROUP_ROOT="$CG8"
+assert_eq "$(printf '%s\n' run --maxWorkers=4)" "$(argv_call 1)" "D4: memory=1G on a runner step sizes its workers as DEVBOX_WORKER_MEMORY=1G would"
+
 # ── row D6: a step may run in a subfolder ────────────────────────────────────
 
 mkdir -p "$PROJ/service/tests" "$PROJ/web"
@@ -662,7 +777,10 @@ refused "a select step with no runner" 2 'names no runner' "$(plan_step x select
 refused "a file that starts with -" 3 'starts with -' "$(plan_step x narrow vitest - 'npx vitest run'; plan_file x --reporter=json)"
 refused "a test file that starts with -" 3 'starts with -' "$(plan_step x run vitest - 'npx vitest run'; plan_test x -x)"
 refused "a file outside the dir of its step" 3 'is outside service/' "$(plan_step x narrow pytest - pytest service/; plan_file x tests/test_a.py)"
-refused "a line of another kind" 2 'starts with step, file or test' 'hello'
+refused "a line of another kind" 2 'starts with step, file, test or memory' 'hello'
+refused "a memory line before its step" 2 'no step line above it' "$(printf 'memory\tx\t1024\n'; plan_step x run - - true)"
+refused "a memory that is not a byte count" 3 'not a byte count' "$(plan_step x run - - true; printf 'memory\tx\t2G\n')"
+refused "a memory given twice" 4 'given twice' "$(plan_step x run - - true; printf 'memory\tx\t1024\nmemory\tx\t2048\n')"
 
 # ── a streamed step whose log fills up ───────────────────────────────────────
 #

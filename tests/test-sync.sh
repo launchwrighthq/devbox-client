@@ -45,6 +45,12 @@ echo private > "$(git rev-parse --git-dir)/devbox-runpod/key"
 mkdir -p "$(git rev-parse --git-dir)/devbox-hetzner"
 echo private > "$(git rev-parse --git-dir)/devbox-hetzner/gate-password"
 echo cached > "$SYNC_DEST/node_modules/cache"
+# devbox's own records and maps sit in the common dir, and a workspace from an
+# older client already holds a copy of them.
+mkdir -p "$(git rev-parse --path-format=absolute --git-common-dir)/devbox/records" \
+  "$SYNC_DEST/.git-common/devbox/records"
+echo log > "$(git rev-parse --path-format=absolute --git-common-dir)/devbox/records/run.log"
+echo stale > "$SYNC_DEST/.git-common/devbox/records/old.log"
 echo untracked > new-source
 mkdir -p .idea .playwright-mcp playwright-report test-results .claude/logs .claude/worktrees/peer
 for f in .idea/workspace.xml .aider.chat.history.md .playwright-mcp/page.png playwright-report/index.html \
@@ -56,6 +62,8 @@ assert_ok 'syncs a linked checkout using the shared helper' devbox_sync
 assert_eq fixture "$(git -C "$SYNC_DEST" branch --show-current)" 'retains the real branch, not a synthetic clone'
 assert_eq "$(git rev-parse HEAD)" "$(git -C "$SYNC_DEST" rev-parse HEAD)" 'retains the checkout commit and its shared objects'
 assert_fail 'removes a prior copy of an unrelated worktree' test -e "$SYNC_DEST/.git-common/worktrees/peer"
+assert_fail 'does not send the records and maps in the common dir' test -e "$SYNC_DEST/.git-common/devbox/records/run.log"
+assert_fail 'removes the copy of them an older client sent' test -e "$SYNC_DEST/.git-common/devbox"
 assert_eq one "$(cat "$SYNC_DEST/tracked")" 'copies tracked source'
 assert_eq untracked "$(cat "$SYNC_DEST/new-source")" 'copies new source'
 assert_eq template "$(cat "$SYNC_DEST/.env.staging.example")" 'keeps credential templates'

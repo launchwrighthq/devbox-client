@@ -56,7 +56,7 @@ new_repo() {
   rm -rf "$TRACES" && mkdir -p "$TRACES"
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
-    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=()
+    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=() STEP_MEMORY=()
   PLAN_SHARD=""
 }
 
@@ -266,14 +266,22 @@ assert_eq "web=select api=carry" "$(actions)" "a new web test file goes to web, 
 assert_eq "web/src/n.test.ts" "$(files_of web)" "alone"
 trace web "read web/src/n.test.ts web/src/n.test.ts"
 gate
-rm "$(devbox_map_dir)/test.map"
+# Gate overload D8: under --step, the plan still reads the map of every step
+# of the runner, each under its own context, to tell whose new test file it is.
+printf 'test("m", () => {})\n' >api/src/m.test.ts
+plan changed web
+assert_eq "web=carry" "$(actions)" "a new api test file leaves web, planned alone, with nothing to run"
+assert_fail "a new api test file never reaches web, planned alone, because api's map is read" \
+  grep -q 'api/src/m.test.ts' "$P"
+rm api/src/m.test.ts
+rm "$(devbox_map_dir)"/test.*.map
 edit src/a.py
 plan changed test
 assert_eq "test=run" "$(actions)" "a step whose map is gone runs in full"
 assert_ok "and says no map" contains "no map" "$(reason_of test)"
 pytest_trace
 gate
-printf 'map\t1\nfile\tbroken\n' >"$(devbox_map_dir)/test.map"
+printf 'map\t1\nfile\tbroken\n' >"$(devbox_map_dir)/test.${PLAN_CTX[test]}.map"
 edit src/a.py
 plan changed test
 assert_eq "test=run" "$(actions)" "a map that cannot be read runs the step in full"
@@ -382,13 +390,13 @@ echo "-- D4b: a step that cannot be traced keeps its inputs and says why"
 plan full
 trace lint "partial - strace: not found"
 gate
-assert_eq "strace: not found" "$(devbox_map_untraced lint)" "its map is marked untraced"
+assert_eq "strace: not found" "$(devbox_map_untraced lint "${PLAN_CTX[lint]}")" "its map is marked untraced"
 edit src/a.py
 plan changed
 assert_eq "lint=run" "$(actions)" "an edit to an input it read before runs it"
 assert_ok "and --plan names the reason" contains "no trace: strace: not found" "$(devbox_plan_print)"
 assert_eq 0 "$(traced lint)" "its earlier trace stays valid, so it is not traced on every run"
-rm "$(devbox_map_dir)/lint.map"
+rm "$(devbox_map_dir)"/lint.*.map
 plan full
 trace lint "partial - strace: not found"
 gate
@@ -406,7 +414,7 @@ gate
 edit README.md
 plan changed
 assert_eq "lint=carry" "$(actions)" "its own list decides"
-assert_eq none "$(devbox_map_state lint)" "and it has no map"
+assert_eq none "$(devbox_map_state lint "${PLAN_CTX[lint]}")" "and it has no map"
 
 echo "-- dir=: a step's test files are those of its folder"
 new_repo dir
@@ -460,7 +468,7 @@ assert_eq "web=select api=carry" "$(actions)" "a step with failed files of other
 assert_eq "web/src/w.test.ts" "$(files_of web)" "its own failed file alone: neither another folder's test file nor a file the name rule rejects"
 assert_eq "failed" "$(freason_of web web/src/w.test.ts)" "as failed"
 assert_fail "and no test line of web leaves its folder" grep -q $'^test\tweb\tapi/' "$P"
-rm "$(devbox_map_dir)/web.map"
+rm "$(devbox_map_dir)"/web.*.map
 plan changed
 assert_eq "web=narrow api=carry" "$(actions)" "with no map, the step narrows"
 assert_eq "web/src/w.test.ts" "$(files_of web)" "to its own failed file alone"
@@ -533,5 +541,85 @@ plan changed lint; rc=$?
 assert_eq 0 "$rc" "--shard 1/1 of a step with no runner is the whole step"
 assert_eq "lint" "$(awk -F'\t' '$1 == "step" { print $2 }' "$P")" "and plans that one step"
 PLAN_SHARD=""
+
+echo "-- gate overload D8, D8b and D10: one map per context, two lock files in turn"
+# MEASURED: worktrees of one checkout on three client versions shared one map
+# per step and reset each other's run ids on every gate, so about 4 in 10 runs
+# of a project's test steps ran in full. Two lock files in turn are two
+# contexts of a runner step.
+new_repo d8
+add_step test runner=pytest
+add_step lint
+mkdir -p "$(devbox_map_dir)"
+printf 'map\t1\ncontext\t-\t-\nstep\t-\tcomplete\t-\t-\n' >"$(devbox_map_dir)/test.map"
+cp "$(devbox_map_dir)/test.map" "$TMP/legacy"
+plan changed
+assert_eq "test=run lint=run" "$(actions)" "D10: a legacy map is never read, so the first plan runs in full"
+pytest_trace
+trace lint "read - src/b.py"
+gate
+ctxa="${PLAN_CTX[test]}" ctxl="${PLAN_CTX[lint]}"
+cp "$(devbox_map_dir)/test.$ctxa.map" "$TMP/map-a"
+printf 'lock v2\n' >package-lock.json
+plan changed
+assert_eq "test=run lint=carry" "$(actions)" \
+  "D8b: a lock file edit gives the runner step a new map, and the lint, which read nothing under a setup output, carries"
+assert_ok "D8b: the runner step's context holds the setup key" test "${PLAN_CTX[test]}" != "$ctxa"
+assert_eq "$ctxl" "${PLAN_CTX[lint]}" "D8b: the lint's context does not"
+assert_ok "D8b: and the runner step runs for want of a map of this context" contains "no map" "$(reason_of test)"
+pytest_trace
+gate
+ctxb="${PLAN_CTX[test]}"
+assert_ok "D8: the other lock file's map is untouched" cmp -s "$TMP/map-a" "$(devbox_map_dir)/test.$ctxa.map"
+edit src/a.py
+plan changed test
+assert_eq "test=select" "$(actions)" "D8: the second gate under the new lock file selects"
+assert_eq "tests/test_a.py" "$(files_of test)" "the test file that read the change"
+trace test "read tests/test_a.py src/a.py" "read tests/test_a.py .venv/lib/x.py"
+gate
+cp "$(devbox_map_dir)/test.$ctxb.map" "$TMP/map-b"
+printf 'package-lock.json v1\n' >package-lock.json
+plan changed test
+assert_eq "$ctxa" "${PLAN_CTX[test]}" "D8: the first lock file reads its own map again"
+assert_eq "test=select" "$(actions)" "D8: and the second gate under it selects, its passes kept"
+assert_eq "tests/test_a.py" "$(files_of test)" "the test file whose read changed since its pass under this lock file"
+trace test "read tests/test_a.py src/a.py" "read tests/test_a.py .venv/lib/x.py"
+gate
+assert_ok "D8: the second lock file's map is untouched in turn" cmp -s "$TMP/map-b" "$(devbox_map_dir)/test.$ctxb.map"
+assert_ok "D10: the legacy map is byte-identical after every gate" cmp -s "$TMP/legacy" "$(devbox_map_dir)/test.map"
+
+echo "-- gate overload D11 and D11a: a client version keeps the maps, a trace format does not"
+# The map base and the trace base hashed the client VERSION, so every release,
+# a patch included, reset the passes of every map and traced each step with no
+# runner again under strace.
+new_repo d11
+add_step test runner=pytest
+add_step lint
+version_file="$DEVBOX_CLIENT_VERSION_FILE"
+DEVBOX_CLIENT_VERSION_FILE="$TMP/VERSION"
+printf '9.0.0\n' >"$DEVBOX_CLIENT_VERSION_FILE"
+plan changed
+pytest_trace
+trace lint "read - src/b.py"
+gate
+ctxt="${PLAN_CTX[test]}" ctxl="${PLAN_CTX[lint]}"
+printf '9.0.1\n' >"$DEVBOX_CLIENT_VERSION_FILE"
+plan changed
+assert_eq "$ctxt $ctxl" "${PLAN_CTX[test]} ${PLAN_CTX[lint]}" "D11: another VERSION reads the same maps"
+assert_eq 1 "$(find "$(devbox_map_dir)" -name 'test.*.map' | wc -l)" "D11: and the runner step has one map"
+assert_eq "test=carry lint=run" "$(actions)" "D11: the step key keeps the version, so the lint runs once, and the runner step selects"
+assert_eq "no test read a changed file" "$(reason_of test)" "D11: on an unchanged tree its selection carries"
+assert_eq 0 "$(traced lint)" "D11: the lint is not traced again"
+edit src/a.py
+plan changed
+assert_eq "test=select" "$(actions | cut -d' ' -f1)" "D11: a changed file selects on the kept map"
+assert_eq "tests/test_a.py" "$(files_of test)" "the test file that read it"
+DEVBOX_TRACE_FORMAT=2
+plan changed
+assert_ok "D11a: a new trace format starts a new map" test "${PLAN_CTX[test]} ${PLAN_CTX[lint]}" != "$ctxt $ctxl"
+assert_eq "test=run lint=run" "$(actions)" "D11a: and runs each step in full"
+assert_eq "1 1" "$(traced test) $(traced lint)" "D11a: traced"
+DEVBOX_TRACE_FORMAT=1
+DEVBOX_CLIENT_VERSION_FILE="$version_file"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

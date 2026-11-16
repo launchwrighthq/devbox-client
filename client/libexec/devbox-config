@@ -76,7 +76,7 @@ DEVBOX_CONFIG_KEYS=" DEVBOX_PROJECT DEVBOX_WANT_TOKENS DEVBOX_MIN_TOKENS DEVBOX_
 DEVBOX_FORWARD_ENV DEVBOX_RUNPOD_IMAGE \
 DEVBOX_ENVIRONMENT DEVBOX_PROVISION DEVBOX_SETUP DEVBOX_GATE_MAX_SECONDS DEVBOX_LANES \
 DEVBOX_MAX_RESUMES DEVBOX_RERUN DEVBOX_SETUP_INPUTS DEVBOX_SETUP_OUTPUTS DEVBOX_SHARED_INPUTS \
-DEVBOX_LOCAL_GATE DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_WORKER_MEMORY "
+DEVBOX_LOCAL_GATE DEVBOX_SERVICES DEVBOX_SERVICE_ENV DEVBOX_WORKER_MEMORY DEVBOX_STEP_MEMORY "
 
 # The replacement of each key that release 4.0 removed from .devbox/config.env
 # (docs/specs/2026-11-14-learned-selection-design.md, section 11). Each is
@@ -261,9 +261,9 @@ devbox_service_of_slot() {
 # file since release 4.0 (devbox_config_removed_key), so an exported value of
 # either is replaced here.
 #
-# Sets DEVBOX_WORKER_MEMORY_BYTES, which the hooks export to the workspace as
-# DEVBOX_WORKER_MEMORY.
-# shellcheck disable=SC2034  # DEVBOX_WORKER_MEMORY_BYTES is read by devbox_hooks_script
+# Sets DEVBOX_WORKER_MEMORY_BYTES and DEVBOX_STEP_MEMORY_BYTES, which the hooks
+# export to the workspace as DEVBOX_WORKER_MEMORY and DEVBOX_STEP_MEMORY.
+# shellcheck disable=SC2034  # both _BYTES values are read by devbox_hooks_script
 devbox_config_services() {
   local file="$1" key s pair slot name seen=" " names=" " n
   for key in DEVBOX_SERVICES DEVBOX_SERVICE_ENV; do
@@ -316,18 +316,29 @@ devbox_config_services() {
     DEVBOX_NEEDS_POSTGRES=0
     DEVBOX_DB_URL_VAR=""
   fi
-  # DEVBOX_WORKER_MEMORY, the memory one test worker needs (section 7). The
-  # runner divides by it in bash arithmetic, which evaluates whatever text it
-  # is given, so the value is checked here and crosses as a byte count. Nine
-  # digits keep 999999999G inside a 64-bit integer.
+  # DEVBOX_WORKER_MEMORY, the memory one test worker needs (section 7), and
+  # DEVBOX_STEP_MEMORY, the memory a step without a runner reserves (the
+  # step-memory-budget spec, D2). The runner computes with both in bash
+  # arithmetic, which evaluates whatever text it is given, so each is checked
+  # here and crosses as a byte count.
   case "$DEVBOX_KV_SEEN" in *" DEVBOX_WORKER_MEMORY "*) ;; *) DEVBOX_WORKER_MEMORY=1536M ;; esac
-  if [[ ! "$DEVBOX_WORKER_MEMORY" =~ ^([1-9][0-9]{0,8})([KMG]?)$ ]]; then
-    echo "devbox: $file: refusing DEVBOX_WORKER_MEMORY '$DEVBOX_WORKER_MEMORY': write a whole number with K, M or G, such as 1536M" >&2
-    return 2
-  fi
-  n="${BASH_REMATCH[1]}"
+  case "$DEVBOX_KV_SEEN" in *" DEVBOX_STEP_MEMORY "*) ;; *) DEVBOX_STEP_MEMORY=2G ;; esac
+  for key in DEVBOX_WORKER_MEMORY DEVBOX_STEP_MEMORY; do
+    if ! n="$(devbox_size_bytes "${!key}")"; then
+      echo "devbox: $file: refusing $key '${!key}': write a whole number with K, M or G, such as 1536M" >&2
+      return 2
+    fi
+    printf -v "${key}_BYTES" '%s' "$n"
+  done
+}
+
+# The bytes of a size written as a whole number with K, M or G, such as 1536M,
+# or status 1. Nine digits keep 999999999G inside a 64-bit integer.
+devbox_size_bytes() {
+  [[ "$1" =~ ^([1-9][0-9]{0,8})([KMG]?)$ ]] || return 1
+  local n="${BASH_REMATCH[1]}"
   case "${BASH_REMATCH[2]}" in K) n=$((n * 1024)) ;; M) n=$((n * 1048576)) ;; G) n=$((n * 1073741824)) ;; esac
-  DEVBOX_WORKER_MEMORY_BYTES="$n"
+  printf '%s\n' "$n"
 }
 
 # Whether a checkout with no .devbox.env may run its gate on this machine
@@ -849,8 +860,11 @@ SETUP
   # machine for --local.
   [ -z "${DEVBOX_STEPS_HOOKS:-}" ] || printf '%s\n' "$DEVBOX_STEPS_HOOKS"
   # The memory one test worker needs, for the runner's worker cap (learned-
-  # selection spec, section 7), as a byte count devbox_config_services checked.
+  # selection spec, section 7), and the memory a step without a runner
+  # reserves (step-memory-budget spec, D2), as byte counts
+  # devbox_config_services checked.
   [ -z "${DEVBOX_WORKER_MEMORY_BYTES:-}" ] || printf 'export DEVBOX_WORKER_MEMORY=%s\n' "$DEVBOX_WORKER_MEMORY_BYTES"
+  [ -z "${DEVBOX_STEP_MEMORY_BYTES:-}" ] || printf 'export DEVBOX_STEP_MEMORY=%s\n' "$DEVBOX_STEP_MEMORY_BYTES"
   # devbox_services, which the step runner's devbox_verify calls before the
   # first step (D8), on all three remote paths. RUN_ID is devbox-verify's run
   # id, which names the run's vhost and bucket.

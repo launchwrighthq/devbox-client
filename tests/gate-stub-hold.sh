@@ -51,11 +51,12 @@
 # keeps a ticket file in $FAKE_TICKETS (when set) from its start to its end,
 # so a test can read which queues still hold a run.
 #
-# A queued run reads NO stdin, as the real pool reads none before its grant.
-# This stub once read stdin while queued, so an `abort` ended its wait, and
-# every client test passed while a real queued pool ignored that line and kept
-# its ticket until its own grant. The client leaves a queue by killing that
-# join's ssh, and the host notices the session is gone: here a watcher removes
+# A queued run reads NO stdin, as a pool older than the end-of-stdin test
+# reads none before its grant, and a client must still leave such a host. This
+# stub once read stdin while queued, so an `abort` ended its wait, and every
+# client test passed while a real queued pool ignored that line and kept its
+# ticket until its own grant. The client leaves a queue by killing that join's
+# ssh, and the host notices the session is gone: here a watcher removes
 # the ticket once this stub's process is gone, and logs `left session`. Each
 # wait after the grant is the `read` builtin on stdin, and each child process
 # has every stream on /dev/null: a run the client drops is killed, and a child

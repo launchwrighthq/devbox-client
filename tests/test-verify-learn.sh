@@ -213,8 +213,10 @@ assert_eq 0 "$rc" "the first gate passes"
 assert_eq "lint test" "$(ran)" "and runs both steps"
 assert_ok "the plan asked both for a trace" grep -qx 'plan lint run - - 1' "$TMP/runner.log"
 assert_fail "no trace line reaches the terminal" contains "devbox-steps: trace" "$out"
-assert_ok "lint's map holds what it read" grep -q $'^path\t[0-9]*\tsrc/b.py$' "$MAPS/lint.map"
-assert_ok "test's map holds each test file" grep -q $'^file\ttests/test_a.py\t' "$MAPS/test.map"
+LINT_MAP="$(printf '%s\n' "$MAPS"/lint.*.map)" TEST_MAP="$(printf '%s\n' "$MAPS"/test.*.map)"
+assert_ok "one map of each step's context" test -f "$LINT_MAP" -a -f "$TEST_MAP"
+assert_ok "lint's map holds what it read" grep -q $'^path\t[0-9]*\tsrc/b.py$' "$LINT_MAP"
+assert_ok "test's map holds each test file" grep -q $'^file\ttests/test_a.py\t' "$TEST_MAP"
 
 verify --local
 assert_eq "" "$(ran)" "a second gate on an unchanged tree runs nothing"
@@ -246,7 +248,7 @@ rc=0
   FAKE_TRACES="$TRACES" FAKE_TRACE_GAP="test:1" bash "$DBX/client/libexec/devbox-verify" --local >"$TMP/gap.out" 2>&1) || rc=$?
 assert_eq 0 "$rc" "a gate whose trace arrived incomplete still passes"
 assert_ok "with one line that names the step" grep -q 'trace of step test arrived incomplete' "$TMP/gap.out"
-assert_ok "and test's map says so" grep -q $'^untraced\tthe trace arrived incomplete' "$MAPS/test.map"
+assert_ok "and test's map says so" grep -q $'^untraced\tthe trace arrived incomplete' "$TEST_MAP"
 
 echo "-- --shard and its refusals"
 verify --local --shard 1/2

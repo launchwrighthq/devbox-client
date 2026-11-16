@@ -88,8 +88,16 @@ if [ -f "$ROOT/.git" ]; then
   # A peer removed its worktree during a cold upload, aborting
   # the gate with rsync exit 24. Only this checkout needs a private index;
   # hide the others from the sender and delete any old remote copies.
+  #
+  # `devbox/` is this client's own data in the common dir: the gate records with
+  # their logs, the maps and the probe worktree. No workspace reads it. MEASURED:
+  # it was over a quarter of one common dir, with single logs of tens of MB, and
+  # a cold workspace's sync spent most of its time sending those logs over a
+  # laptop uplink that several parallel syncs shared. The pool held each of those
+  # gates' grants idle at 0.0 cores for many minutes. `H` hides it from the
+  # sender only, so `--delete` also removes the copy an older client sent.
   devbox_sync_push .git-common -a --delete "${rsync_args[@]}" --exclude='devbox-runpod/' --exclude='devbox-hetzner/' \
-    --filter="+ /worktrees/$WORKTREE/***" --filter='H /worktrees/*' \
+    --filter='H /devbox/' --filter="+ /worktrees/$WORKTREE/***" --filter='H /worktrees/*' \
     "$GIT_COMMON/"
 fi
 # The two gitdir pointers, the common dir's info/exclude, and the repair of a

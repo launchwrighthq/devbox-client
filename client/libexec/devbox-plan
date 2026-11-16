@@ -249,8 +249,9 @@ _devbox_plan_forward() {
 }
 
 # Print the base of step $1's key: the client version, the config, the step
-# line and the forwarded hashes, which devbox_plan_build reads once each. The
-# map keeps it, because a test file's pass under another base proves nothing.
+# line and the forwarded hashes, which devbox_plan_build reads once each. A new
+# client may run a step another way, so a record carries under its own client
+# alone.
 _devbox_plan_base() {
   local sum
   sum="$(printf 'version\n%s\nconfig\n%s\nstep\n%s\nforward\n%s\n' \
@@ -258,13 +259,38 @@ _devbox_plan_base() {
   printf '%s\n' "${sum%% *}"
 }
 
-# Print what step $1's own trace is taken under: the hash of the client
-# version, the config and the step line. A step without inputs= is traced again
-# when it differs from the one its map holds (D4).
+# Print the map base of step $1, which its map's context line holds: the base
+# with DEVBOX_TRACE_FORMAT in place of the client version (gate-overload spec,
+# D11). A test file's pass under another map base proves nothing, and a pass
+# under another client of one trace format still names the tree it passed on.
+_devbox_plan_map_base() {
+  local sum
+  sum="$(printf 'format\n%s\nconfig\n%s\nstep\n%s\nforward\n%s\n' \
+    "$DEVBOX_TRACE_FORMAT" "$_plan_config" "${STEP_SOURCE[$1]-}" "$_plan_forward" | sha256sum)" || return 1
+  printf '%s\n' "${sum%% *}"
+}
+
+# Print what step $1's own trace is taken under: the hash of
+# DEVBOX_TRACE_FORMAT, the config and the step line (D11). A step without
+# inputs= is traced again when it differs from the one its map holds (D4).
 _devbox_plan_trace_base() {
   local sum
-  sum="$(printf 'version\n%s\nconfig\n%s\nstep\n%s\n' "$_plan_version" "$_plan_config" "${STEP_SOURCE[$1]-}" | sha256sum)" || return 1
+  sum="$(printf 'format\n%s\nconfig\n%s\nstep\n%s\n' "$DEVBOX_TRACE_FORMAT" "$_plan_config" "${STEP_SOURCE[$1]-}" | sha256sum)" || return 1
   printf '%s\n' "${sum%% *}"
+}
+
+# Print the context id of step $1's map (gate-overload spec, D8): of its map
+# base and the setup key for a runner step, whose test files' passes depend on
+# both; of its trace base alone for a step with no runner. A lock file edit
+# then keeps a lint's map, so it carries when it read nothing under a setup
+# output (learned-selection D4a), where a map of its own per setup key would
+# hold no learned inputs, and the lint would run in full under strace.
+_devbox_plan_ctx() {
+  if [ -n "${STEP_RUNNER[$1]-}" ]; then
+    devbox_map_ctx "${PLAN_MAP_BASE[$1]}" "$PLAN_SETUP_KEY"
+  else
+    devbox_map_ctx "${PLAN_TRACE_BASE[$1]}"
+  fi
 }
 
 # Print step $2's key over the manifest $1: its base, the setup key when its
@@ -285,10 +311,10 @@ _devbox_plan_key() {
 _devbox_plan_learn() {
   local step="$1" inputs
   unset 'PLAN_LEARNED[$step]' 'PLAN_SETUP_READ[$step]'
-  if [ -z "${STEP_INPUTS[$step]-}" ] && inputs="$(devbox_map_step_inputs "$step")"; then
+  if [ -z "${STEP_INPUTS[$step]-}" ] && inputs="$(devbox_map_step_inputs "$step" "${PLAN_CTX[$step]}")"; then
     PLAN_LEARNED[$step]="${inputs:+$inputs$'\n'}"
   fi
-  if devbox_map_reads_setup "$step"; then PLAN_SETUP_READ[$step]=1; fi
+  if devbox_map_reads_setup "$step" "${PLAN_CTX[$step]}"; then PLAN_SETUP_READ[$step]=1; fi
 }
 
 # devbox_plan_rekey <step> <manifest>
@@ -328,7 +354,8 @@ devbox_plan_learn() {
       trace="$tdir/.$step.none"
       printf 'partial\t-\tthe runner sent no trace of this step\n' >"$trace" || continue
     fi
-    devbox_map_update "$step" "$run" "$trace" "$mode" "${PLAN_BASE[$step]}" "$PLAN_SETUP_KEY" "${PLAN_TRACE_BASE[$step]:--}" || continue
+    devbox_map_update "$step" "$run" "$trace" "$mode" "${PLAN_CTX[$step]}" "${PLAN_MAP_BASE[$step]}" "$PLAN_SETUP_KEY" \
+      "${PLAN_TRACE_BASE[$step]:--}" || continue
     [ "${PLAN_MODE[$step]-}" != shard ] || continue
     awk -F'\t' -v s="$step" '$1 == "step" && $2 == s && $4 == "pass" { f = 1 } END { exit !f }' "$rec" || continue
     key="$(devbox_plan_rekey "$step" "$manifest")" || continue
@@ -343,8 +370,8 @@ devbox_plan_learn() {
 # Set _plan_mapfiles[$1] to the test files of step $1's map, once per plan.
 _devbox_plan_mapfiles() {
   [ -z "${_plan_mapfiles[$1]+x}" ] || return 0
-  if [ "$(devbox_map_state "$1")" = ok ]; then
-    _plan_mapfiles[$1]="$(devbox_map_test_files "$1")"
+  if [ "$(devbox_map_state "$1" "${PLAN_CTX[$1]}")" = ok ]; then
+    _plan_mapfiles[$1]="$(devbox_map_test_files "$1" "${PLAN_CTX[$1]}")"
   else
     _plan_mapfiles[$1]=""
   fi
@@ -402,7 +429,7 @@ _devbox_plan_test_sets() {
     [ "$s" = "$step" ] || [ -z "${_plan_mapfiles[$s]}" ] || others+="${_plan_mapfiles[$s]}"$'\n'
   done
   # No map, or one that cannot be read, has no last full trace to compare with.
-  srun="$(devbox_map_step_run "$step")" || srun=""
+  srun="$(devbox_map_step_run "$step" "${PLAN_CTX[$step]}")" || srun=""
   if [ -n "$srun" ] && rdir="$(devbox_record_dir)" && [ -r "$rdir/$srun.files" ]; then lastman="$rdir/$srun.files"; fi
   out="$(awk "$_DEVBOX_PLAN_AWK_PATH"'
     function common(a, b,   x, y, n, m, i) {
@@ -544,7 +571,7 @@ _devbox_plan_narrow() {
 _devbox_plan_select() {
   local step="$1" manifest="$2" state last run outcome code failed="" sel rc=0 f r paths keep
   local -A reason=()
-  state="$(devbox_map_state "$step")"
+  state="$(devbox_map_state "$step" "${PLAN_CTX[$step]}")"
   case "$state" in
     none) _plan_why="no map"; return 1 ;;
     bad)
@@ -561,10 +588,10 @@ _devbox_plan_select() {
       [ -z "$(devbox_record_open_files "$run" "$step")" ] || return 1
     fi
   fi
-  sel="$(devbox_map_select "$step" "$manifest" "${PLAN_BASE[$step]}" "$PLAN_SETUP_KEY")" || rc=$?
+  sel="$(devbox_map_select "$step" "$manifest" "${PLAN_CTX[$step]}" "${PLAN_MAP_BASE[$step]}" "$PLAN_SETUP_KEY")" || rc=$?
   case "$rc" in
     0) ;;
-    3) _plan_why="its map was traced under another config, client, step line, forwarded value or setup"; return 1 ;;
+    3) _plan_why="its map was traced under another config, trace format, step line, forwarded value or setup"; return 1 ;;
     *) echo "devbox verify: the map of step $step could not be read, so the step runs in full" >&2
        _plan_why="its map could not be read"; return 1 ;;
   esac
@@ -649,8 +676,9 @@ _devbox_plan_run_reason() {
 # a record (D3).
 #
 # It also fills PLAN_STEPS, PLAN_ACTION, PLAN_MODE, PLAN_TRACE, PLAN_NFILES,
-# PLAN_REASON, PLAN_FREASON (`<step><TAB><path>` to a file's reason), PLAN_BASE
-# and PLAN_SETUP_KEY for devbox_plan_print, the record and devbox_plan_rekey,
+# PLAN_REASON, PLAN_FREASON (`<step><TAB><path>` to a file's reason), PLAN_BASE,
+# PLAN_MAP_BASE, PLAN_TRACE_BASE, PLAN_CTX (each for every step of the gate) and
+# PLAN_SETUP_KEY for devbox_plan_print, the record, devbox_plan_learn and devbox_plan_rekey,
 # so call it with its stdout sent to a file, never inside $( ), where those
 # variables would end with the subshell.
 #
@@ -661,7 +689,7 @@ devbox_plan_build() {
   local rerun="$1" manifest="$2" step var action key run after a b64 f mode trace rc
   local _plan_version _plan_config _plan_forward _plan_files _plan_reason _plan_why _plan_tests _plan_new _plan_shard _plan_branch _plan_narrow_why
   local shard_step="" shard_i="" shard_n=""
-  local -a steps afters step_lines=() file_lines=() test_lines=()
+  local -a steps afters step_lines=() file_lines=() test_lines=() memory_lines=()
   local -A _plan_freason=() _plan_mapfiles=()
   shift 2
   case "$rerun" in
@@ -706,14 +734,19 @@ devbox_plan_build() {
 
   declare -ga PLAN_STEPS=("${steps[@]}")
   declare -gA PLAN_ACTION=() PLAN_MODE=() PLAN_TRACE=() PLAN_NFILES=() PLAN_REASON=() PLAN_FREASON=() \
-    PLAN_BASE=() PLAN_TRACE_BASE=() PLAN_LEARNED=() PLAN_SETUP_READ=()
+    PLAN_BASE=() PLAN_MAP_BASE=() PLAN_TRACE_BASE=() PLAN_CTX=() PLAN_LEARNED=() PLAN_SETUP_READ=()
   PLAN_SETUP_KEY="$(_devbox_plan_setup_key "$manifest")" \
     || { echo "devbox verify: could not compute the setup key, so no plan was made" >&2; return 1; }
+  # Every step of the gate, also under --step: the test sets of a runner step
+  # read the maps of every step of its runner, each under its own context.
+  for step in "${STEP_NAMES[@]}"; do
+    { PLAN_TRACE_BASE[$step]="$(_devbox_plan_trace_base "$step")" \
+      && PLAN_BASE[$step]="$(_devbox_plan_base "$step")" \
+      && PLAN_MAP_BASE[$step]="$(_devbox_plan_map_base "$step")" \
+      && PLAN_CTX[$step]="$(_devbox_plan_ctx "$step")"; } \
+      || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
+  done
   for step in "${steps[@]}"; do
-    PLAN_TRACE_BASE[$step]="$(_devbox_plan_trace_base "$step")" \
-      || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
-    PLAN_BASE[$step]="$(_devbox_plan_base "$step")" \
-      || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
     _devbox_plan_learn "$step"
     key="$(_devbox_plan_key "$manifest" "$step")" \
       || { echo "devbox verify: could not compute the key of step $step, so no plan was made" >&2; return 1; }
@@ -754,7 +787,7 @@ devbox_plan_build() {
         [ -z "$_plan_narrow_why" ] || _plan_reason+="; $_plan_narrow_why"
       fi
     fi
-    if [ "$action" = run ] && [ -z "${STEP_INPUTS[$step]-}" ] && f="$(devbox_map_untraced "$step")" && [ -n "$f" ]; then
+    if [ "$action" = run ] && [ -z "${STEP_INPUTS[$step]-}" ] && f="$(devbox_map_untraced "$step" "${PLAN_CTX[$step]}")" && [ -n "$f" ]; then
       _plan_reason+="; no trace: $f"
     fi
     # A shard that runs runs every file of its part, and selects within it
@@ -780,7 +813,7 @@ devbox_plan_build() {
       if [ -n "${STEP_RUNNER[$step]-}" ]; then
         trace=1
       elif [ -z "${STEP_INPUTS[$step]-}" ]; then
-        if [ "$rerun" = full ] || ! f="$(devbox_map_step_traced "$step")" || [ "$f" != "${PLAN_TRACE_BASE[$step]}" ]; then trace=1; fi
+        if [ "$rerun" = full ] || ! f="$(devbox_map_step_traced "$step" "${PLAN_CTX[$step]}")" || [ "$f" != "${PLAN_TRACE_BASE[$step]}" ]; then trace=1; fi
       fi
     fi
     after=""
@@ -791,6 +824,7 @@ devbox_plan_build() {
     b64="$(printf '%s' "${STEP_CMD[$step]}" | base64 | tr -d '\n')" || return 1
     step_lines+=("$(printf 'step\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$step" "$action" "$key" \
       "${STEP_RUNNER[$step]:--}" "${after:--}" "$b64" "${STEP_DIR[$step]:--}" "$trace")")
+    [ -z "${STEP_MEMORY[$step]-}" ] || memory_lines+=("$(printf 'memory\t%s\t%s' "$step" "${STEP_MEMORY[$step]}")")
     # shellcheck disable=SC2034 # PLAN_MODE and PLAN_TRACE are read by devbox-verify's record
     PLAN_ACTION[$step]="$action" PLAN_MODE[$step]="$mode" PLAN_TRACE[$step]="$trace"
     PLAN_REASON[$step]="$_plan_reason" PLAN_NFILES[$step]=0
@@ -809,6 +843,7 @@ devbox_plan_build() {
   printf '%s\n' "${step_lines[@]}"
   [ "${#file_lines[@]}" -eq 0 ] || printf '%s\n' "${file_lines[@]}"
   [ "${#test_lines[@]}" -eq 0 ] || printf '%s\n' "${test_lines[@]}"
+  [ "${#memory_lines[@]}" -eq 0 ] || printf '%s\n' "${memory_lines[@]}"
 }
 
 # Print the plan that devbox_plan_build made for a person, for --plan: one line
