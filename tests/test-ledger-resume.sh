@@ -100,6 +100,8 @@ for f in a.test.ts b.test.ts; do
   stop_at="${FAKE_STOP_AT-}"
   [ "${DEVBOX_RESUME:-0}" = 0 ] || stop_at="${FAKE_STOP_AT_RESUME:-$stop_at}"
   if [ "${FAKE_STOPPING:-0}" = 1 ] && [ "$f" = "$stop_at" ]; then
+    # FAKE_EDIT names a file of the checkout that changes while the gate runs.
+    [ -z "${FAKE_EDIT-}" ] || printf 'edited\n' >>"$FAKE_EDIT"
     [ -z "${FAKE_GRANT_AFTER_STOP-}" ] || printf '%s\n' "$FAKE_GRANT_AFTER_STOP" >"$FAKE_GRANT_FILE"
     # A watchdog stop ends the step before it passes. 143, the code of a
     # SIGTERM, so the runner records no pass for the step that holds this gate.
@@ -226,6 +228,19 @@ assert_ok "D5: it discards the ledger whose count is spent, and says why" \
   contains "the unfinished gate of this worktree resumed 1 time(s), and DEVBOX_MAX_RESUMES in $CO/.devbox/config.env is 1, so its ledger is discarded and the gate runs in full" "$out"
 assert_eq "lint build a.test.ts b.test.ts" "$(ran 3)" "D5: and runs the gate in full"
 assert_eq "0" "$(run_field 3 resume)" "D5: with DEVBOX_RESUME=0"
+# ═══ D5: a worktree that changed while the gate ran ends at the stop ═══════
+#
+# Its key differs after the stop, so the run the resume would start discards the
+# ledger and runs the whole gate with a resume count of 0. Before this case, a
+# stop at every time limit started the whole gate again, with no end.
+reset
+stops 1
+FAKE_EDIT="$CO/src.txt" FAKE_STOP_AT=a.test.ts verify --target lan1
+assert_eq "10" "$rc" "D5: a stop of a gate whose worktree changed exits 10"
+assert_eq "1" "$(runs)" "D5: and starts no second run"
+assert_ok "D5: it says why it does not resume" \
+  contains "this worktree changed while the gate ran (its ledger key differs), so a resume would run the whole gate again, and it does not resume" "$out"
+printf 'one\n' >"$CO/src.txt"
 # A file open at the first stop and finished before the second is not named.
 reset
 stops 2

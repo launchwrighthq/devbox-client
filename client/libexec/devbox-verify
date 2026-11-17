@@ -2419,9 +2419,17 @@ ledger_mark() {
 # and the run id with it. The steps the run named and its rerun setting go
 # along. --fresh goes as --full: --fresh again would discard the ledger of the
 # gate that just stopped, which is the ledger the resume reads.
+#
+# The key is computed again before the exec. A worktree that changed while the
+# gate ran has another key, and the run the exec starts would discard the ledger
+# and run the whole gate with a resume count of 0. MEASURED: an agent kept
+# editing its worktree under a gate that the watchdog stopped at its time limit,
+# and each stop started the whole gate again, so one `devbox verify` ran for
+# hours at the limit and DEVBOX_MAX_RESUMES never ended it. So such a stop ends
+# here, with the stop's own code.
 ledger_after_stop() {
-  local base count step
-  local -a again=()
+  local base count step now=""
+  local -a again=() fwd=()
   [ "$LEDGER_MARKED" = 1 ] || return 0
   if ! ledger_fetch "$TARGET" "$SLUG" "the stopped gate cannot resume"; then
     ledger_forget
@@ -2434,6 +2442,14 @@ ledger_after_stop() {
   count="$(ledger_count)" || count=""
   if [ -z "$count" ] || [ "$count" -ge "$DEVBOX_MAX_RESUMES" ]; then
     echo "devbox verify: this gate resumed ${count:-an unknown number of} time(s), and DEVBOX_MAX_RESUMES in $DEVBOX_CONFIG is $DEVBOX_MAX_RESUMES, so it does not resume again" >&2
+    return 0
+  fi
+  # The listing of DEVBOX_MANIFEST_FILE was made before the gate ran, so the
+  # files are listed again here.
+  [ -z "${fwd_crossed:-}" ] || read -r -a fwd <<<"$fwd_crossed"
+  DEVBOX_MANIFEST_FILE="" ledger_key_of now "$PROBE_DIR/none" ${fwd[@]+"${fwd[@]}"} || now=""
+  if [ "$now" != "$LEDGER_KEY" ]; then
+    echo "devbox verify: this worktree changed while the gate ran (its ledger key differs), so a resume would run the whole gate again, and it does not resume" >&2
     return 0
   fi
   [ -z "$FORCE_TARGET" ] || again=(--target "$FORCE_TARGET")
