@@ -452,6 +452,17 @@ assert_ok "the lane wait is its own phase, on both targets" \
   grep -qE '^> lock +fix-cache/feat-login +lan1\+cloud1 +10s$' <<<"$view"
 assert_fail "and no run reads as syncing" grep -qE '^. sync ' <<<"$view"
 
+# A run that waits for an unhealthy target to clear holds no lane and no
+# ticket on any target, so its row is this laptop's alone, and never lost.
+sleeper; P_WAIT="${SLEEPERS[-1]}"
+now="$(date +%s)"
+write_run "$P_WAIT" "$(ident "$P_WAIT")" $((now - 300)) $((now - 120)) wait lan1+cloud1 "$SLUG_FEAT" "$top_feat" "verify $RID_PREFIX.$P_WAIT"
+run_client "$STATUS"
+assert_ok "a run waiting for a target to clear is its own phase, on both targets" \
+  grep -qE '^> wait +fix-cache/feat-login +lan1\+cloud1 +2m0[0-9]s$' <<<"$out"
+assert_fail "and it is not lost after two minutes" grep -qE '^  lost .*lan1\+cloud1' <<<"$out"
+rm -f "$RUNS/$P_WAIT"
+
 # --target names one of the targets the run waits on, and shows it.
 run_client "$STATUS" --target cloud1
 assert_ok "--target cloud1 shows the run that waits on lan1 and cloud1" contains "lan1+cloud1" "$out"

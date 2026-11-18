@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.2.1"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.2.2"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.2.1"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.2.2"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.2.1"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.2.2"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.2.1 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.2.2 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -450,11 +450,12 @@ target, under that grant. The client takes the first rule that matches:
 3. Any other eligible target. The run joins every eligible target.
 4. The first rented target in `DEVBOX_RENT`.
 5. This machine, when `DEVBOX_QUEUE_FULL_ACTION=local`.
-6. Otherwise exit 8, with one line per target that says why.
+6. Otherwise, when a target was skipped as unhealthy, wait for one to clear (below). Else, or
+   when none clears within the wait, exit 8, with one line per target that says why.
 
 ```
 ==> devbox: lan1 unreachable (no answer in 3s)
-==> devbox: cloud1 skipped: degraded (disk 93%)
+==> devbox: cloud1 skipped: degraded (disk 96%)
 ==> devbox: queuing on cloud2: 30/32 tokens, 3/3 jobs, 1 waiting: about 240s of queuing
 ==> devbox: queuing on cloud3: 4/16 tokens, 1/3 jobs, 0 waiting: this ask fits now
 ==> devbox: granted 12 tokens on cloud3 lane 1 after 2s (also queued on cloud2)
@@ -483,6 +484,22 @@ wins, and `DEVBOX_MAX_QUEUE_WAIT` still counts from the first place in a queue. 
 probed during the affinity grace, and `--target` probes no other target. A target skipped for
 its gate password, its host key, its protocol, its image or a `never` verdict is not probed
 again.
+
+When no target is eligible and one was skipped as unhealthy, the run waits rather than exit 8
+at once. A degraded disk, swap past its limit or a broker restart clears by itself: two hosts
+once degraded in the same minute, were healthy within 4 minutes, and every gate started in
+between exited 8. The run probes the targets skipped as unhealthy or unreachable every
+`DEVBOX_REJOIN_SECONDS` and joins the first that turns eligible. A target skipped for a reason
+that does not pass within a run is named and not probed again, so one target that lacks a
+`DEVBOX_REQUIRES` token and one that is degraded waits for the second. Rules 4 and 5 come
+first, and a run whose only skips that can pass are unreachable exits as before. The wait lasts
+at most `DEVBOX_MAX_QUEUE_WAIT` from its start, or 3600 seconds with no ceiling, then exits 8
+with each target's last reason:
+
+```
+==> devbox: no target can take this gate now, so this run waits up to 600s for one to clear, and probes lan1 cloud1 again every 30s: lan1 skipped: degraded (disk 97%); cloud1 skipped: degraded (disk 96%)
+==> devbox: cloud1 answered again, so this run joins it too
+```
 
 A target is healthy when its watchdog record says `ok` and is at most 90 seconds old. A
 handshake mismatch, or an image that does not satisfy `DEVBOX_REQUIRES`, skips one target. On
@@ -645,9 +662,9 @@ against the core count and memory in use, then jobs, and swap while the host use
 of 4.1.3 or earlier that admits on pressure the jobs show as a count alone, because no job
 limit applies there, and on any host that admits on pressure the token bar is the running worker hints over the cores, never yellow when full. Then one table
 lists every gate that runs, then the queue in line order, then the runs this laptop started
-that no target holds yet (probe, rent, lock, sync, setup), then the lost ones. `lock` is the
-wait for a free lane. A run that waits in several queues is one row, and its target cell names
-each of those targets, joined by `+`. A run is lost when every target it names answered
+that no target holds yet (probe, rent, wait, lock, sync, setup), then the lost ones. `wait` is
+the wait for an unhealthy target to clear, and `lock` is the wait for a free lane. A run that
+waits in several queues is one row, and its target cell names each of those targets, joined by `+`. A run is lost when every target it names answered
 without it for over a minute. A gate of this laptop shows as `<repository>/<worktree>`, and `▶` with a
 bold name marks the gates of the repository you run the command in. A gate of another
 laptop shows dim as `other laptop`, with no name. Every duration of a gate uses the host's
@@ -706,7 +723,7 @@ files still say, as 4.0 refuses `DEVBOX_VERIFY`, `select=related`, `DEVBOX_NEEDS
 | 5 | the protocol handshake refused, on every deployed target |
 | 6 | no target's workspace image satisfies `DEVBOX_REQUIRES` |
 | 7 | the workspace memory limit killed the gate |
-| 8 | no target can take this gate, or `DEVBOX_MAX_QUEUE_WAIT` ran out with no grant; the gate did not run |
+| 8 | no target can take this gate, also after the wait for an unhealthy one to clear, or `DEVBOX_MAX_QUEUE_WAIT` ran out with no grant; the gate did not run |
 | 9 | a Git LFS file is a pointer; run `git lfs pull` |
 | 10 | the watchdog on the target stopped the gate: past `DEVBOX_GATE_MAX_SECONDS`, or no CPU used for too long. This is not a test result |
 | 11 | the pool on the target lost the gate's queue ticket and could not restore it; the gate did not run |

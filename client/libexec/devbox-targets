@@ -358,6 +358,9 @@ devbox_probe_lost() {
 #   5. the laptop, with DEVBOX_QUEUE_FULL_ACTION=local
 #   6. none
 #
+# A `fail 8 none` is this function's last word, not the run's: devbox-verify
+# waits on it when an unhealthy target is among the skips (health_wait there).
+#
 # Before rule 4: a failure that a person must repair, and that holds for EVERY
 # deployed target, fails the run with the code it had when a client knew one
 # host. A refused gate password or a host key off its pin is 3 (a

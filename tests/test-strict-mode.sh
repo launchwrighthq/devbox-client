@@ -373,8 +373,12 @@ run_verify DEVBOX_STRICT=1 FAKE_EST='never - 0 0/2 0/3 0'
 assert_eq 72 "$rc" "strict, a pool that can never grant on every target: exit 72"
 assert_ok "stderr names the queue event" contains "::devbox-infra::queue" "$out"
 
+# A degraded target is waited for first (docs/targets.md section 4.3), so a
+# 2-second ceiling and a probe each second keep the case short.
+write_env "${TARGET_B[@]}" 'DEVBOX_MAX_QUEUE_WAIT=2' 'DEVBOX_REJOIN_SECONDS=1'
 run_verify DEVBOX_STRICT=1 FAKE_HEALTH="$(date +%s) degraded disk 93%"
-assert_eq 72 "$rc" "strict, every target degraded: exit 72"
+assert_eq 72 "$rc" "strict, every target degraded through the wait: exit 72"
+assert_ok "it waited for the target to clear first" contains "no target cleared within the wait of 2s." "$out"
 assert_ok "the refusal names the target and its health" contains "hostb skipped: degraded (disk 93%)" "$out"
 assert_fail "and it is not called a queue event" contains "::devbox-infra::queue" "$out"
 run_verify FAKE_HEALTH="$(date +%s) degraded disk 93%"

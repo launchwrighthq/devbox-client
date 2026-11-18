@@ -1605,7 +1605,14 @@ join_fifo_reader() {
 # Join one target: its two fifos, its fds, its job. $1 the target, $2 the max
 # wait for its pool, $3 the line that says why it is joined.
 join_start() {
-  local name="$1" d="$JOIN_DIR/$1" lfd rfd
+  local name="$1" d lfd rfd
+  # Here and not in join_targets: the wait for a target to clear joins its
+  # first target through rejoin_read, with no join_targets before it.
+  if [ -z "$JOIN_DIR" ]; then
+    JOIN_DIR="$PROBE_DIR/join"
+    mkdir -m 700 "$JOIN_DIR"
+  fi
+  d="$JOIN_DIR/$name"
   rm -rf "$d"
   mkdir -m 700 "$d"
   mkfifo -m 600 "$d/lock.in" "$d/run.in"
@@ -1788,16 +1795,27 @@ REJOIN_PENDING=()
 REJOIN_PID=""
 REJOIN_NEXT=0
 REJOIN_DIR=""
+# The skip text of the newest pass for each target it skipped, which
+# skip_lines prints in place of the selection's: a refusal after a wait names
+# each target's last reason, not the one it had when the wait started.
+declare -A REJOIN_TEXT=()
 
 # The skipped targets of SELECTION that a later probe may find eligible. None
 # for a forced target or the rented Hetzner server, which a run joins alone.
 rejoin_arm() {
+  if [ "$REJOIN_SECONDS" -eq 0 ] || [ -n "$FORCE_TARGET" ] || [ "${SELECT_TARGETS[*]}" = hetzner ]; then
+    REJOIN_PENDING=()
+    return 0
+  fi
+  rejoin_skipped
+}
+
+# Every target SELECTION skipped as unreachable or unhealthy, into
+# REJOIN_PENDING, with the first pass one interval away.
+rejoin_skipped() {
   local kind name class _text
   REJOIN_PENDING=()
   REJOIN_NEXT=$((SECONDS + REJOIN_SECONDS))
-  if [ "$REJOIN_SECONDS" -eq 0 ] || [ -n "$FORCE_TARGET" ] || [ "${SELECT_TARGETS[*]}" = hetzner ]; then
-    return 0
-  fi
   while read -r kind name class _text; do
     [ "$kind" = skip ] || continue
     case "$class" in unreachable|unhealthy) REJOIN_PENDING+=("$name") ;; esac
@@ -1872,6 +1890,7 @@ rejoin_read() {
       join) late+=("$name"); JOIN_FACT[$name]="$rest" ;;
       skip)
         read -r class text <<<"$rest"
+        REJOIN_TEXT[$name]="$text"
         case "$class" in
           unreachable|unhealthy) still+=("$name") ;;
           *) echo "==> devbox: $name $text" ;;
@@ -1897,6 +1916,81 @@ rejoin_stop() {
   kill "${pids[@]}" 2>/dev/null || true
   wait "$REJOIN_PID" 2>/dev/null || true
   REJOIN_PID=""
+}
+
+# ── the wait for a target to clear ───────────────────────────────────────────
+#
+# A selection with no eligible target exited 8 at once. MEASURED: two hosts
+# of one list crossed their disk collector's trigger in the same minute, and
+# each watchdog wrote `degraded disk` while the collector ran. Both were
+# healthy again within 4 minutes, and every gate started in that window
+# exited 8 with no wait, which the agents that ran them read as a failure.
+#
+# So a `fail 8 none` whose skips include an unhealthy target waits: the
+# targets skipped as unreachable or unhealthy are probed again every
+# REJOIN_SECONDS by the passes of the probe while waiting, and the first that
+# turns eligible is joined like any other. Every other class is final for
+# the run, for the reasons the probe while waiting gives above, and its target
+# is named in the wait line and never probed again. So a mix waits when at
+# least one target is unhealthy: one target `requires` and one `unhealthy`
+# waits for the second, and one `requires` and one `unreachable` exits as
+# before. A run whose every skip is unreachable has no health to wait for;
+# that is the cafe case, and a rental, the laptop or exit 3 answer it at once.
+#
+# Only `none` reaches this. Rules 4 and 5 come first in devbox_select, so a
+# run that can rent or fall back to the laptop does that at once.
+#
+# The wait counts from its start, under DEVBOX_MAX_QUEUE_WAIT, and a target
+# joined during it queues under what is left. With no ceiling the bound is
+# HEALTH_WAIT_SECONDS, the hour of DEVBOX_POOL_DEADLINE's default, which ends a
+# queued run with no ceiling on a host: a target whose watchdog never writes
+# again would otherwise hold the run for good. DEVBOX_REJOIN_SECONDS=0
+# turns the probe while waiting off, and this wait with it. The rented Hetzner
+# server is left out, as rejoin_arm leaves it out.
+#
+# Returns 0 with the first join started, or 1 when the run has nothing to
+# wait for, nothing left to probe, or the ceiling ran out.
+HEALTH_WAIT_SECONDS=3600
+health_wait() {
+  local kind name class text unhealthy=0 why="" ceiling targets last=""
+  [ "$REJOIN_SECONDS" -gt 0 ] || return 1
+  [ "${SELECT_TARGETS[*]}" != hetzner ] || return 1
+  while read -r kind name class text; do
+    [ "$kind" = skip ] || continue
+    [ "$class" != unhealthy ] || unhealthy=1
+    why="$why${why:+; }$name $text"
+  done <<<"$SELECTION"
+  [ "$unhealthy" = 1 ] || return 1
+  rejoin_skipped
+  ceiling="$QUEUE_WAIT"
+  [ "$ceiling" -gt 0 ] || ceiling="$HEALTH_WAIT_SECONDS"
+  echo "==> devbox: no target can take this gate now, so this run waits up to ${ceiling}s for one to clear, and probes ${REJOIN_PENDING[*]} again every ${REJOIN_SECONDS}s: $why"
+  JOIN_FACT=()
+  JOIN_MAXWAIT="$QUEUE_WAIT"
+  GRACE_TARGET=""
+  GRACE_REST=()
+  JOIN_T0="$SECONDS"
+  while [ "${#JOINED[@]}" -eq 0 ]; do
+    if [ "${#REJOIN_PENDING[@]}" -eq 0 ]; then
+      echo "devbox verify: no target is left that can clear while this run waits." >&2
+      return 1
+    fi
+    # devbox status lists the run as waiting, on the targets it probes.
+    targets="${REJOIN_PENDING[*]}"
+    targets="${targets// /+}"
+    if [ "$targets" != "$last" ]; then
+      devbox_runfile_phase wait "$targets" "$SLUG"
+      last="$targets"
+    fi
+    if [ $((SECONDS - JOIN_T0)) -ge "$ceiling" ]; then
+      rejoin_stop
+      echo "devbox verify: no target cleared within the wait of ${ceiling}s." >&2
+      return 1
+    fi
+    # Short, so a TERM reaches its trap within 0.2 seconds, as in join_wait.
+    sleep 0.2
+    rejoin_tick
+  done
 }
 
 # ── choose the target ────────────────────────────────────────────────────────
@@ -1978,7 +2072,7 @@ skip_lines() {
   local prefix="$1" kind name _class text
   while read -r kind name _class text; do
     [ "$kind" = skip ] || continue
-    printf '%s%s %s\n' "$prefix" "$name" "$text"
+    printf '%s%s %s\n' "$prefix" "$name" "${REJOIN_TEXT[$name]-$text}"
   done <<<"$SELECTION"
 }
 target_addr() { local var="DEVBOX_TARGET_${1^^}"; printf '%s' "${!var-}"; }
@@ -2674,10 +2768,6 @@ admission_text() {
 # Join every target named, after the affinity grace when GRACE_TARGET is set.
 join_targets() {
   local name
-  if [ -z "$JOIN_DIR" ]; then
-    JOIN_DIR="$PROBE_DIR/join"
-    mkdir -m 700 "$JOIN_DIR"
-  fi
   GRACE_REST=()
   if [ -n "$GRACE_TARGET" ]; then
     for name in "$@"; do
@@ -2825,6 +2915,12 @@ decide() {
       refuse_none >&2
       devbox_die 8 "$(queue_kind)" ;;
     fail)
+      # A target that can clear within the run is waited for (health_wait).
+      # The ceiling of the joins counts from the start of that wait.
+      if [ "$d_rule" = none ] && health_wait; then
+        run_joins "$QUEUE_WAIT" || queue_ceiling
+        return 0
+      fi
       case "$d_rule" in
         auth)
           while read -r f_name f_kind f_rest; do

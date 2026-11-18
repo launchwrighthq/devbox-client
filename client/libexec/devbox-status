@@ -890,8 +890,9 @@ collect_local() {
       # A lane wait read as `sync`, because the sync phase covered the lock wait
       # too: runs of one worktree showed as syncing for tens of minutes while
       # they waited on one host's lock. No host reports a lane lock, so the row
-      # is this laptop's alone.
-      lock) scol=yellow ;;
+      # is this laptop's alone. A run that waits for a target to clear has no
+      # ticket anywhere either: every target it names skipped it.
+      lock|wait) scol=yellow ;;
       queued|gate)
         if [ "$phase" = gate ]; then state=running; scol=green; else scol=yellow; fi
         # Joined when any target the run waits on holds it, by slug or by run

@@ -242,7 +242,7 @@ _devbox_runfile_failed() {
 }
 
 # Write the run file for a new phase, by rename, so status never reads half of
-# one. $1 the phase: probe, rent, lock, queued, sync, setup or gate. $2 the
+# one. $1 the phase: probe, rent, wait, lock, queued, sync, setup or gate. $2 the
 # target, when it changes; $3 the slug, $4 the worktree path and $5 verify or
 # run, when they are known. The caller sets DEVBOX_RUNFILE_RUN once it has a run
 # id. Always returns 0.
