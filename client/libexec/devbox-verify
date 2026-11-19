@@ -2190,7 +2190,7 @@ if [ "$RUN_MODE" = "1" ]; then
   # A run never calls devbox_verify, whose hooks start the declared services
   # (learned-selection spec, D8), so the command starts them first when the
   # hooks define devbox_services.
-  GATE_STDIN="$HOOKS"$'\n''{ ! declare -F devbox_services >/dev/null || devbox_services; } && '"devbox_environment && $RUN_SCRIPT"
+  GATE_STDIN="$HOOKS"$'\n'"$(devbox_services_first)"' && '"devbox_environment && $RUN_SCRIPT"
 fi
 GATE_ENV=()
 
@@ -2581,7 +2581,9 @@ if [ "$RUN_MODE" = 0 ]; then
     echo "devbox verify: could not encode the ledger tools for the workspace (base64 failed), so the gate did not run" >&2
     devbox_die 1
   }
-  GATE_STDIN="$HOOKS"$'\n'"$ledger_hooks"
+  # The services start before gate-root's entry runs devbox_environment, as
+  # in a run: devbox_services_first says why.
+  GATE_STDIN="$HOOKS"$'\n'"$ledger_hooks"$'\n'"$(devbox_services_first)"
 fi
 
 # ── did a run's own connection fail? ─────────────────────────────────────────

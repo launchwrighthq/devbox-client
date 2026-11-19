@@ -1150,6 +1150,20 @@ devbox_ledger_hooks() {
 # client's runner, client/share/steps/devbox-steps, runs them now.
 DEVBOX_STEPS_RUNNER="$(readlink -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/..")/share/steps/devbox-steps"
 
+# The line a remote gate's stdin ends with: the declared services start in
+# the eval of the hooks, before gate-root's entry runs devbox_environment.
+# MEASURED: a verify gate ran DEVBOX_ENVIRONMENT before devbox_verify started
+# the services, while `devbox run` and --local started them first, so an
+# environment line that rewrote a service's database URL saw it in a run and
+# on the laptop, and saw nothing in a remote gate. gate-root's entries are
+# fixed strings on the host, so the order moves here, in the hooks, and a
+# service that fails ends the eval, and the gate, with its own code before
+# any step. devbox_verify starts them only when this line did not.
+devbox_services_first() {
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf '%s\n' '{ ! declare -F devbox_services >/dev/null || { devbox_services && _devbox_services_started=1; }; }'
+}
+
 # Print the shell text that replaces devbox_verify with the runner and its
 # plan (section 6.3). devbox_hooks_script appends it from DEVBOX_STEPS_HOOKS.
 #   $1  remote: the runner and the plan cross as base64 inside single quotes,
@@ -1193,8 +1207,11 @@ devbox_steps_hooks() {
   # The declared services answer before the first step, and a service that
   # does not fails the gate with its own code, 3 (learned-selection spec, D8).
   # A project with no service gets no devbox_services, and a gate on this
-  # machine got them from devbox_services_local_up.
-  printf '  if declare -F devbox_services >/dev/null; then devbox_services || return; fi\n'
+  # machine got them from devbox_services_local_up. A remote gate already
+  # started them before DEVBOX_ENVIRONMENT (devbox_services_first), and they
+  # start once.
+  # shellcheck disable=SC2016  # expanded by the workspace bash, never here
+  printf '  if declare -F devbox_services >/dev/null && [ -z "${_devbox_services_started:-}" ]; then devbox_services || return; fi\n'
   # shellcheck disable=SC2016  # expanded by the workspace bash, never here
   printf '  for _o in "$_d"/logs/*; do [ "$_o" = "$_d/logs/%s" ] || rm -rf -- "$_o"; done\n' "$run"
   if [ "$mode" = remote ]; then
