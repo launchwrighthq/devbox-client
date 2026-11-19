@@ -371,4 +371,27 @@ assert_eq "a.test.ts	30
 c.test.ts	4" "$(devbox_record_durations test)" \
   "the durations: the newest seconds of each file, a 3.3 line with none left out"
 
+echo "-- many records: the newest read never fails on a broken pipe"
+# sort's output must pass the 64 KiB pipe buffer for head to close the pipe
+# under it: 800 records of a long run id give about 100 KiB of sort output.
+new_repo many
+dir="$(devbox_record_dir)"
+mkdir -p "$dir"
+for i in $(seq 1 800); do
+  record_text "0123456789abcdef.$((100000 + i))" "$((5000 + i))" main full 1 \
+    "step test k pass 1 0 full" "file test vitest src/a.test.ts fail" >"$dir/0123456789abcdef.$((100000 + i)).record"
+done
+fails=0
+for i in $(seq 1 20); do
+  out="$(devbox_record_newest main)" || fails=$((fails + 1))
+done
+assert_eq "0" "$fails" "devbox_record_newest succeeds 20 times out of 20"
+assert_eq "$dir/0123456789abcdef.100800.record" "$out" "and names the newest record"
+fails=0
+for i in $(seq 1 20); do devbox_record_last_pass_of test >/dev/null || fails=$((fails + 1)); done
+assert_eq "0" "$fails" "a query through _devbox_record_query succeeds 20 times out of 20"
+fails=0
+for i in $(seq 1 10); do bash "$RESULT" --json >/dev/null 2>&1 || fails=$((fails + 1)); done
+assert_eq "0" "$fails" "devbox result --json exits 0 10 times out of 10"
+
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

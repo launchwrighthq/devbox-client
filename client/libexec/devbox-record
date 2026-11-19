@@ -74,6 +74,14 @@ $1 == "scope" { scope = $2 }
 END { if (NR > 0) done() }
 '
 
+# The first line of a sorted stream, read to its end. MEASURED: `sort | head -n 1`
+# under pipefail failed at random once a checkout held a few hundred records:
+# head exited after one line, sort died writing the rest with "Broken pipe",
+# the query returned 1, and `devbox result --json` exited 1 after a complete
+# gate with no output of its own. awk reads every line and keeps the first, so
+# sort always finishes its write.
+_DEVBOX_RECORD_FIRST='NR == 1'
+
 # Run the awk program $1 over every record of this checkout, then print the
 # first field of the newest output line. Each output line of the program is
 # `<at><TAB><answer>`. Prints nothing when no record matches or none exists.
@@ -86,8 +94,9 @@ _devbox_record_query() {
   [ -d "$dir" ] || return 0
   files=("$dir"/*.record)
   [ -e "${files[0]}" ] || return 0
+  # awk 'NR == 1' and not head: see _DEVBOX_RECORD_FIRST.
   best="$(awk -F'\t' "$_DEVBOX_RECORD_AWK_HEAD$program" "${files[@]}" \
-    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2r | head -n 1)" || return 1
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2r | awk "$_DEVBOX_RECORD_FIRST")" || return 1
   [ -z "$best" ] || printf '%s\n' "${best#*$'\t'}"
 }
 
@@ -236,7 +245,7 @@ devbox_record_newest() {
   best="$(RECORD_BRANCH="$branch" awk -F'\t' "$_DEVBOX_RECORD_AWK_HEAD"'
     function begin() { }
     function done() { print (branch == ENVIRON["RECORD_BRANCH"] ? 1 : 0) "\t" at "\t" file }' "${files[@]}" \
-    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2nr -k3,3r | head -n 1)" || return 1
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2nr -k3,3r | awk "$_DEVBOX_RECORD_FIRST")" || return 1
   [ -z "$best" ] || printf '%s\n' "${best#*$'\t'*$'\t'}"
 }
 

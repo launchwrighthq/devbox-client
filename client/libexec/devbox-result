@@ -64,7 +64,12 @@ git rev-parse --git-dir >/dev/null 2>&1 || { echo "devbox result: $PWD is not in
 # branch has none. A detached HEAD has no branch: symbolic-ref exits 1 and the
 # record says `-` (section 7).
 branch="$(devbox_record_branch)"
-record="$(devbox_record_newest "$branch")"
+# A failed read says so: a bare exit 1 here once read as "no record" to every
+# caller, after a gate that had written one.
+if ! record="$(devbox_record_newest "$branch")"; then
+  echo "devbox result: could not read the records in $(devbox_record_dir)" >&2
+  exit 1
+fi
 if [ -z "$record" ]; then
   echo "devbox result: no record in $(devbox_record_dir); devbox verify writes one after each gate" >&2
   exit 1
