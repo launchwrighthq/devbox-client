@@ -2052,6 +2052,40 @@ choose_target() {
   DECISION="${SELECTION##*$'\n'}"
   read -r d_kind d_name d_rule _ <<<"$DECISION"
 }
+# One line when a forced target queues and another deployed target would start
+# the run now. MEASURED: agents ran `devbox run --target <host>` by habit while
+# that host was saturated, with runs queued 4 to 9 minutes, and another host
+# the checkout may use stood nearly idle. --target joins that one host, so the
+# affinity grace and the late joins never happen. The other deployed targets
+# get one probe, in parallel and under the probe's own limits, only when the
+# forced target's estimate is not `now`: a forced target that fits now costs no
+# contact with another host, as before. The line never changes where the run
+# goes, and nothing here fails the run.
+forced_target_hint() {
+  local verdict secs name facts sel b_kind b_name b_rule b_verdict estimate deployed=0
+  local -a others=()
+  [ -n "$FORCE_TARGET" ] && [ "$d_kind" = pick ] && [ "$d_name" = "$FORCE_TARGET" ] || return 0
+  read -r _ _ _ verdict secs _ <<<"$DECISION"
+  [ "$verdict" != now ] || return 0
+  # A deployed target only: the rented Hetzner server is this checkout's own.
+  for name in ${DEVBOX_DEPLOYED[@]+"${DEVBOX_DEPLOYED[@]}"}; do
+    if [ "$name" = "$FORCE_TARGET" ]; then deployed=1; else others+=("$name"); fi
+  done
+  [ "$deployed" = 1 ] && [ "${#others[@]}" -gt 0 ] || return 0
+  # Silent when the probe cannot run, or its directory cannot be made:
+  # devbox_targets_probe fails only on its own limits, which the forced
+  # target's probe already passed, and a hint that is not given leaves the
+  # run exactly as --target asked for it.
+  mkdir -m 700 "$PROBE_DIR/others" 2>/dev/null || return 0
+  facts="$(devbox_targets_probe "$GRANT_WANT" "$DEVBOX_MIN_TOKENS" "$PROBE_DIR/others" 1 "${others[@]}")" || return 0
+  newkey_lines "$facts"
+  sel="$(printf '%s\n' "$facts" | sed '/^$/d' | rejoin_select "${others[@]}")"
+  read -r b_kind b_name b_rule b_verdict _ <<<"${sel##*$'\n'}"
+  [ "$b_kind" = pick ] && [ "$b_rule" = 2 ] && [ "$b_verdict" = now ] || return 0
+  estimate="$verdict"
+  [ "$verdict" != wait ] || estimate="wait ${secs}s"
+  echo "devbox: --target $FORCE_TARGET queues (estimate $estimate); $b_name would start now. Drop --target to let devbox choose." >&2
+}
 # The rented Hetzner server becomes a target once it answers, and the choice then
 # runs on it alone: rules 1, 2, 3, 5 and 6, as for any forced target. The probe
 # proves its handshake, its health, DEVBOX_REQUIRES and its queue, like a deployed
@@ -2976,6 +3010,7 @@ decide() {
 
 [ "$FORCE_TARGET" != hetzner ] || hetzner_target
 choose_target
+forced_target_hint
 if [ "$d_kind" = rent ] && [ "$d_name" = hetzner ]; then
   skip_lines "==> devbox: "
   echo "==> devbox: renting hetzner: no deployed target can take this gate"

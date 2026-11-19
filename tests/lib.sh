@@ -210,10 +210,21 @@ PRELUDE
 # rename, and sets PROC_STAT_WRITER to its pid. The caller kills it. The writer
 # also ends by itself once the test shell that started it is gone, because a
 # KILL to that shell runs no EXIT trap and the writer would loop forever.
+#
+# A new writer counts on from the counters in <file>, so they never go back.
+# MEASURED: a test that moved the host from 10 to 60 percent idle read a busy
+# host once in a full run on a loaded laptop. The new writer restarted at 0,
+# the first reading of the pool still held the larger counters of the old
+# writer, and the difference went negative, which reads as no idle share at
+# all. With the counters carried on, all the two readings differ by is the
+# new writer's, because the caller stops the old one first.
 proc_stat_writer() {
-  local file="$1" idle="$2"
+  local file="$1" idle="$2" i=0 b=0 _c b0 _x _y i0 _rest
+  if [ -r "$file" ] && read -r _c b0 _x _y i0 _rest <"$file" \
+     && [[ "$b0" =~ ^[0-9]+$ && "$i0" =~ ^[0-9]+$ ]]; then
+    b="$b0"; i="$i0"
+  fi
   (
-    i=0; b=0
     # $$ in this subshell is the test shell's pid.
     while kill -0 "$$" 2>/dev/null; do
       i=$((i + idle)); b=$((b + 100 - idle))

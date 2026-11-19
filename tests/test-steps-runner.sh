@@ -777,7 +777,7 @@ refused "a select step with no runner" 2 'names no runner' "$(plan_step x select
 refused "a file that starts with -" 3 'starts with -' "$(plan_step x narrow vitest - 'npx vitest run'; plan_file x --reporter=json)"
 refused "a test file that starts with -" 3 'starts with -' "$(plan_step x run vitest - 'npx vitest run'; plan_test x -x)"
 refused "a file outside the dir of its step" 3 'is outside service/' "$(plan_step x narrow pytest - pytest service/; plan_file x tests/test_a.py)"
-refused "a line of another kind" 2 'starts with step, file, test or memory' 'hello'
+refused "a line of another kind" 2 'starts with step, file, test, memory or cgroup' 'hello'
 refused "a memory line before its step" 2 'no step line above it' "$(printf 'memory\tx\t1024\n'; plan_step x run - - true)"
 refused "a memory that is not a byte count" 3 'not a byte count' "$(plan_step x run - - true; printf 'memory\tx\t2G\n')"
 refused "a memory given twice" 4 'given twice' "$(plan_step x run - - true; printf 'memory\tx\t1024\nmemory\tx\t2048\n')"

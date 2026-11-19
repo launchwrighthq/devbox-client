@@ -779,6 +779,97 @@ _container_cgroup_layouts() {
   printf '%s\n' "$root/system.slice/docker-$id.scope" "$root/docker/$id"
 }
 
+# ── the meta file of a grant, read on the host ───────────────────────────────
+#
+# The pool writes meta/<pid> and both devbox-runner and devbox-pool read it.
+# Its readers live here, beside the cap rule below, so the two programs read
+# one key the same way.
+
+# The wall-clock limit a grant's client sent, DEVBOX_GATE_MAX_SECONDS, from the
+# line of meta/<pid> keyed "max-seconds <N>". Prints nothing and returns 1
+# when the grant carries none: a caller that sent no --max-seconds.
+#
+# Its readers are the watchdog's wall-clock rule and devbox_grant_cap below,
+# the stuck cap of reconcile and of the pool's status. While
+# reconcile read only the first line, it called a gate stuck at the 3600s grant
+# cap whatever limit its project set. --reclaim-idle then took the grant of a
+# gate inside its own 7200s limit after one 10-second sample at low CPU, and
+# --kill-orphans stopped that gate on the same pass: a signal status with no
+# reason line, once a minute under the watchdog.
+grant_max_seconds() {
+  local v
+  v="$(grant_meta "${1-}" max-seconds)" || return 1
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$v"
+}
+
+# The word after <key> on a line of meta/<pid> past the first, or a refusal
+# that prints nothing. Since protocol 3 the pool writes keyed lines below the
+# first: `max-seconds <N>`, `container <ws-name>` and, in hold mode, `go
+# <epoch>` when the client starts the gate. Every reader finds its line by its
+# key and never by its position, because the pool appends `go` minutes after the
+# others, and a line read by number would read another key's value.
+grant_meta() {
+  local f="${1-}" key="${2-}" k v
+  [ -r "$f" ] || return 1
+  {
+    read -r _ || return 1
+    while read -r k v _; do
+      if [ "$k" = "$key" ] && [ -n "$v" ]; then
+        printf '%s' "$v"
+        return 0
+      fi
+    done
+  } <"$f"
+  return 1
+}
+
+# When the client started the gate of a grant, from the meta `go` line, or a
+# refusal. A grant with no such line is one whose client is still preparing it
+# (docs/specs/2026-11-13-late-binding-queue-design.md D10).
+grant_go_epoch() {
+  local v
+  v="$(grant_meta "${1-}" go)" || return 1
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$v"
+}
+
+# The age at which a grant is past its limit, into GRANT_CAP in seconds from
+# the grant, with GRANT_CAP_TEXT naming that limit and GRANT_CAP_OWN 1 when it
+# is the grant's own. $1 the meta file, $2 the granted epoch, $3 the host cap,
+# DEVBOX_MAX_GRANT_SECONDS.
+#
+# A gate whose project set a longer DEVBOX_GATE_MAX_SECONDS is inside that
+# limit, and the watchdog's wall-clock and stall rules judge it there. The host
+# cap still applies to a shorter limit and to a grant with none, so no project
+# can make a reader act sooner than the host allows. That limit counts from
+# the meta `go` line since protocol 3 (D10 of
+# docs/specs/2026-11-13-late-binding-queue-design.md): a run holds its grant
+# through its sync and setup, which the pool bounds with its own prep limit.
+# Counted from the grant, a gate that prepared for minutes would read as stuck
+# that much sooner than the limit its project set.
+#
+# ONE copy for reconcile and `devbox-pool status`. MEASURED: the status line
+# applied the host cap alone and read STALE at 4120 s and again at 5096 s for a
+# gate whose project set 7200 s, while reconcile and the watchdog judged it
+# inside its limit, and the gate finished normally.
+# shellcheck disable=SC2034  # every GRANT_CAP variable is read by the caller
+devbox_grant_cap() {
+  local meta="${1-}" granted_at="${2-}" host_cap="${3-}" lim go
+  GRANT_CAP="$host_cap"
+  GRANT_CAP_TEXT="the ${host_cap}s cap"
+  GRANT_CAP_OWN=0
+  lim="$(grant_max_seconds "$meta")" || return 0
+  local text="its own DEVBOX_GATE_MAX_SECONDS of ${lim}s"
+  if go="$(grant_go_epoch "$meta")" && [ "$go" -gt "$granted_at" ]; then
+    text="$text after its go, $((go - granted_at))s into the grant"
+    lim=$((lim + go - granted_at))
+  fi
+  if [ "$lim" -gt "$host_cap" ]; then
+    GRANT_CAP="$lim"; GRANT_CAP_TEXT="$text"; GRANT_CAP_OWN=1
+  fi
+}
+
 # ── the probe line ───────────────────────────────────────────────────────────
 #
 # A client used to ask a host three questions, one round trip each:

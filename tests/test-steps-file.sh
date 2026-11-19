@@ -216,6 +216,26 @@ assert_eq "3221225472|536870912|536870912|" \
 assert_eq "$(source_of $'lint -- npm run lint' lint)" "$(source_of $'lint memory=3G -- npm run lint' lint)" \
   "D4: memory= does not change the source, so a step keeps its carried pass"
 
+# cgroup=nested runs a step's processes in a cgroup at depth 2 or more. A test
+# that reads its own cgroup passes or fails by it, so the value joins the
+# source, and a pass taken without it never carries for the step with it.
+cat >"$STEPS" <<'EOF'
+cgtest cgroup=nested -- npm run test:cgroup
+mod:{name} each=apps/*/ cgroup=nested -- true
+plain -- true
+EOF
+rc=0
+devbox_steps_load "$STEPS" "$ROOT" || rc=$?
+assert_eq 0 "$rc" "cgroup=nested loads"
+assert_eq "nested|nested|" "${STEP_CGROUP[cgtest]}|${STEP_CGROUP[mod:web]}|${STEP_CGROUP[plain]}" \
+  "cgroup=nested fills STEP_CGROUP, for each module of an each= line, and is empty when unset"
+assert_eq "cgtest cgroup=nested -- npm run test:cgroup" "${STEP_SOURCE[cgtest]}" \
+  "cgroup=nested is in the source"
+assert_ok "so a step that gains it no longer has the key of its earlier pass" \
+  test "$(source_of $'s -- true' s)" != "$(source_of $'s cgroup=nested -- true' s)"
+refused "cgroup= with another value" 'a cgroup=host -- true' 1 'cgroup must be nested, not "host"'
+refused "cgroup= with no value" $'a -- true\nb cgroup= -- true' 2 'attribute "cgroup" has no value'
+
 # ── the caller's scope ───────────────────────────────────────────────────────
 
 printf '%s\n' 'only -- true' >"$STEPS"

@@ -27,7 +27,10 @@
 #                        default (docs/specs/2026-11-16-step-memory-budget-design.md)
 #   DEVBOX_CGROUP_ROOT   the cgroup v2 directory of this workspace, whose
 #                        memory.max caps the workers and sets the memory
-#                        budget of the steps; /sys/fs/cgroup by default
+#                        budget of the steps, and under which a cgroup=nested
+#                        step gets devbox/<name>; /sys/fs/cgroup by default
+#   DEVBOX_PROC_CGROUP   the file a cgroup=nested step reads its own cgroup
+#                        from; /proc/self/cgroup by default
 #   DEVBOX_MEMINFO       the meminfo file read when no cgroup file holds a
 #                        limit; /proc/meminfo by default
 # The project directory is the current directory.
@@ -40,7 +43,9 @@
 # first time the grant holds runner steps back, one line the first time the
 # memory budget holds a step back, one
 # `devbox-steps: untraced <name> <reason>` line for a step whose trace cannot
-# run, the batch lines of a streamed step whose files run in batches, then a
+# run, the batch lines of a streamed step whose files run in batches, one
+# `devbox-steps: <name> left its cgroup <dir>` line for a cgroup=nested step
+# whose cgroup could not be removed, then a
 # summary table, the full log of each failed step after
 # `== <name>: <log path>`, the `devbox-steps: trace <name> <seq> <chunk>` lines
 # of each traced step, and last one `devbox-steps: result <name>
@@ -66,7 +71,7 @@ VITEST_DIR=node_modules/.devbox-ledger
 # ── the plan ─────────────────────────────────────────────────────────────────
 
 NAMES=()
-declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=() TESTS=() DIR=() TRACE=() MEM=()
+declare -A MODE=() RUNNER=() AFTER=() CMD=() LINE=() FILES=() TESTS=() DIR=() TRACE=() MEM=() NESTED=()
 
 n=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -151,7 +156,18 @@ while IFS= read -r line || [ -n "$line" ]; do
       [[ "${fields[2]}" =~ ^[1-9][0-9]{0,17}$ ]] || plan_die "$n" "the memory of $name is $(printf '%q' "${fields[2]}"), not a byte count"
       MEM[$name]="${fields[2]}"
       ;;
-    *) plan_die "$n" "a line starts with step, file, test or memory, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
+    cgroup)
+      # The cgroup= of .devbox/steps. `nested` is its one value.
+      if [ "${#tabs}" -ne 2 ] || [ "${#fields[@]}" -ne 3 ]; then
+        plan_die "$n" "a cgroup line has 3 non-empty fields separated by one tab"
+      fi
+      name="${fields[1]}"
+      [ -n "${MODE[$name]+x}" ] || plan_die "$n" "a cgroup line names $(printf '%q' "$name"), which no step line above it plans"
+      [ -z "${NESTED[$name]+x}" ] || plan_die "$n" "the cgroup of $name is given twice"
+      [ "${fields[2]}" = nested ] || plan_die "$n" "the cgroup of $name is $(printf '%q' "${fields[2]}"), not nested"
+      NESTED[$name]=1
+      ;;
+    *) plan_die "$n" "a line starts with step, file, test, memory or cgroup, and this one starts with $(printf '%q' "${fields[0]-}")" ;;
   esac
 done <"$DEVBOX_STEPS_PLAN"
 [ "${#NAMES[@]}" -gt 0 ] || die "the plan $DEVBOX_STEPS_PLAN holds no step"
@@ -700,6 +716,113 @@ setuid_run() {
   return 1
 }
 
+# ── cgroup=nested ────────────────────────────────────────────────────────────
+#
+# A test may read its own cgroup from /proc/self/cgroup and need a path of
+# depth 2 or more, as it has on a laptop under systemd. MEASURED in a
+# workspace under sysbox: every gate process sits in `0::/init.scope`, depth 1,
+# and dev cannot create a cgroup, because /sys/fs/cgroup belongs to the
+# container's root. `sudo -n` works for dev, and container root can. On a
+# laptop under systemd and on a CI runner the path is deeper already, and the
+# step stays where it is.
+#
+# The step's own shell joins devbox/<name> before it execs the command, so
+# every process the command starts inherits it. The name is the step's alone,
+# not the run's: one gate runs in a workspace at a time, so two steps never
+# share one, and a gate stopped by a signal leaves one empty cgroup per step
+# that the next gate reuses, never one more per run.
+#
+# The cgroup sits below the container's own, so the container's memory limit
+# stays in force over it. A step that leaves a process behind keeps the cgroup
+# alive, and that process still counts against the container's limit.
+NESTED_ROOT="${DEVBOX_CGROUP_ROOT:-/sys/fs/cgroup}"
+PROC_CGROUP="${DEVBOX_PROC_CGROUP:-/proc/self/cgroup}"
+# The directory the step of this job joins, set by cgroup_prepare. Empty when
+# the step needs no move.
+CGROUP_DIR=""
+
+# own_cgroup: the cgroup v2 path of this shell, from the `0::` line of
+# /proc/self/cgroup, or a status of 1 when no such line exists.
+own_cgroup() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in 0::/*) printf '%s\n' "${line#0::}"; return 0 ;; esac
+  done <"$PROC_CGROUP"
+  return 1
+}
+
+# cgroup_depth <path>: how many parts the path has. / is 0, /init.scope is 1.
+cgroup_depth() {
+  local part n=0
+  local -a parts
+  IFS=/ read -ra parts <<<"$1"
+  for part in ${parts[@]+"${parts[@]}"}; do [ -z "$part" ] || n=$((n + 1)); done
+  printf '%s\n' "$n"
+}
+
+# cgroup_prepare <name> <log>: set CGROUP_DIR to the cgroup step <name> must
+# join, created, or to nothing when its shell sits at depth 2 or more. A step
+# that cannot get one does not run, and the log says why: a test that asserts
+# its depth would fail on a reason the log never named, and a test that skips
+# on a shallow path would pass having tested nothing.
+cgroup_prepare() {
+  local name="$1" log="$2" path depth
+  CGROUP_DIR=""
+  if ! path="$(own_cgroup 2>>"$log")"; then
+    printf 'devbox-steps: %s has cgroup=nested, and %s holds no cgroup v2 line (0::/...), so %s did not run\n' "$name" "$PROC_CGROUP" "$name" >>"$log"
+    return 1
+  fi
+  depth="$(cgroup_depth "$path")"
+  if [ "$depth" -ge 2 ]; then
+    printf 'devbox-steps: %s runs in cgroup %s, depth %s, so cgroup=nested moves it nowhere\n' "$name" "$path" "$depth" >>"$log"
+    return 0
+  fi
+  # shellcheck disable=SC2024 # the log is the step's, which this user writes; only mkdir needs root
+  if ! sudo -n mkdir -p "$NESTED_ROOT/devbox/$name" >>"$log" 2>&1; then
+    printf 'devbox-steps: %s has cgroup=nested and runs in cgroup %s, depth %s, and sudo -n mkdir -p %s failed, so %s did not run; cgroup=nested needs passwordless sudo and a cgroup v2 hierarchy at %s\n' \
+      "$name" "$path" "$depth" "$NESTED_ROOT/devbox/$name" "$name" "$NESTED_ROOT" >>"$log"
+    return 1
+  fi
+  printf 'devbox-steps: %s runs in cgroup %s, depth %s, so it moves to %s\n' "$name" "$path" "$depth" "$NESTED_ROOT/devbox/$name" >>"$log"
+  CGROUP_DIR="$NESTED_ROOT/devbox/$name"
+}
+
+# cgroup_join <name>: move this shell into CGROUP_DIR, then read
+# /proc/self/cgroup again. A write the kernel took and a path that did not
+# change would run the step at the old depth, so the path is checked, not the
+# write. The messages go to stderr, which run_command sends to the step log.
+cgroup_join() {
+  local name="$1" pid="$BASHPID" path
+  [ -n "$CGROUP_DIR" ] || return 0
+  # The pid is read into a variable first. A redirection of an external
+  # command expands in the child bash forks for it, so `<<<"$BASHPID"` there
+  # wrote the child's pid. MEASURED in tests/test-steps-cgroup.sh: the pid
+  # moved was not the step command's, so the command ran at the old depth.
+  if ! sudo -n tee "$CGROUP_DIR/cgroup.procs" >/dev/null <<<"$pid"; then
+    echo "devbox-steps: could not write pid $pid to $CGROUP_DIR/cgroup.procs with sudo -n, so $name did not run" >&2
+    return 1
+  fi
+  path="$(own_cgroup)" || path=""
+  case "$path" in
+    */devbox/"$name") [ "$(cgroup_depth "$path")" -lt 2 ] || return 0 ;;
+  esac
+  echo "devbox-steps: pid $pid was written to $CGROUP_DIR/cgroup.procs, and $PROC_CGROUP still names $(printf '%q' "$path"), so $name did not run" >&2
+  return 1
+}
+
+# cgroup_remove <name> <log>: remove CGROUP_DIR once the step ended. A
+# failure is reported and does not fail the step: the step's own result is
+# already decided, and the cgroup still holds the process the step left
+# behind, which is where it belongs. The next gate reuses it.
+cgroup_remove() {
+  local name="$1" log="$2"
+  [ -n "$CGROUP_DIR" ] || return 0
+  # shellcheck disable=SC2024 # the log is the step's, which this user writes; only rmdir needs root
+  sudo -n rmdir "$CGROUP_DIR" >>"$log" 2>&1 && return 0
+  printf 'devbox-steps: could not remove the cgroup %s: a process the step started may still run in it\n' "$CGROUP_DIR" >>"$log"
+  echo "devbox-steps: $name left its cgroup $CGROUP_DIR"
+}
+
 # ── a step ───────────────────────────────────────────────────────────────────
 
 # The command of one step with the runner's plug-in and its worker option
@@ -865,10 +988,10 @@ run_command() {
     # strace log of a long step filled the 10% tmpfs of $XDG_RUNTIME_DIR on a
     # CI runner, and tee's ENOSPC failed a step whose command passed. GNU tee
     # keeps streaming to stdout after a file write fails.
-    (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null 2>&1 \
+    (cgroup_join "$name" || exit 2; cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null 2>&1 \
       | { tee -a "$log" || echo "devbox-steps: could not write all of the log $log" >&2; } || rc=$?
   else
-    (cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null >>"$log" 2>&1 || rc=$?
+    (cgroup_join "$name" || exit 2; cd "./${DIR[$name]}" && exec "$@" bash "$script") </dev/null >>"$log" 2>&1 || rc=$?
   fi
   return "$rc"
 }
@@ -885,7 +1008,9 @@ run_step() {
   # A command of a few thousand file arguments is longer than the 128 KiB one
   # argument may hold, so it runs from a file rather than bash -c, and a list
   # past BATCH_BYTES runs in batches, for a wrapper that joins its arguments.
-  if ! prefix="$(compose "$name" "$workers" 2>>"$log")" || ! split_batches "$name" "$prefix" "$script"; then
+  if [ -n "${NESTED[$name]+x}" ] && ! cgroup_prepare "$name" "$log"; then
+    rc=2
+  elif ! prefix="$(compose "$name" "$workers" 2>>"$log")" || ! split_batches "$name" "$prefix" "$script"; then
     rc=2
     printf 'devbox-steps: could not compose the command of %s, so it did not run\n' "$name" >>"$log"
   elif [ -n "${TRACED[$name]+x}" ] && ! { rm -rf "$tdir" && mkdir -p "$tdir"; }; then
@@ -924,6 +1049,7 @@ run_step() {
     fi
     run_batches "$name" "$script" "$log" || rc=$?
   fi
+  cgroup_remove "$name" "$log"
   printf '%s %s\n' "$rc" "$((SECONDS - started))" >"$STATE_DIR/$name.tmp"
   mv -f "$STATE_DIR/$name.tmp" "$STATE_DIR/$name.done"
 }

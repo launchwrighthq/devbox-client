@@ -666,7 +666,7 @@ _devbox_plan_run_reason() {
 
 # Print the plan of section 5.6 for the rerun setting $1 (changed or full) over
 # the manifest $2 (devbox_sync_manifest's lines): one `step` line per step,
-# then the `file` and `test` lines. With step names after $2, only those are
+# then the `file`, `test`, `memory` and `cgroup` lines. With step names after $2, only those are
 # planned, and an `after` name that is not planned is dropped, because that
 # step never runs and the runner would wait on it forever.
 #
@@ -689,7 +689,7 @@ devbox_plan_build() {
   local rerun="$1" manifest="$2" step var action key run after a b64 f mode trace rc
   local _plan_version _plan_config _plan_forward _plan_files _plan_reason _plan_why _plan_tests _plan_new _plan_shard _plan_branch _plan_narrow_why
   local shard_step="" shard_i="" shard_n=""
-  local -a steps afters step_lines=() file_lines=() test_lines=() memory_lines=()
+  local -a steps afters step_lines=() file_lines=() test_lines=() memory_lines=() cgroup_lines=()
   local -A _plan_freason=() _plan_mapfiles=()
   shift 2
   case "$rerun" in
@@ -825,6 +825,7 @@ devbox_plan_build() {
     step_lines+=("$(printf 'step\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$step" "$action" "$key" \
       "${STEP_RUNNER[$step]:--}" "${after:--}" "$b64" "${STEP_DIR[$step]:--}" "$trace")")
     [ -z "${STEP_MEMORY[$step]-}" ] || memory_lines+=("$(printf 'memory\t%s\t%s' "$step" "${STEP_MEMORY[$step]}")")
+    [ -z "${STEP_CGROUP[$step]-}" ] || cgroup_lines+=("$(printf 'cgroup\t%s\t%s' "$step" "${STEP_CGROUP[$step]}")")
     # shellcheck disable=SC2034 # PLAN_MODE and PLAN_TRACE are read by devbox-verify's record
     PLAN_ACTION[$step]="$action" PLAN_MODE[$step]="$mode" PLAN_TRACE[$step]="$trace"
     PLAN_REASON[$step]="$_plan_reason" PLAN_NFILES[$step]=0
@@ -844,6 +845,7 @@ devbox_plan_build() {
   [ "${#file_lines[@]}" -eq 0 ] || printf '%s\n' "${file_lines[@]}"
   [ "${#test_lines[@]}" -eq 0 ] || printf '%s\n' "${test_lines[@]}"
   [ "${#memory_lines[@]}" -eq 0 ] || printf '%s\n' "${memory_lines[@]}"
+  [ "${#cgroup_lines[@]}" -eq 0 ] || printf '%s\n' "${cgroup_lines[@]}"
 }
 
 # Print the plan that devbox_plan_build made for a person, for --plan: one line

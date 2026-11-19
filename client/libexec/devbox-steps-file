@@ -2,7 +2,8 @@
 # Parse and check a project's .devbox/steps into the STEP_* variables that the
 # plan and the runner read (docs/specs/2026-11-14-client-owns-the-gate-design.md,
 # sections 4.2 and 6.7, and docs/specs/2026-11-14-learned-selection-design.md,
-# sections 4.2 and 5.6, for dir=, shards= and requires=).
+# sections 4.2 and 5.6, for dir=, shards= and requires=). cgroup= is in
+# README.md, "The steps of a gate".
 # shellcheck shell=bash
 
 # Every rule of section 4.2 is checked here, on the laptop, before any target is
@@ -23,7 +24,7 @@ _devbox_steps_reset() {
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
     STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() \
-    STEP_DIR=() STEP_SHARDS=() STEP_REQUIRES=() STEP_MEMORY=()
+    STEP_DIR=() STEP_SHARDS=() STEP_REQUIRES=() STEP_MEMORY=() STEP_CGROUP=()
 }
 
 # Print the directories under <root> that the `each` pattern <pattern> names,
@@ -90,7 +91,7 @@ _devbox_steps_dir_ok() {
 #   $1 line  $2 name  $3 after (comma list)  $4 inputs (comma list)  $5 command
 #   $6 runner  $7 narrow  $8 rerun  $9 the template name of an `each` line, or
 #   empty  $10 dir  $11 shards  $12 requires (comma list)  $13 the checkout root
-#   $14 memory in bytes, or empty
+#   $14 memory in bytes, or empty  $15 cgroup, `nested` or empty
 _devbox_steps_add() {
   local n="$1" name="$2" after="$3" inputs="$4" cmd="$5"
   if [[ ! "$name" =~ ^[a-z0-9][a-z0-9:_-]*$ ]]; then
@@ -117,6 +118,7 @@ _devbox_steps_add() {
   STEP_REQUIRES[$name]="${12//,/ }"
   # shellcheck disable=SC2034 # read by devbox-plan, which writes it into the plan
   STEP_MEMORY[$name]="${14}"
+  STEP_CGROUP[$name]="${15}"
   [ -z "$9" ] || _tmpl[$9]+="$name "
 }
 
@@ -125,7 +127,7 @@ _devbox_steps_add() {
 _devbox_steps_line() {
   local n="$1" line="$2" root="$3" head rest cmd name w key val given=" " tok
   local a_each="" a_after="" a_inputs="" a_runner="" a_narrow="" a_rerun=""
-  local a_dir="" a_shards="" a_requires="" a_memory="" memory=""
+  local a_dir="" a_shards="" a_requires="" a_memory="" a_cgroup="" memory=""
   local dirs dir mod
   local -a words toks
   case "$line" in --|--[[:space:]]*)
@@ -161,7 +163,7 @@ _devbox_steps_line() {
       _devbox_steps_refuse "$n" "$w is no longer read, because every runner step selects its test files by what they read; remove it"
       return 2
     fi
-    case "$key" in each|after|inputs|runner|narrow|rerun|dir|shards|requires|memory) ;; *)
+    case "$key" in each|after|inputs|runner|narrow|rerun|dir|shards|requires|memory|cgroup) ;; *)
       _devbox_steps_refuse "$n" "unknown attribute \"$key\""; return 2 ;;
     esac
     case "$given" in *" $key "*)
@@ -182,6 +184,9 @@ _devbox_steps_line() {
   esac
   case "$a_rerun" in ""|always) ;; *)
     _devbox_steps_refuse "$n" "rerun must be always, not \"$a_rerun\""; return 2 ;;
+  esac
+  case "$a_cgroup" in ""|nested) ;; *)
+    _devbox_steps_refuse "$n" "cgroup must be nested, not \"$a_cgroup\""; return 2 ;;
   esac
   # shards= splits a runner step's test files across CI jobs (learned-selection
   # spec, D10), so a step with no runner has no files to split.
@@ -228,7 +233,7 @@ _devbox_steps_line() {
 
   if [ -z "$a_each" ]; then
     _devbox_steps_add "$n" "$name" "$a_after" "$a_inputs" "$cmd" \
-      "$a_runner" "$a_narrow" "$a_rerun" "" "$a_dir" "$a_shards" "$a_requires" "$root" "$memory" || return 2
+      "$a_runner" "$a_narrow" "$a_rerun" "" "$a_dir" "$a_shards" "$a_requires" "$root" "$memory" "$a_cgroup" || return 2
     return 0
   fi
   case "$a_each" in */) ;; *)
@@ -251,7 +256,7 @@ _devbox_steps_line() {
       "$(_devbox_steps_sub "$a_inputs" "$dir" "$mod")" \
       "$(_devbox_steps_sub "$cmd" "$dir" "$mod")" \
       "$a_runner" "$a_narrow" "$a_rerun" "$name" \
-      "$(_devbox_steps_sub "$a_dir" "$dir" "$mod")" "$a_shards" "$a_requires" "$root" "$memory" || return 2
+      "$(_devbox_steps_sub "$a_dir" "$dir" "$mod")" "$a_shards" "$a_requires" "$root" "$memory" "$a_cgroup" || return 2
   done <<<"$dirs"
 }
 
@@ -284,6 +289,8 @@ _devbox_steps_visit() {
 # the file does not throw away every carried pass. shards= stays out: it only
 # splits CI jobs, and the step runs the same files either way. memory= stays
 # out for the same reason: it decides when the step starts, not what it runs.
+# cgroup= is in: a test that reads its own cgroup passes or fails by it, so a
+# pass taken without it is no pass of the step with it.
 _devbox_steps_source() {
   local name="$1" src="$1" list="" item
   local -a items
@@ -299,6 +306,7 @@ _devbox_steps_source() {
       < <(printf '%s\n' "${STEP_INPUTS[$name]}" | LC_ALL=C sort -u)
     src+=" inputs=$list"
   fi
+  [ -z "${STEP_CGROUP[$name]}" ] || src+=" cgroup=${STEP_CGROUP[$name]}"
   [ -z "${STEP_DIR[$name]}" ] || src+=" dir=${STEP_DIR[$name]}"
   [ -z "${STEP_NARROW[$name]}" ] || src+=" narrow=${STEP_NARROW[$name]}"
   list=""

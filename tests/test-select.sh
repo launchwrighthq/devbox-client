@@ -56,7 +56,7 @@ new_repo() {
   rm -rf "$TRACES" && mkdir -p "$TRACES"
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
-    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=() STEP_MEMORY=()
+    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=() STEP_MEMORY=() STEP_CGROUP=()
   PLAN_SHARD=""
 }
 

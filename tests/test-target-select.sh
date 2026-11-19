@@ -550,6 +550,47 @@ assert_ok "naming why" contains "==> devbox: queuing on lan1 (--target lan1): " 
 assert_eq "0" "$(opened cloud-fixture)" "and cloud1 is not even probed"
 assert_fail "and a target that answered clears its cache record" test -f "$TMP/run/devbox/unreachable-lan1"
 
+# The hint of a forced target that queues. MEASURED: agents ran `devbox run
+# --target <host>` by habit while that host was saturated, with runs queued
+# for minutes, and another host of the list stood nearly idle. --target skips
+# every other host, so the affinity grace and the late joins never happen.
+# When the forced target's estimate is not `now`, the other deployed targets
+# get one probe, and one line on stderr names a host that would start the run
+# now. The run still goes where --target sent it.
+busy_probe() {
+  devbox_probe_line "$PROTO $FP" "wait 300 4 20/20 4/4 2" "$(date +%s) ok" "$(date +%s)" >"$TMP/probes/$1.probe"
+}
+HINT="devbox: --target lan1 queues (estimate wait 300s); cloud1 would start now. Drop --target to let devbox choose."
+busy_probe lan-fixture
+FAKE_GRANT="lan-fixture:2" verify --target lan1
+assert_eq "0" "$rc" "H1: --target lan1 with a 300 s estimate completes"
+assert_ok "H1: one line names lan1's estimate and cloud1, which would start now" contains "$HINT" "$out"
+assert_eq "1" "$(grep -cF 'Drop --target' <<<"$out")" "H1: once"
+assert_ok "H1: the gate still ran on lan1" contains "GATE RAN ON lan-fixture" "$out"
+assert_fail "H1: and cloud1 was not joined" contains "queuing on cloud1" "$out"
+assert_eq "1" "$(opened cloud-fixture)" "H1: cloud1 got one probe"
+
+busy_probe cloud-fixture
+FAKE_GRANT="lan-fixture:2" verify --target lan1
+assert_eq "0" "$rc" "H2: with cloud1 busy too the run completes"
+assert_fail "H2: and prints no hint" contains "Drop --target" "$out"
+rm -f "$TMP/probes/cloud-fixture.probe"
+
+# An unreachable or a stalled other target ends the hint, silently: the run
+# asked for lan1 alone. The probe enters each in the unreachable cache, which
+# the cases after these must not read.
+FAKE_GRANT="lan-fixture:2" FAKE_UNREACHABLE=cloud-fixture verify --target lan1
+assert_eq "0" "$rc" "H3: with cloud1 unreachable the run completes on lan1"
+assert_ok "H3: there" contains "GATE RAN ON lan-fixture" "$out"
+assert_fail "H3: with no hint and no line about cloud1" matches 'Drop --target|cloud1 unreachable' "$out"
+rm -f "$TMP/run/devbox/unreachable-cloud1"
+t0="$(date +%s)"
+FAKE_GRANT="lan-fixture:2" FAKE_STALL=cloud-fixture DEVBOX_PROBE_ANSWER_SECONDS=1 verify --target lan1
+assert_eq "0" "$rc" "H4: with cloud1 stalled the run completes on lan1"
+assert_fail "H4: with no hint" contains "Drop --target" "$out"
+assert_ok "H4: one answer limit later ($(( $(date +%s) - t0 ))s)" test "$(( $(date +%s) - t0 ))" -lt 10
+rm -f "$TMP/run/devbox/unreachable-cloud1" "$TMP/probes/lan-fixture.probe"
+
 # A stalled target. ConnectTimeout bounds only the connect, so a
 # host that accepted TCP and then never answered held the probe's `wait`, and
 # with it the whole run, with no skip line. Each ssh of the probe now has a

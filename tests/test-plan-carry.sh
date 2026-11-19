@@ -63,7 +63,7 @@ manifest() {
 no_steps() {
   declare -ga STEP_NAMES=()
   declare -gA STEP_AFTER=() STEP_INPUTS=() STEP_RUNNER=() STEP_NARROW=() \
-    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=() STEP_MEMORY=()
+    STEP_RERUN=() STEP_CMD=() STEP_SOURCE=() STEP_DIR=() STEP_MEMORY=() STEP_CGROUP=()
 }
 
 # Add one step: $1 name, $2 inputs (one per line), then key=value attributes.
@@ -437,5 +437,14 @@ STEP_MEMORY[pytest]=1073741824
 plan changed
 assert_eq $'memory\tlint\t3221225472\nmemory\tpytest\t1073741824' "$(grep '^memory' "$P")" \
   "the plan carries the memory= of lint and pytest as byte counts, and no line for the other steps"
+
+echo "-- cgroup=: one cgroup line per step that sets it"
+new_repo cg
+disjoint_steps
+STEP_CGROUP[guards]=nested
+plan changed
+assert_eq $'cgroup\tguards\tnested' "$(grep '^cgroup' "$P")" \
+  "the plan carries the cgroup=nested of guards, and no line for the other steps"
+assert_eq "cgroup" "$(tail -n 1 "$P" | cut -f1)" "after every step line, where the runner reads it"
 
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"
