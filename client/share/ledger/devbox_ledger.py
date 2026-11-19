@@ -605,6 +605,20 @@ class Tracer:
             os.makedirs(trace_dir, exist_ok=True)
             with open(temp, "w", encoding="utf-8", errors="surrogateescape") as handle:
                 handle.write(text)
+            # The name is taken with O_EXCL before the rename. devbox-steps runs
+            # a long file list as several pytest runs into one trace folder, and
+            # a later run whose process got a pid an earlier run had used would
+            # rename over that run's file and drop its test files' reads. An
+            # empty file left by a process killed between the two calls names no
+            # test file, so those files have no trace and run again.
+            n = 1
+            while True:
+                try:
+                    os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                    break
+                except FileExistsError:
+                    n += 1
+                    target = os.path.join(trace_dir, "%s-%d-%d.trace" % (TRACE_RUNNER, os.getpid(), n))
             os.replace(temp, target)
         except OSError as err:
             sys.stderr.write("devbox_ledger: could not write the read trace %s, so its test files have no trace: %s\n" % (target, err))

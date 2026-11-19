@@ -40,7 +40,8 @@
 # first time the grant holds runner steps back, one line the first time the
 # memory budget holds a step back, one
 # `devbox-steps: untraced <name> <reason>` line for a step whose trace cannot
-# run, then a summary table, the full log of each failed step after
+# run, the batch lines of a streamed step whose files run in batches, then a
+# summary table, the full log of each failed step after
 # `== <name>: <log path>`, the `devbox-steps: trace <name> <seq> <chunk>` lines
 # of each traced step, and last one `devbox-steps: result <name>
 # <pass|fail|resumed|carried> <seconds> <code>` line per step, in plan order.
@@ -701,15 +702,11 @@ setuid_run() {
 
 # ── a step ───────────────────────────────────────────────────────────────────
 
-# The final command of one step, with the runner's plug-in, its worker option
-# and its files appended. Every appended word goes through printf %q, because
-# the command runs under bash and a file name may hold a space or a quote. $2
-# is the step's worker count. The notes go to stderr, which run_step writes
-# to the step log.
+# The command of one step with the runner's plug-in and its worker option
+# appended, before its files, which split_batches appends. $2 is the step's
+# worker count. The notes go to stderr, which run_step writes to the step log.
 compose() {
-  local name="$1" workers="$2" cmd="${CMD[$1]}" f dir="${DIR[$1]}" plugin=0 probe
-  local -a files=()
-  [ -z "${RUNLIST[$name]-}" ] || mapfile -t files <<<"${RUNLIST[$name]%$'\n'}"
+  local name="$1" workers="$2" cmd="${CMD[$1]}" dir="${DIR[$1]}" plugin=0 probe
   [ -z "$LEDGER" ] && [ -z "${TRACED[$name]+x}" ] || plugin=1
   case "${RUNNER[$name]}" in
     vitest)
@@ -739,10 +736,122 @@ compose() {
       fi
       ;;
   esac
-  # The plan names files from the project directory, and a dir= step's runner
-  # runs in its folder, so each file loses that folder's prefix.
-  for f in "${files[@]}"; do cmd+=" $(printf '%q' "${f#"$dir"}")"; done
   printf '%s\n' "$cmd"
+}
+
+# The most bytes one composed command line may hold before its files run in
+# batches. MEASURED: a vitest step of a few thousand files composed a command
+# over 131072 bytes, and its `npx vitest run` exited 249 after 4 seconds and printed
+# nothing, so the step failed with no message. npx starts the bin through
+# `sh -c` with the command and every argument joined into one string, and
+# Linux refuses a single argument string over 131072 bytes (MAX_ARG_STRLEN)
+# with E2BIG. npm exec, npm run and a project's own `sh -c "$*"` join the same
+# way, and the runner cannot know what a command does, so the budget holds for
+# every runner step. 96 KiB leaves 32 KiB for what a wrapper adds: its bin
+# path, and two quotes around each argument, which stays under 32 KiB for any
+# list whose paths average 5 bytes or more. The runner's own `bash <script>`
+# has no such cap, so a list under the budget runs as one command.
+BATCH_BYTES=98304
+
+# byte_sizes <word>...: the bytes of each word into SIZES. Under LC_ALL=C,
+# because ${#word} counts characters in a UTF-8 locale and a file name may
+# hold multi-byte ones.
+byte_sizes() {
+  local LC_ALL=C word
+  SIZES=()
+  for word in "$@"; do SIZES+=("${#word}"); done
+}
+
+# split_batches <name> <prefix> <script>: the commands of one step into
+# BATCHES, each the prefix of compose with its files appended, the file count
+# of each into BATCH_FILES, the bytes of the whole list as one command into
+# LINE_BYTES, and each command into its script, <script> for the first and
+# <script without .sh>.<n>.sh for batch n. One command when it fits
+# BATCH_BYTES, byte for byte the command of a single run; else as many
+# batches as it takes, each under the budget, in the order of the list. A file
+# whose name alone passes the budget runs in a batch of its own, as it is,
+# because no split makes it shorter.
+split_batches() {
+  local name="$1" prefix="$2" script="$3" dir="${DIR[$1]}" f q cmd i bytes count
+  local -a files=() quoted=()
+  BATCHES=() BATCH_FILES=() LINE_BYTES=0
+  [ -z "${RUNLIST[$name]-}" ] || mapfile -t files <<<"${RUNLIST[$name]%$'\n'}"
+  # The plan names files from the project directory, and a dir= step's runner
+  # runs in its folder, so each file loses that folder's prefix. Every
+  # appended word goes through printf %q, because the command runs under bash
+  # and a file name may hold a space or a quote.
+  cmd="$prefix"
+  for f in ${files[@]+"${files[@]}"}; do
+    printf -v q ' %q' "${f#"$dir"}"
+    quoted+=("$q")
+    cmd+="$q"
+  done
+  byte_sizes "$prefix" ${quoted[@]+"${quoted[@]}"}
+  for bytes in "${SIZES[@]}"; do LINE_BYTES=$((LINE_BYTES + bytes)); done
+  if [ "$LINE_BYTES" -le "$BATCH_BYTES" ]; then
+    BATCHES=("$cmd")
+    BATCH_FILES=("${#files[@]}")
+  else
+    cmd="$prefix" bytes="${SIZES[0]}" count=0
+    for i in "${!quoted[@]}"; do
+      if [ "$count" -gt 0 ] && [ $((bytes + SIZES[i + 1])) -gt "$BATCH_BYTES" ]; then
+        BATCHES+=("$cmd")
+        BATCH_FILES+=("$count")
+        cmd="$prefix" bytes="${SIZES[0]}" count=0
+      fi
+      cmd+="${quoted[i]}"
+      bytes=$((bytes + SIZES[i + 1]))
+      count=$((count + 1))
+    done
+    BATCHES+=("$cmd")
+    BATCH_FILES+=("$count")
+  fi
+  for i in "${!BATCHES[@]}"; do
+    printf '%s\n' "${BATCHES[i]}" >"$(batch_script "$script" "$i")" || return 1
+  done
+}
+
+# batch_script <script> <index>: the script of batch <index>, counted from 0.
+batch_script() {
+  if [ "$2" = 0 ]; then printf '%s' "$1"; else printf '%s.%d.sh' "${1%.sh}" "$(($2 + 1))"; fi
+}
+
+# step_note <name> <log> <text>: one `devbox-steps:` line into the step log,
+# and onto stdout too when the step streams, whose log is not printed again.
+step_note() {
+  if [ "$1" = "$STREAM" ]; then
+    printf 'devbox-steps: %s\n' "$3" | tee -a "$2"
+  else
+    printf 'devbox-steps: %s\n' "$3" >>"$2"
+  fi
+}
+
+# run_batches <name> <script> <log>: the batches of split_batches in order,
+# each logged and run as run_command runs one command. Every batch runs, also
+# after one fails, so the ledger and the log hold every failure of the step.
+# The status is the first failed batch's code, the run whose failure the log
+# shows first; 0 only when every batch passed.
+run_batches() {
+  local name="$1" script="$2" log="$3" n="${#BATCHES[@]}" i rc=0 b
+  if [ "$n" = 1 ]; then
+    printf 'devbox-steps: %s\n' "${BATCHES[0]}" >>"$log"
+    run_command "$name" "$script" "$log" || rc=$?
+    return "$rc"
+  fi
+  local total=0
+  for b in "${BATCH_FILES[@]}"; do total=$((total + b)); done
+  step_note "$name" "$log" "$name lists $total files, a command of $LINE_BYTES bytes, over the $BATCH_BYTES this runner allows below the 131072 one argument may hold when a wrapper such as npx joins the command into one, so it runs in $n batches"
+  for ((i = 0; i < n; i++)); do
+    step_note "$name" "$log" "$name batch $((i + 1)) of $n, ${BATCH_FILES[i]} files"
+    printf 'devbox-steps: %s\n' "${BATCHES[i]}" >>"$log"
+    b=0
+    run_command "$name" "$(batch_script "$script" "$i")" "$log" || b=$?
+    if [ "$b" != 0 ]; then
+      step_note "$name" "$log" "$name batch $((i + 1)) of $n failed with code $b"
+      [ "$rc" != 0 ] || rc="$b"
+    fi
+  done
+  return "$rc"
 }
 
 # run_command <name> <script> <log>: the command of one step in its folder,
@@ -768,20 +877,23 @@ run_command() {
 # file written by rename, because `wait -n` before bash 5.1 does not say which
 # job ended. $2 is the step's worker count.
 run_step() {
-  local name="$1" workers="$2" log started="$SECONDS" rc=0 cmd script tdir prog
+  local name="$1" workers="$2" log started="$SECONDS" rc=0 cmd prefix script tdir prog
   log="$(log_of "$name")"
   script="$STATE_DIR/$name.sh"
   tdir="$(trace_dir_of "$name")"
   export DEVBOX_WORKERS="$workers"
   # A command of a few thousand file arguments is longer than the 128 KiB one
-  # argument may hold, so it runs from a file rather than bash -c.
-  if ! cmd="$(compose "$name" "$workers" 2>>"$log")" || ! printf '%s\n' "$cmd" >"$script"; then
+  # argument may hold, so it runs from a file rather than bash -c, and a list
+  # past BATCH_BYTES runs in batches, for a wrapper that joins its arguments.
+  if ! prefix="$(compose "$name" "$workers" 2>>"$log")" || ! split_batches "$name" "$prefix" "$script"; then
     rc=2
     printf 'devbox-steps: could not compose the command of %s, so it did not run\n' "$name" >>"$log"
   elif [ -n "${TRACED[$name]+x}" ] && ! { rm -rf "$tdir" && mkdir -p "$tdir"; }; then
     rc=2
     printf 'devbox-steps: cannot create the trace folder %s, so %s did not run\n' "$tdir" "$name" >>"$log"
   elif [ -n "${TRACED[$name]+x}" ] && [ "${RUNNER[$name]}" = - ]; then
+    # A step without a runner is given no file, so it is always one command.
+    cmd="${BATCHES[0]}"
     printf 'devbox-steps: %s\n' "$cmd" >>"$log"
     run_command "$name" "$script" "$log" strace "${STRACE_OPTS[@]}" -o "$tdir/strace.log" || rc=$?
     if [ "$rc" != 0 ] && prog="$(setuid_run "$tdir/strace.log")"; then
@@ -801,7 +913,6 @@ run_step() {
     fi
     rm -f "$tdir/strace.log"
   else
-    printf 'devbox-steps: %s\n' "$cmd" >>"$log"
     if [ "${RUNNER[$name]}" = pytest ] && { [ -n "$LEDGER" ] || [ -n "${TRACED[$name]+x}" ]; }; then
       export PYTHONPATH="$DEVBOX_LEDGER_TOOLS${PYTHONPATH:+:$PYTHONPATH}"
     fi
@@ -811,7 +922,7 @@ run_step() {
       [ "${RUNNER[$name]}" != vitest ] \
         || export NODE_OPTIONS="--import=\"$DEVBOX_LEDGER_TOOLS/devbox-trace-hook.mjs\"${NODE_OPTIONS:+ $NODE_OPTIONS}"
     fi
-    run_command "$name" "$script" "$log" || rc=$?
+    run_batches "$name" "$script" "$log" || rc=$?
   fi
   printf '%s %s\n' "$rc" "$((SECONDS - started))" >"$STATE_DIR/$name.tmp"
   mv -f "$STATE_DIR/$name.tmp" "$STATE_DIR/$name.done"
