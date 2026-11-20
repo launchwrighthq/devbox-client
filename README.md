@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.3.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.3.1"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.3.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.3.1"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.3.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.3.1"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.3.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.3.1 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -281,12 +281,14 @@ command marks nothing partial.
 **Workers.** Every step gets `DEVBOX_WORKERS=<n>`. A vitest step gets `--maxWorkers=<n>`, plus `--minWorkers=1` on vitest 2 and 3, and a
 pytest step `-n <n>` when pytest-xdist loads. `<n>` is the grant (`DEVBOX_TOKENS`, or the
 cores of `nproc` on a laptop) divided by the runner steps running at that moment, capped by the
-workspace memory less 4 GiB divided by `DEVBOX_WORKER_MEMORY`, and by the step's file count. A
+workspace memory less 4 GiB divided by the same runner steps and by `DEVBOX_WORKER_MEMORY`, and
+by the step's file count. A
 command that sets `--maxWorkers`, `--pool-options`, `-n` or `--numprocesses` keeps its value.
 At most as many runner steps as the grant has tokens run at once. The steps that run at once
 also share the workspace memory less 4 GiB: a runner step reserves its workers times their
 memory, any other step its `memory=`, else `DEVBOX_STEP_MEMORY`, else 2G. A step starts only
-while its reservation fits, a runner step first shrinks its workers to fit, and one line says
+while its reservation fits, the ready runner steps start before the steps without a runner, a
+runner step first shrinks its workers to fit, and one line says
 `<n> steps wait for memory` the first time a step waits. When no step runs, the next one starts
 whatever its size. The client never passes `--exclude`: a resumed or selected step gets the files it must
 run, each under its `dir=` and a test file of its runner.

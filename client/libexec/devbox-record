@@ -36,7 +36,9 @@
 # file of unknown duration.
 #
 # Beside each `<run-id>.record` lie `<run-id>.files`, the manifest of the files
-# that run hashed, and `<run-id>.log`, the gate output the client saved. Only a
+# that run hashed, `<run-id>.log`, the gate output the client saved, and, after
+# a complete gate whose package.json or pyproject.toml names the devbox client,
+# `<run-id>.unpinned`, the lines test selection compares for those files. Only a
 # `complete 1` record answers a carry: a cancelled, stopped or killed gate, and
 # one whose files changed while it ran, wrote `complete 0`, and a pass in it
 # proves nothing about the tree it names.
@@ -124,8 +126,8 @@ devbox_record_write() {
 }
 
 # Remove every record of the directory $1 past the 200 newest by `at`, with its
-# manifest and its log. A `.log` with no record is a gate that still runs, and
-# stays.
+# manifest, its log and its unpinned lines (devbox_plan_learn). A `.log` with
+# no record is a gate that still runs, and stays.
 devbox_record_prune() {
   local dir="$1" path
   local -a files old
@@ -137,7 +139,7 @@ devbox_record_prune() {
     function done() { print at "\t" file }' "${files[@]}" \
     | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2r | tail -n +"$((DEVBOX_RECORD_KEEP + 1))" | cut -f2-)
   for path in "${old[@]}"; do
-    rm -f -- "$path" "${path%.record}.files" "${path%.record}.log" || {
+    rm -f -- "$path" "${path%.record}.files" "${path%.record}.log" "${path%.record}.unpinned" || {
       echo "devbox verify: could not remove the old record $path" >&2
       return 1
     }

@@ -622,4 +622,252 @@ assert_eq "1 1" "$(traced test) $(traced lint)" "D11a: traced"
 DEVBOX_TRACE_FORMAT=1
 DEVBOX_CLIENT_VERSION_FILE="$version_file"
 
+echo "-- a devbox client bump in a lock file keeps the map context of a runner step"
+# MEASURED: a project pins the devbox client in package.json or pyproject.toml,
+# so each client release it adopts rewrites its lock file. The map context held
+# the setup key, so every worktree that merged the bump found no map and ran
+# every test file of every runner step in full.
+#
+# write_locks <dir> <client version> <left-pad-fixture version> <client rev>:
+# the four lock formats in the shapes their tools write, each naming the
+# client and one other package.
+write_locks() {
+  local d="$1" c="$2" p="$3" r="$4"
+  mkdir -p "$d"
+  cat >"$d/package-lock.json" <<EOF
+{
+  "name": "app-fixture",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "app-fixture",
+      "version": "1.0.0",
+      "devDependencies": {
+        "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v$c",
+        "left-pad-fixture": "^1.0.0"
+      }
+    },
+    "node_modules/@launchwrighthq/devbox-client": {
+      "version": "$c",
+      "resolved": "git+ssh://git@example.invalid/launchwrighthq/devbox-client.git#$r",
+      "dev": true,
+      "bin": {
+        "devbox": "bin/devbox"
+      }
+    },
+    "node_modules/left-pad-fixture": {
+      "version": "$p",
+      "resolved": "https://example.invalid/left-pad-fixture-$p.tgz",
+      "integrity": "sha512-left-pad-fixture-$p",
+      "dev": true
+    }
+  }
+}
+EOF
+  cat >"$d/pnpm-lock.yaml" <<EOF
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    devDependencies:
+      '@launchwrighthq/devbox-client':
+        specifier: github:launchwrighthq/devbox-client#v$c
+        version: https://example.invalid/devbox-client/tar.gz/$r
+      left-pad-fixture:
+        specifier: ^1.0.0
+        version: $p
+
+packages:
+
+  '@launchwrighthq/devbox-client@https://example.invalid/devbox-client/tar.gz/$r':
+    resolution: {tarball: https://example.invalid/devbox-client/tar.gz/$r}
+    version: $c
+    hasBin: true
+
+  left-pad-fixture@$p:
+    resolution: {integrity: sha512-left-pad-fixture-$p}
+
+snapshots:
+
+  '@launchwrighthq/devbox-client@https://example.invalid/devbox-client/tar.gz/$r': {}
+
+  left-pad-fixture@$p: {}
+EOF
+  cat >"$d/yarn.lock" <<EOF
+# yarn lockfile v1
+
+
+"@launchwrighthq/devbox-client@github:launchwrighthq/devbox-client#v$c":
+  version "$c"
+  resolved "https://example.invalid/devbox-client/tar.gz/$r"
+
+app-tools-fixture@1.0.0:
+  version "1.0.0"
+  dependencies:
+    "@launchwrighthq/devbox-client" "github:launchwrighthq/devbox-client#v$c"
+    left-pad-fixture "^1.0.0"
+
+left-pad-fixture@^1.0.0:
+  version "$p"
+  resolved "https://example.invalid/left-pad-fixture-$p.tgz#$p"
+  integrity sha512-left-pad-fixture-$p
+EOF
+  cat >"$d/uv.lock" <<EOF
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "app-fixture"
+version = "1.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "left-pad-fixture" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "devbox-client" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "left-pad-fixture", specifier = ">=1.0.0" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "devbox-client", git = "https://example.invalid/devbox-client?tag=v$c" }]
+
+[[package]]
+name = "devbox-client"
+version = "$c"
+source = { git = "https://example.invalid/devbox-client?tag=v$c#$r" }
+
+[[package]]
+name = "left-pad-fixture"
+version = "$p"
+source = { registry = "https://example.invalid/simple" }
+sdist = { url = "https://example.invalid/left-pad-fixture-$p.tar.gz", hash = "sha256:$p" }
+EOF
+}
+new_repo client
+add_step test runner=pytest
+manifest
+lockline="$(grep '  package-lock.json$' "$M")"
+assert_eq "$(printf 'setup\n%s\n' "$lockline" | sha256sum | cut -d' ' -f1)" "$(_devbox_plan_setup_key "$M")" \
+  "a lock file with no devbox client entry hashes into the setup key as before"
+assert_eq "$(_devbox_plan_setup_key "$M")" "$(_devbox_plan_map_setup_key "$M")" \
+  "and the map's setup key equals the setup key"
+write_locks "$TMP/locks-a" 1.0.0 1.0.0 1111111111111111111111111111111111111111
+write_locks "$TMP/locks-b" 1.1.0 1.0.0 2222222222222222222222222222222222222222
+write_locks "$TMP/locks-c" 1.0.0 1.0.1 1111111111111111111111111111111111111111
+for f in package-lock.json pnpm-lock.yaml yarn.lock uv.lock; do
+  cp "$TMP/locks-a/$f" .
+  manifest
+  s0="$(_devbox_plan_setup_key "$M")" m0="$(_devbox_plan_map_setup_key "$M")"
+  assert_ok "$f: a lock file that names the client gives the map a setup key of its own" test "$m0" != "$s0"
+  cp "$TMP/locks-b/$f" .
+  manifest
+  assert_ok "$f: a client bump changes the setup key" test "$(_devbox_plan_setup_key "$M")" != "$s0"
+  assert_eq "$m0" "$(_devbox_plan_map_setup_key "$M")" "$f: and keeps the map's setup key"
+  cp "$TMP/locks-c/$f" .
+  manifest
+  assert_ok "$f: a bump of another package changes the map's setup key" test "$(_devbox_plan_map_setup_key "$M")" != "$m0"
+  cp "$TMP/locks-a/$f" .
+done
+for v in 1.0.0 1.0.1; do
+  printf '{\n  "packages": {\n    "node_modules/@launchwrighthq/devbox-client-fixture": {\n      "version": "%s"\n    }\n  }\n}\n' "$v" >package-lock.json
+  printf '"@launchwrighthq/devbox-client-fixture@^1.0.0":\n  version "%s"\n' "$v" >yarn.lock
+  printf '[[package]]\nname = "devbox-client-fixture"\nversion = "%s"\n' "$v" >uv.lock
+  manifest
+  m0="${m1-}" m1="$(_devbox_plan_map_setup_key "$M")"
+done
+assert_ok "a package whose name only starts with the client's stays in the map's setup key" test "$m0" != "$m1"
+cp "$TMP/locks-a"/* .
+plan changed
+assert_eq "test=run" "$(actions)" "the first plan of the step runs it in full"
+pytest_trace
+gate
+ctx0="${PLAN_CTX[test]}" setup0="$PLAN_SETUP_KEY"
+cp "$TMP/locks-b"/* .
+plan changed
+assert_eq "$ctx0" "${PLAN_CTX[test]}" "a client bump in all four lock files keeps the runner step's map context"
+assert_ok "while the setup key changes" test "$PLAN_SETUP_KEY" != "$setup0"
+assert_eq "test=carry" "$(actions)" "so the step selects on its kept map"
+assert_eq "no test read a changed file" "$(reason_of test)" "and carries, since no test read the lock files"
+cp "$TMP/locks-c/package-lock.json" .
+plan changed
+assert_ok "a bump of another package starts a new map context" test "${PLAN_CTX[test]}" != "$ctx0"
+assert_eq "test=run" "$(actions)" "and runs the step in full"
+assert_ok "for want of a map of this context" contains "no map" "$(reason_of test)"
+
+echo "-- a devbox client pin in package.json or pyproject.toml selects no test"
+# MEASURED: after a client bump every vitest test file read package.json, so
+# selection picked every test file with the reason `read package.json`.
+# pytest reads pyproject.toml in its own process, which counts for every file.
+new_repo pin
+add_step test runner=pytest
+cat >package.json <<'EOF'
+{
+  "name": "app-fixture",
+  "devDependencies": {
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v1.0.0",
+    "@launchwrighthq/devbox-client-fixture": "^1.0.0",
+    "left-pad-fixture": "^1.0.0"
+  }
+}
+EOF
+cat >pyproject.toml <<'EOF'
+[project]
+name = "app-fixture"
+dependencies = [
+    "left-pad-fixture>=1.0.0",
+    "devbox-client @ git+https://example.invalid/devbox-client@v1.0.0",
+]
+
+[project.optional-dependencies]
+devbox = ["devbox-client @ git+https://example.invalid/devbox-client@v1.0.0"]
+dev = ["pytest>=8", "devbox-client-fixture>=1.0.0"]
+EOF
+pin_trace() {
+  trace test "read tests/test_a.py tests/test_a.py" "read tests/test_a.py package.json" \
+    "read tests/test_b.py tests/test_b.py" "read tests/test_b.py src/b.py" \
+    "read tests/test_c.py tests/test_c.py" "read - pyproject.toml"
+}
+manifest
+assert_eq "package.json
+pyproject.toml" "$(devbox_map_unpinned "$M" | cut -c67-)" "a package.json and a pyproject.toml that name the client each get an unpinned line"
+assert_ok "with another hash than the manifest's" test -z "$(devbox_map_unpinned "$M" | grep -Fxf "$M")"
+plan changed
+pin_trace
+gate
+assert_ok "a complete gate keeps the unpinned lines beside its record" test -s "$(devbox_record_dir)/$LAST_RUN.unpinned"
+sed -i 's|devbox-client#v1.0.0|devbox-client#v1.1.0|' package.json
+plan changed
+assert_eq "test=carry" "$(actions)" "a package.json change that only moves the client pin selects no test"
+assert_eq "no test read a changed file" "$(reason_of test)" "and the step carries on its map"
+gate
+sed -i 's|devbox-client@v1.0.0|devbox-client@v1.1.0|g' pyproject.toml
+plan changed
+assert_eq "test=carry" "$(actions)" "a pyproject.toml change that only moves the client pin selects no test"
+assert_eq "no test read a changed file" "$(reason_of test)" "and the step carries on its map"
+gate
+cp package.json "$TMP/package.json"
+sed -i 's|"@launchwrighthq/devbox-client-fixture": "^1.0.0"|"@launchwrighthq/devbox-client-fixture": "^1.0.1"|' package.json
+plan changed
+assert_eq "test=select" "$(actions)" "a package whose name only starts with the client's is no pin"
+assert_eq "tests/test_a.py" "$(files_of test)" "so the test file that read package.json runs"
+cp "$TMP/package.json" package.json
+sed -i 's|"left-pad-fixture": "^1.0.0"|"left-pad-fixture": "^1.0.1"|' package.json
+plan changed
+assert_eq "test=select" "$(actions)" "another dependency line of package.json selects"
+assert_eq "tests/test_a.py" "$(files_of test)" "exactly the test file that read it"
+assert_eq "read package.json" "$(freason_of test tests/test_a.py)" "with the reason"
+cp "$TMP/package.json" package.json
+sed -i 's|"pytest>=8"|"pytest>=9"|' pyproject.toml
+plan changed
+assert_eq "tests/test_a.py
+tests/test_b.py
+tests/test_c.py" "$(files_of test)" "another line of a pyproject.toml the step's own process read selects every test file"
+
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

@@ -635,17 +635,72 @@ assert_eq "0" "$RC" "D3: an 8G step in a 6 GiB budget passes: $ERR"
 assert_eq "huge:start huge:end" "$(tr '\n' ' ' <"$BUD_EV" | sed 's/ $//')" "D3: and it ran, because no step was running"
 
 # D3: a runner step shrinks its workers to what the budget leaves. A 3G step
-# without a runner starts first and leaves 3 GiB of 6, so a 4-token runner
-# step gets 2 workers of 1536M, not 3.
+# without a runner is still running when the runner step becomes ready after
+# prep, and leaves 3 GiB of 6, so a 4-token runner step gets 2 workers of
+# 1536M, not 4.
 {
-  plan_step build run - - 'sleep 0.4'
-  plan_step suite run vitest - 'npx vitest run'
+  plan_step build run - - 'sleep 0.6'
+  plan_step prep run - - 'true'
+  plan_step suite run vitest prep 'npx vitest run'
   printf 'memory\tbuild\t%s\n' 3221225472
+  printf 'memory\tprep\t1\n'
 } >"$TMP/shrink.plan"
 : >"$ARGV_LOG"
 run_steps shrink "$TMP/shrink.plan" DEVBOX_TOKENS=4 DEVBOX_CGROUP_ROOT="$CG10"
 assert_eq "0" "$RC" "D3: the shrunk runner step passes: $ERR"
 assert_eq "$(printf '%s\n' run --maxWorkers=2)" "$(argv_call 1)" "D3: a runner step shrinks to the 2 workers that fit the 3 GiB left"
+
+# Runner steps first. MEASURED: a gate started six short steps first, in plan
+# order, and its vitest step got the 2 workers their reservations left, then
+# kept them for over an hour after the short steps ended. Here four 2G steps
+# without a runner come first in the plan and a runner step last, in a
+# 12 GiB budget on a 4-token grant: the runner step starts first with its fair
+# share, min(4 tokens, 12 GiB / 1536M) = 4 workers, 6 GiB. Three short steps
+# fit the 6 GiB left beside it, and the fourth waits. In plan order the four
+# would have taken 8 GiB and left the runner step 2 workers.
+: >"$BUD_EV"
+{
+  for s in s1 s2 s3 s4; do
+    plan_step "$s" run - - "echo $s:start >>$q_bud; sleep 0.4; echo $s:end >>$q_bud"
+  done
+  plan_step suite run vitest - "echo suite:start >>$q_bud; sleep 0.4; echo suite:end >>$q_bud; npx vitest run"
+  for i in 01 02 03 04 05 06 07 08; do plan_test suite "src/t$i.test.ts"; done
+} >"$TMP/first.plan"
+: >"$ARGV_LOG"
+: >"$ENV_LOG"
+run_steps first "$TMP/first.plan" DEVBOX_TOKENS=4 DEVBOX_CGROUP_ROOT="$CG16"
+assert_eq "0" "$RC" "runner first: the five steps pass: $ERR"
+assert_eq "--maxWorkers=4" "$(argv_call 1 | grep -- '^--maxWorkers=')" "runner first: the runner step gets its fair share of 4 workers"
+assert_ok "runner first: its DEVBOX_WORKERS is 4" grep -qx "vitest pwd=$PROJ workers=4" "$ENV_LOG"
+assert_eq "suite" "$(sed -n 's/^\[[0-9]* s\] \([a-z0-9]*\) started, reserving .*/\1/p' <<<"$OUT" | head -1)" \
+  "runner first: the runner step's start line comes before every short step's"
+assert_ok "runner first: it reserves 4 workers of 1536M" grep -Eq '^\[[0-9]+ s\] suite started, reserving 6\.0G$' <<<"$OUT"
+assert_eq "suite:start" "$(head -1 "$BUD_EV")" "runner first: the runner step's command starts first"
+peak="$(awk -F: '$1 != "suite" { n += ($2 == "start") ? 1 : -1; if (n > m) m = n } END { print m + 0 }' "$BUD_EV")"
+assert_eq "3" "$peak" "runner first: three 2G short steps run beside it in the 6 GiB it leaves"
+assert_ok "runner first: the fourth short step waits for memory, and the line says so" \
+  grep -Eq '^\[[0-9]+ s\] 1 steps wait for memory: 0\.0G of 12\.0G free, s4 needs 2\.0G$' <<<"$OUT"
+assert_eq "s1 s2 s3 s4" "$(sed -n 's/^\[[0-9]* s\] \(s[0-9]\) started, .*/\1/p' <<<"$OUT" | paste -sd ' ')" \
+  "runner first: the short steps keep their plan order"
+
+# Two runner steps that start together split the budget as they split the
+# grant. In a 6 GiB budget on a 12-token grant each gets 6 GiB / 2 / 1536M = 2
+# workers. Sized from the whole budget, the first took 4 workers, all 6 GiB,
+# and the second waited for it to end.
+: >"$BUD_EV"
+{
+  for s in r1 r2; do
+    plan_step "$s" run vitest - "echo $s:start >>$q_bud; sleep 0.4; echo $s:end >>$q_bud; npx vitest run"
+    for i in 01 02 03 04 05 06 07 08; do plan_test "$s" "src/$s-$i.test.ts"; done
+  done
+} >"$TMP/split.plan"
+: >"$ARGV_LOG"
+run_steps split "$TMP/split.plan" DEVBOX_TOKENS=12 DEVBOX_CGROUP_ROOT="$CG10"
+assert_eq "0" "$RC" "fair budget: two runner steps pass: $ERR"
+assert_eq "2" "$(grep -cx -- '--maxWorkers=2' "$ARGV_LOG")" "fair budget: each of two runner steps gets half the budget, 2 workers"
+peak="$(awk -F: '{ n += ($2 == "start") ? 1 : -1; if (n > m) m = n } END { print m + 0 }' "$BUD_EV")"
+assert_eq "2" "$peak" "fair budget: and both run at once"
+assert_eq "0" "$(grep -c 'wait for memory' <<<"$OUT")" "fair budget: neither waits for memory"
 
 # D4: memory= of a runner step is the memory of one of its workers. With 1G
 # workers, an 8 GiB memory.high (a 4 GiB budget) holds 4 of them.

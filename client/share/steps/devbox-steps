@@ -502,12 +502,16 @@ step_reservation() {
 # under a locale with a decimal comma awk printed 12,0G.
 gib() { LC_ALL=C awk -v b="$1" 'BEGIN { printf "%.1fG", b / 1073741824 }'; }
 
-# step_workers <name> <runner steps that run at the same time>
+# step_workers <name> <runner steps that run at the same time>: the fair
+# share of a runner step. The grant and the memory budget are both split over
+# the runner steps that run at once, so a step that starts beside another
+# runner step never counts the other one's memory as its own.
 step_workers() {
-  local name="$1" n cap
-  n=$((TOKENS / ($2 > 0 ? $2 : 1)))
+  local name="$1" runners="$2" n cap
+  [ "$runners" -gt 0 ] || runners=1
+  n=$((TOKENS / runners))
   if [ -n "$BUDGET" ]; then
-    cap=$((BUDGET / $(worker_memory "$name")))
+    cap=$((BUDGET / runners / $(worker_memory "$name")))
     [ "$cap" -ge 1 ] || cap=1
     [ "$n" -le "$cap" ] || n="$cap"
   fi
@@ -1200,6 +1204,18 @@ finish_step() {
 # step that cannot fit waits for a running one to end, and when none runs the
 # next ready step starts whatever its size, so no reservation can stall the
 # gate.
+#
+# The runner steps of a pass start before the steps without a runner, each
+# with its fair share of step_workers, and the steps without a runner take
+# what is left. MEASURED: a gate of three runner steps and about a dozen steps
+# without a runner started six short steps first, in plan order, which
+# reserved three quarters of the budget, and its vitest step started with the
+# 2 workers that were left. The short steps all ended within six minutes. The
+# vitest step kept its 2 workers for over an hour on a grant several times as
+# large, and a pytest step of the same project ran with 2 workers for 42
+# minutes, while most of the host's cores stood idle. vitest and pytest-xdist
+# fix their worker count when they start and never add one. A short step that
+# waits starts as soon as a running step frees its memory.
 declare -A RESERVED=()
 HELD_SAID=0
 MEM_SAID=0
@@ -1221,15 +1237,19 @@ while :; do
     for dep in ${AFTER[$name]}; do [ "${STATUS[$dep]}" = ended ] || ready=0; done
     [ "$ready" = 0 ] || ready_names+=("$name")
   done
+  # The runner steps first, then the steps without a runner, each kind in
+  # plan order.
   for name in ${ready_names[@]+"${ready_names[@]}"}; do
-    if [ "${RUNNER[$name]}" != - ]; then
-      if [ "$runners" -ge "$TOKENS" ]; then
-        held=$((held + 1))
-        continue
-      fi
-      runners=$((runners + 1))
+    [ "${RUNNER[$name]}" != - ] || continue
+    if [ "$runners" -ge "$TOKENS" ]; then
+      held=$((held + 1))
+      continue
     fi
+    runners=$((runners + 1))
     starting+=("$name")
+  done
+  for name in ${ready_names[@]+"${ready_names[@]}"}; do
+    [ "${RUNNER[$name]}" != - ] || starting+=("$name")
   done
   reserved=0
   active=0

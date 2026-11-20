@@ -186,23 +186,136 @@ _devbox_plan_shared_of() {
   _devbox_plan_match "$1" "$(printf '%s\n' "${shared[@]}")"
 }
 
-# Print the setup key of the manifest $1: the hash of the lines of the files
-# the setup installs from. DEVBOX_SETUP_INPUTS names them; without it, every
-# package-lock.json, uv.lock, pnpm-lock.yaml and yarn.lock, the four lock files
-# whose outputs, node_modules/ and .venv/, the hooks script knows. The setup
-# command itself is in .devbox/config.env, which every key holds.
-_devbox_plan_setup_key() {
+# Print the manifest lines, in the manifest $1, of the files the setup installs
+# from. DEVBOX_SETUP_INPUTS names them; without it, every package-lock.json,
+# uv.lock, pnpm-lock.yaml and yarn.lock, the four lock files whose outputs,
+# node_modules/ and .venv/, the hooks script knows.
+_devbox_plan_setup_lines() {
   local -a paths
-  local sum
   read -ra paths <<<"${DEVBOX_SETUP_INPUTS:-}"
-  sum="$(set -o pipefail; {
-    printf 'setup\n'
-    if [ "${#paths[@]}" -gt 0 ]; then
-      _devbox_plan_match "$1" "$(printf '%s\n' "${paths[@]}" | sed 's/[][*?\\]/\\&/g')"
-    else
-      awk "$_DEVBOX_PLAN_AWK_PATH"'{ p = path_of($0); n = split(p, c, "/"); if (c[n] == "package-lock.json" || c[n] == "uv.lock" || c[n] == "pnpm-lock.yaml" || c[n] == "yarn.lock") print }' "$1"
-    fi
-  } | sha256sum)" || return 1
+  if [ "${#paths[@]}" -gt 0 ]; then
+    _devbox_plan_match "$1" "$(printf '%s\n' "${paths[@]}" | sed 's/[][*?\\]/\\&/g')"
+  else
+    awk "$_DEVBOX_PLAN_AWK_PATH"'{ p = path_of($0); n = split(p, c, "/"); if (c[n] == "package-lock.json" || c[n] == "uv.lock" || c[n] == "pnpm-lock.yaml" || c[n] == "yarn.lock") print }' "$1"
+  fi
+}
+
+# Print the setup key of the manifest $1: the hash of the lines of the files
+# the setup installs from (_devbox_plan_setup_lines). The setup command itself
+# is in .devbox/config.env, which every key holds.
+_devbox_plan_setup_key() {
+  local sum
+  sum="$(set -o pipefail; { printf 'setup\n'; _devbox_plan_setup_lines "$1"; } | sha256sum)" || return 1
+  printf '%s\n' "${sum%% *}"
+}
+
+# The awk programs that print a lock file with the devbox client's own entries
+# left out, matched by the package's name and never by a version, one per lock
+# format. _devbox_plan_map_setup_key hashes what they print.
+#
+# package-lock.json: a key `@launchwrighthq/devbox-client`, the spec line of
+# a dependency list, and a key `node_modules/@launchwrighthq/devbox-client`
+# at any depth, or below it, with the whole object it opens. Braces inside a
+# string do not count.
+# shellcheck disable=SC2016  # an awk program: awk expands its $0, never bash
+_DEVBOX_PLAN_SANS_CLIENT_JSON='
+skip > 0 { t = $0; gsub(/"([^"\\]|\\.)*"/, "", t); skip += gsub(/\{/, "", t); skip -= gsub(/\}/, "", t); next }
+match($0, /^[ \t]*"[^"]*"[ \t]*:/) {
+  k = substr($0, RSTART, RLENGTH); sub(/^[ \t]*"/, "", k); sub(/"[ \t]*:$/, "", k)
+  if (k == "@launchwrighthq/devbox-client" || k ~ /(^|\/)node_modules\/@launchwrighthq\/devbox-client(\/|$)/) {
+    t = $0; gsub(/"([^"\\]|\\.)*"/, "", t); skip = gsub(/\{/, "", t); skip -= gsub(/\}/, "", t)
+    next
+  }
+}
+{ print }
+'
+# pnpm-lock.yaml and yarn.lock, both a block per key by indent: a key line
+# whose name, quoted or not, after the leading `/` of pnpm 6, is
+# `@launchwrighthq/devbox-client` followed by `@`, `(`, `:`, a quote or a
+# space, with every deeper line under it. That is pnpm's importer entry with
+# its specifier and version, its packages and snapshots entries and a
+# dependency line, and yarn's block, the classic and the berry form, and its
+# dependency line. A blank line inside the block goes with it.
+# shellcheck disable=SC2016  # an awk program: awk expands its $0, never bash
+_DEVBOX_PLAN_SANS_CLIENT_YAML='
+{
+  match($0, /^ */); i = RLENGTH
+  if (skip) {
+    if ($0 ~ /^[ \t]*$/ || i > ind) next
+    skip = 0
+  }
+  if (substr($0, i + 1) ~ /^["\047]?\/?@launchwrighthq\/devbox-client([@(:"\047 ]|$)/) { skip = 1; ind = i; next }
+  print
+}
+'
+# uv.lock: the `[[package]]` block whose name is `devbox-client`, with its
+# source line and its `[package.*]` tables, and each inline table
+# `{ name = "devbox-client", ... }` in any other block: a dependency line, a
+# requires-dist entry, a dev group's entry.
+# shellcheck disable=SC2016  # an awk program: awk expands its $0, never bash
+_DEVBOX_PLAN_SANS_CLIENT_TOML='
+function flush(   j) { if (!drop) for (j = 1; j <= n; j++) print buf[j]; n = 0; drop = 0 }
+/^\[\[package\]\][ \t]*$/ { flush(); inpkg = 1 }
+/^\[/ && !/^\[\[package\]\]/ && !/^\[\[?package\./ { flush(); inpkg = 0 }
+{
+  line = $0
+  gsub(/\{ *name = "devbox-client"( *,[^}]*)? *\}( *,)? */, "", line)
+  if (!inpkg) { print line; next }
+  if (line ~ /^name = "devbox-client"[ \t]*$/) drop = 1
+  buf[++n] = line
+}
+END { flush() }
+'
+
+# Print the manifest line $1 of a setup input as the map's setup key takes it:
+# the line itself, or, for a lock file that names the devbox client, the
+# sha256 of that file with the client's entries left out, read from the
+# checkout in $PWD, where the manifest's paths start.
+_devbox_plan_map_setup_line() {
+  local line="$1" path prog sum rc=0
+  if ! [[ "$line" =~ ^[0-9a-f]{64}\ \ (.+)$ ]]; then
+    printf '%s\n' "$line"
+    return 0
+  fi
+  path="${BASH_REMATCH[1]}"
+  case "${path##*/}" in
+    package-lock.json) prog="$_DEVBOX_PLAN_SANS_CLIENT_JSON" ;;
+    pnpm-lock.yaml|yarn.lock) prog="$_DEVBOX_PLAN_SANS_CLIENT_YAML" ;;
+    uv.lock) prog="$_DEVBOX_PLAN_SANS_CLIENT_TOML" ;;
+    *) printf '%s\n' "$line"; return 0 ;;
+  esac
+  grep -qF -- devbox-client "$path" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) printf '%s\n' "$line"; return 0 ;;
+    *) echo "devbox verify: could not read $path, a lock file of the setup" >&2; return 1 ;;
+  esac
+  sum="$(set -o pipefail; awk "$prog" "$path" | sha256sum)" \
+    || { echo "devbox verify: could not read $path, a lock file of the setup" >&2; return 1; }
+  printf '%s  %s\n' "${sum%% *}" "$path"
+}
+
+# Print the map's setup key over the manifest $1, which a runner step's map
+# context and the context line of its map hold: the setup key, with each lock
+# file's line taken by _devbox_plan_map_setup_line. A lock file with no client
+# entry keeps its line, so with none the two keys are equal.
+# MEASURED: a project pins the devbox client in package.json or pyproject.toml,
+# so each client release it adopts rewrites its lock file. The map context of
+# each runner step held the setup key, so every worktree that merged the bump
+# found no map and ran every test file of every runner step: six client bumps
+# in two days ran the whole suites of several projects again and again, 60 to
+# 90 minutes each on a busy fleet. The client is no test's dependency. The
+# setup skip still keys on the whole lock file, so a client bump still runs the
+# setup, and so does a step's key after a read under a setup output (D4a).
+_devbox_plan_map_setup_key() {
+  local lines line sum text=$'setup\n'
+  lines="$(_devbox_plan_setup_lines "$1")" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    line="$(_devbox_plan_map_setup_line "$line")" || return 1
+    text+="$line"$'\n'
+  done <<<"$lines"
+  sum="$(printf '%s' "$text" | sha256sum)" || return 1
   printf '%s\n' "${sum%% *}"
 }
 
@@ -280,14 +393,15 @@ _devbox_plan_trace_base() {
 }
 
 # Print the context id of step $1's map (gate-overload spec, D8): of its map
-# base and the setup key for a runner step, whose test files' passes depend on
-# both; of its trace base alone for a step with no runner. A lock file edit
-# then keeps a lint's map, so it carries when it read nothing under a setup
-# output (learned-selection D4a), where a map of its own per setup key would
-# hold no learned inputs, and the lint would run in full under strace.
+# base and the map's setup key (_devbox_plan_map_setup_key) for a runner step,
+# whose test files' passes depend on both; of its trace base alone for a step
+# with no runner. A lock file edit then keeps a lint's map, so it carries when
+# it read nothing under a setup output (learned-selection D4a), where a map of
+# its own per setup key would hold no learned inputs, and the lint would run in
+# full under strace.
 _devbox_plan_ctx() {
   if [ -n "${STEP_RUNNER[$1]-}" ]; then
-    devbox_map_ctx "${PLAN_MAP_BASE[$1]}" "$PLAN_SETUP_KEY"
+    devbox_map_ctx "${PLAN_MAP_BASE[$1]}" "$PLAN_MAP_SETUP_KEY"
   else
     devbox_map_ctx "${PLAN_TRACE_BASE[$1]}"
   fi
@@ -341,9 +455,18 @@ devbox_plan_rekey() {
 # id (gate-fixes-4.0.1 spec, D4). The caller writes <record file> again
 # afterwards. A map that cannot be written names itself and changes no result:
 # the gate's result is the gate's.
+#
+# First it writes PLAN_UNPINNED as <run-id>.unpinned beside the record, by
+# rename, the lines devbox_map_select compares for a pass of this run
+# (devbox_map_unpinned). With none, no file: each manifest line is then its own.
 devbox_plan_learn() {
-  local run="$1" manifest="$2" tdir="$3" rec="$4" step mode trace key
+  local run="$1" manifest="$2" tdir="$3" rec="$4" step mode trace key rdir
   shift 4
+  if [ -n "${PLAN_UNPINNED-}" ] && rdir="$(devbox_record_dir)"; then
+    { printf '%s\n' "$PLAN_UNPINNED" >"$rdir/.$run.unpinned.$$" \
+      && mv -f -- "$rdir/.$run.unpinned.$$" "$rdir/$run.unpinned"; } \
+      || echo "devbox verify: could not write $rdir/$run.unpinned, so a test file that read a package.json or pyproject.toml runs again after a client bump" >&2
+  fi
   for step in "$@"; do
     mode="${PLAN_ACTION[$step]-}"
     [ "${PLAN_TRACE[$step]-0}" = 1 ] || continue
@@ -354,7 +477,7 @@ devbox_plan_learn() {
       trace="$tdir/.$step.none"
       printf 'partial\t-\tthe runner sent no trace of this step\n' >"$trace" || continue
     fi
-    devbox_map_update "$step" "$run" "$trace" "$mode" "${PLAN_CTX[$step]}" "${PLAN_MAP_BASE[$step]}" "$PLAN_SETUP_KEY" \
+    devbox_map_update "$step" "$run" "$trace" "$mode" "${PLAN_CTX[$step]}" "${PLAN_MAP_BASE[$step]}" "$PLAN_MAP_SETUP_KEY" \
       "${PLAN_TRACE_BASE[$step]:--}" || continue
     [ "${PLAN_MODE[$step]-}" != shard ] || continue
     awk -F'\t' -v s="$step" '$1 == "step" && $2 == s && $4 == "pass" { f = 1 } END { exit !f }' "$rec" || continue
@@ -561,8 +684,8 @@ _devbox_plan_narrow() {
 # Set _plan_files, _plan_reason and _plan_freason for the runner step $1 whose
 # key has no pass, by section 6: each test file that can see the change, with
 # its reason. Selection needs a map that reads, written under this run's base
-# and setup key, and a newest result that passed or failed in its test files
-# alone: a crash or a stop leaves files that never ran and that no reason
+# and map's setup key, and a newest result that passed or failed in its test
+# files alone: a crash or a stop leaves files that never ran and that no reason
 # would select. That result is this branch's newest (devbox_record_last_of);
 # with none, the map's own passes decide, because each one names the tree it
 # passed on. Returns 0 to select, 10 when no file is selected, which
@@ -588,7 +711,8 @@ _devbox_plan_select() {
       [ -z "$(devbox_record_open_files "$run" "$step")" ] || return 1
     fi
   fi
-  sel="$(devbox_map_select "$step" "$manifest" "${PLAN_CTX[$step]}" "${PLAN_MAP_BASE[$step]}" "$PLAN_SETUP_KEY")" || rc=$?
+  sel="$(devbox_map_select "$step" "$manifest" "${PLAN_CTX[$step]}" "${PLAN_MAP_BASE[$step]}" "$PLAN_MAP_SETUP_KEY" \
+    "$PLAN_UNPINNED")" || rc=$?
   case "$rc" in
     0) ;;
     3) _plan_why="its map was traced under another config, trace format, step line, forwarded value or setup"; return 1 ;;
@@ -678,9 +802,10 @@ _devbox_plan_run_reason() {
 # It also fills PLAN_STEPS, PLAN_ACTION, PLAN_MODE, PLAN_TRACE, PLAN_NFILES,
 # PLAN_REASON, PLAN_FREASON (`<step><TAB><path>` to a file's reason), PLAN_BASE,
 # PLAN_MAP_BASE, PLAN_TRACE_BASE, PLAN_CTX (each for every step of the gate) and
-# PLAN_SETUP_KEY for devbox_plan_print, the record, devbox_plan_learn and devbox_plan_rekey,
-# so call it with its stdout sent to a file, never inside $( ), where those
-# variables would end with the subshell.
+# PLAN_SETUP_KEY, PLAN_MAP_SETUP_KEY and PLAN_UNPINNED for devbox_plan_print,
+# the record, devbox_plan_learn and devbox_plan_rekey, so call it with its
+# stdout sent to a file, never inside $( ), where those variables would end
+# with the subshell.
 #
 # Returns 2 with a line for a rerun value or a step name it does not know, and
 # 1 with a line when a part of a key cannot be read: a key that left out what
@@ -737,6 +862,10 @@ devbox_plan_build() {
     PLAN_BASE=() PLAN_MAP_BASE=() PLAN_TRACE_BASE=() PLAN_CTX=() PLAN_LEARNED=() PLAN_SETUP_READ=()
   PLAN_SETUP_KEY="$(_devbox_plan_setup_key "$manifest")" \
     || { echo "devbox verify: could not compute the setup key, so no plan was made" >&2; return 1; }
+  PLAN_MAP_SETUP_KEY="$(_devbox_plan_map_setup_key "$manifest")" \
+    || { echo "devbox verify: could not compute the setup key of the maps, so no plan was made" >&2; return 1; }
+  PLAN_UNPINNED="$(devbox_map_unpinned "$manifest")" \
+    || { echo "devbox verify: could not hash the package.json and pyproject.toml files for the selection, so no plan was made" >&2; return 1; }
   # Every step of the gate, also under --step: the test sets of a runner step
   # read the maps of every step of its runner, each under its own context.
   for step in "${STEP_NAMES[@]}"; do

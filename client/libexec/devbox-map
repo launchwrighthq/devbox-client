@@ -15,15 +15,18 @@
 # One file per step and context, <git common dir>/devbox/maps/<step>.<ctx>.map
 # (docs/specs/2026-11-16-gate-overload-design.md, section 6), one field per
 # tab, written by rename. <ctx> is devbox_map_ctx of what the map's passes
-# depend on, which devbox-plan chooses: the map base and the setup key for a
-# runner step, the trace base for a step with no runner. MEASURED: one map per
-# step held one context, and worktrees of one checkout pinned three client
-# versions, so each gate's update reset the other contexts' run ids, select
-# answered "another context" for each of them, and about 4 in 10 runs of one
-# project's test steps in a day ran in full. The format:
+# depend on, which devbox-plan chooses: the map base and the map's setup key
+# for a runner step, the trace base for a step with no runner. The map's setup
+# key is the setup key with the devbox client's own entries left out of each
+# lock file (_devbox_plan_map_setup_key), so a client bump keeps the map.
+# MEASURED: one map per step held one context, and worktrees of one checkout
+# pinned three client versions, so each gate's update reset the other
+# contexts' run ids, select answered "another context" for each of them, and
+# about 4 in 10 runs of one project's test steps in a day ran in full. The
+# format:
 #
 #   map       1
-#   context   <map base>  <setup key>
+#   context   <map base>  <map's setup key>
 #   untraced  <reason>                     the last run sent no usable trace
 #   path      <id>  <repository path>
 #   dir       <id>  <repository path>/
@@ -35,8 +38,8 @@
 # `step` line holds the reads of the step's own process, the `-` owner of the
 # trace; a runner step's inputs are those, every test file's reads and the test
 # files themselves. The context is the map base (DEVBOX_TRACE_FORMAT, the
-# config, the step line and the forwarded values) and the setup key the run
-# had: a file's last pass proves nothing about a run under another context.
+# config, the step line and the forwarded values) and the map's setup key the
+# run had: a file's last pass proves nothing about a run under another context.
 # <traced under> is the trace base, the hash of DEVBOX_TRACE_FORMAT, the config
 # and the step line that step's own trace was taken under, `-` for none: strace
 # made a type check and a lint run several times as long (learned-selection
@@ -126,11 +129,61 @@ DEVBOX_MAP_KEEP=8
 # devbox_map_ctx <value>...
 # Print the context id of a map: the first 16 hex digits of the sha256 of the
 # values, each followed by a newline. devbox-plan passes the map base and the
-# setup key of a runner step, and the trace base of a step with no runner.
+# map's setup key of a runner step, and the trace base of a step with no runner.
 devbox_map_ctx() {
   local sum
   sum="$(printf '%s\n' "$@" | sha256sum)" || return 1
   printf '%s\n' "${sum:0:16}"
+}
+
+# The sed programs that print a manifest file with every line that names the
+# devbox client left out, by the package's name and never by a version.
+# package.json: its dependency line `"@launchwrighthq/devbox-client": "..."`.
+# pyproject.toml: a key line `devbox-client = ...`, such as a uv or Poetry
+# source, and each quoted array item `"devbox-client @ ..."`, alone on its
+# line or among other items, with `_` or `.` for the `-`, as the name rule
+# of Python packages allows. The character after the name must end it, so a
+# package whose name only starts with it stays.
+_DEVBOX_MAP_UNPIN_PACKAGE='/^[[:space:]]*"@launchwrighthq\/devbox-client"[[:space:]]*:/d'
+_DEVBOX_MAP_UNPIN_PYPROJECT=$'/^[[:space:]]*["\']?devbox[-_.]client["\']?[[:space:]]*=/d\ns/"devbox[-_.]client([][ @;=<>!~(][^"]*)?"[[:space:]]*,?[[:space:]]*//g\ns/\'devbox[-_.]client([][ @;=<>!~(][^\']*)?\'[[:space:]]*,?[[:space:]]*//g'
+
+# devbox_map_unpinned <manifest>
+# Print, for each package.json and pyproject.toml of the manifest, at any
+# depth, whose content names the devbox client, its manifest line with the
+# sha256 of the file read through _DEVBOX_MAP_UNPIN_*, from the checkout in
+# $PWD, where the manifest's paths start. A file that names no client prints
+# nothing: its manifest line is already that hash. devbox-plan computes these
+# lines once per gate, devbox_map_select compares them in place of the
+# manifest's own, and devbox-plan keeps them as <run-id>.unpinned beside the
+# record a map line names, so both sides of a comparison take one rule.
+# MEASURED: a project pins the devbox client in package.json, and every vitest
+# test file reads package.json, so after a client bump selection picked every
+# test file with the reason `read package.json`. pytest reads pyproject.toml
+# in its own process, which counts for every test file. The record key, the
+# setup key and the sync keep the real hash.
+devbox_map_unpinned() {
+  local lines line path prog sum
+  # awk picks the two names first, so the loop of bash reads below sees a few
+  # lines, never every synced file of the manifest.
+  lines="$(awk "$_DEVBOX_MAP_AWK_PATH"'{ p = path_of($0); n = split(p, c, "/"); if (c[n] == "package.json" || c[n] == "pyproject.toml") print }' "$1")" \
+    || { echo "devbox verify: could not read the file list $1" >&2; return 1; }
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[0-9a-f]{64}\ \ (.+)$ ]] || continue
+    path="${BASH_REMATCH[1]}"
+    case "${path##*/}" in
+      package.json) prog="$_DEVBOX_MAP_UNPIN_PACKAGE" ;;
+      pyproject.toml) prog="$_DEVBOX_MAP_UNPIN_PYPROJECT" ;;
+      *) continue ;;
+    esac
+    grep -qE -- 'devbox[-_.]client' "$path" || {
+      [ "$?" = 1 ] && continue
+      echo "devbox verify: could not read $path, a file of the selection" >&2
+      return 1
+    }
+    sum="$(set -o pipefail; sed -E "$prog" "$path" | sha256sum)" \
+      || { echo "devbox verify: could not read $path, a file of the selection" >&2; return 1; }
+    printf '%s  %s\n' "${sum%% *}" "$path"
+  done <<<"$lines"
 }
 
 # Set the variable named $1 to the map file of step $2 under the context id
@@ -274,7 +327,7 @@ devbox_map_step_run() {
   _devbox_map_awk "$1" "${2-}" 'function report() { if (m_hasstep && m_srun != "-") print m_srun }'
 }
 
-# devbox_map_select <step> <manifest> <ctx> [<map base> <setup key>]
+# devbox_map_select <step> <manifest> <ctx> [<map base> <setup key> [<unpinned>]]
 # Print `<path>\t<reason>` for each test file of the map that this run must run,
 # by section 6: `changed` when the file itself differs from its last pass,
 # `no trace` when it never passed or its pass's manifest is gone, `partial`
@@ -287,10 +340,14 @@ devbox_map_step_run() {
 # an input of its step changed. It reads the map of context id <ctx>. With
 # <map base> and <setup key>, it returns 3 when that map's context line names
 # another context, because then a pass under the old context proves nothing.
+# <unpinned> is devbox_map_unpinned of <manifest>: each of its lines stands for
+# the manifest's line of that path, and the <run-id>.unpinned beside a pass's
+# manifest does the same for that pass. A pass with no such file compares the
+# manifest's own line.
 # Returns 1 with no map, 2 for a map that cannot be read.
 devbox_map_select() {
-  local step="$1" manifest="$2" base="${4-}" setup="${5-}" file rdir rc=0 run
-  local -a args=()
+  local step="$1" manifest="$2" base="${4-}" setup="${5-}" unpinned="${6-}" file rdir rc=0 run
+  local -a args=() unargs=()
   _devbox_map_file file "$step" "${3-}" || return 2
   [ -e "$file" ] || return 1
   [ -r "$file" ] && [ -r "$manifest" ] || return 2
@@ -301,6 +358,7 @@ devbox_map_select() {
     [[ "$run" =~ ^[0-9a-f]{8,32}\.[0-9]{1,10}$ ]] || continue
     [ -r "$rdir/$run.files" ] || continue
     args+=("phase=old" "R=$run" "$rdir/$run.files")
+    [ ! -r "$rdir/$run.unpinned" ] || unargs+=("phase=unold" "R=$run" "$rdir/$run.unpinned")
   done < <(awk -F'\t' '$1 == "file" { print $3 }' "$file" | LC_ALL=C sort -u)
   MAP_BASE="$base" MAP_SETUP="$setup" awk -F'\t' "$_DEVBOX_MAP_AWK_PATH$_DEVBOX_MAP_AWK_READ"'
     function entries(p, into, r,   n, c, i, d) {
@@ -321,6 +379,8 @@ devbox_map_select() {
     phase == "map" { map_line(); next }
     phase == "cur" { p = path_of($0); cur[p] = $0; entries(p, ent, ""); next }
     phase == "old" { p = path_of($0); old[R, p] = $0; has[R] = 1; entries(p, ent, R); next }
+    phase == "uncur" { p = path_of($0); if (p in cur) cur[p] = $0; next }
+    phase == "unold" { p = path_of($0); if ((R, p) in old) old[R, p] = $0; next }
     END {
       map_check()
       if (m_bad != "") exit 2
@@ -353,7 +413,8 @@ devbox_map_select() {
         }
         if (first != "") print t "\tread " first
       }
-    }' phase=map "$file" phase=cur "$manifest" "${args[@]}" || rc=$?
+    }' phase=map "$file" phase=cur "$manifest" "${args[@]}" phase=uncur <(printf '%s' "$unpinned") \
+    ${unargs[@]+"${unargs[@]}"} || rc=$?
   return "$rc"
 }
 
