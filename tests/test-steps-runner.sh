@@ -649,6 +649,7 @@ assert_eq "huge:start huge:end" "$(tr '\n' ' ' <"$BUD_EV" | sed 's/ $//')" "D3: 
 run_steps shrink "$TMP/shrink.plan" DEVBOX_TOKENS=4 DEVBOX_CGROUP_ROOT="$CG10"
 assert_eq "0" "$RC" "D3: the shrunk runner step passes: $ERR"
 assert_eq "$(printf '%s\n' run --maxWorkers=2)" "$(argv_call 1)" "D3: a runner step shrinks to the 2 workers that fit the 3 GiB left"
+assert_eq "1" "$(grep -cx -- --end-- "$ARGV_LOG")" "D3: a runner step with no file list has nothing to split into waves, and runs in one go"
 
 # Runner steps first. MEASURED: a gate started six short steps first, in plan
 # order, and its vitest step got the 2 workers their reservations left, then
@@ -682,6 +683,8 @@ assert_ok "runner first: the fourth short step waits for memory, and the line sa
   grep -Eq '^\[[0-9]+ s\] 1 steps wait for memory: 0\.0G of 12\.0G free, s4 needs 2\.0G$' <<<"$OUT"
 assert_eq "s1 s2 s3 s4" "$(sed -n 's/^\[[0-9]* s\] \(s[0-9]\) started, .*/\1/p' <<<"$OUT" | paste -sd ' ')" \
   "runner first: the short steps keep their plan order"
+assert_eq "1" "$(grep -cx -- --end-- "$ARGV_LOG")" "runner first: a runner step at its fair share runs in one go"
+assert_eq "0" "$(grep -c ' wave ' <<<"$OUT")" "runner first: and prints no wave line"
 
 # Two runner steps that start together split the budget as they split the
 # grant. In a 6 GiB budget on a 12-token grant each gets 6 GiB / 2 / 1536M = 2

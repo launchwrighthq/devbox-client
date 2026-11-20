@@ -39,7 +39,8 @@
 # environment before any step starts, or a ledger or a log that cannot be
 # written once steps run, 143 after SIGTERM and 130 after SIGINT.
 #
-# stdout: one line when a step starts, ends, carries or resumes, one line the
+# stdout: one line when a step starts, ends, carries or resumes, one line when
+# a wave of a step that runs in waves starts, one line the
 # first time the grant holds runner steps back, one line the first time the
 # memory budget holds a step back, one
 # `devbox-steps: untraced <name> <reason>` line for a step whose trace cannot
@@ -474,11 +475,15 @@ if [ -n "$MEMORY_MAX" ]; then
   [ "$BUDGET" -ge 0 ] || BUDGET=0
 fi
 
-# The number of files each runner step runs: its list, or its test lines.
+# The files runner step $1 runs, one per line: its list, or its test lines.
+step_files() {
+  if [ -n "${HASLIST[$1]+x}" ]; then printf '%s' "${RUNLIST[$1]}"; else printf '%s' "${TESTS[$1]}"; fi
+}
+
+# The number of files each runner step runs.
 declare -A FILE_COUNT=()
 for name in "${NAMES[@]}"; do
-  files=""
-  if [ -n "${HASLIST[$name]+x}" ]; then files="${RUNLIST[$name]}"; else files="${TESTS[$name]}"; fi
+  files="$(step_files "$name")"
   FILE_COUNT[$name]=0
   [ -z "$files" ] || FILE_COUNT[$name]="$(printf '%s' "$files" | awk 'END { print NR }')"
 done
@@ -532,6 +537,61 @@ own_workers() {
     esac
   done
   return 1
+}
+
+# ── waves ────────────────────────────────────────────────────────────────────
+#
+# A runner step that starts below its fair share, because the steps that run
+# hold the memory, runs its files in waves. vitest and pytest-xdist fix their
+# worker count when they start, so a step that starts with 2 workers keeps 2
+# however much frees after it: MEASURED, a vitest step kept the 2 workers it
+# started with for over an hour after the short steps that held the budget
+# had ended. Each wave is one run of the step command over a slice of its
+# files, with the workers that fit when the wave starts. A wave that starts
+# at its fair share runs every file left.
+#
+# The rule: a wave below the fair share F that starts with W workers runs
+# ceil(N * W / (4 * F)) of the step's N files, and at least W, so it lasts
+# about a quarter of what the whole step lasts at its fair share, whatever W
+# is. The step reaches its fair share at most that quarter after the memory
+# frees, and a wave that gains nothing costs one more start of the runner.
+# The eighth wave runs every file left, so a step held below its share for
+# its whole length starts its runner 8 times at most. The plan carries no
+# seconds per file, so each file counts as one unit of work. The slices keep
+# the order of the list, and a slice too long for one command still runs in
+# batches. A step with no file list, a runner-set worker count, or a fair
+# share it gets at the start runs in one go.
+WAVE_PARTS=4
+WAVE_MAX=8
+declare -A WAVE_LEFT=() WAVE_TOTAL=() WAVE_NO=() WAVE_RC=() WAVE_T0=() WAVE_NEXT=()
+WAVE_SLICE="" WAVE_TAKEN=0 WAVE_LEFT_N=0
+
+# wave_ready <name>: whether runner step <name> can run in waves. It needs a
+# file list to slice, and a worker count the runner sets: a command that sets
+# its own keeps it in every wave, so a wave would gain it nothing.
+wave_ready() {
+  [ "${RUNNER[$1]}" != - ] && [ "${FILE_COUNT[$1]}" -gt 0 ] && ! own_workers "${RUNNER[$1]}" "${CMD[$1]}"
+}
+
+# wave_take <name> <workers> <fair share>: the next wave of step <name> into
+# WAVE_SLICE, one file per line, its file count into WAVE_TAKEN and the files
+# left before it into WAVE_LEFT_N; the rest stays in WAVE_LEFT.
+wave_take() {
+  local name="$1" workers="$2" share="$3" take
+  local -a left=()
+  mapfile -t left <<<"${WAVE_LEFT[$name]%$'\n'}"
+  WAVE_LEFT_N="${#left[@]}"
+  WAVE_NO[$name]=$((WAVE_NO[$name] + 1))
+  take="$WAVE_LEFT_N"
+  if [ "$workers" -lt "$share" ] && [ "${WAVE_NO[$name]}" -lt "$WAVE_MAX" ]; then
+    take=$(((WAVE_TOTAL[$name] * workers + WAVE_PARTS * share - 1) / (WAVE_PARTS * share)))
+    [ "$take" -ge "$workers" ] || take="$workers"
+    [ "$take" -le "$WAVE_LEFT_N" ] || take="$WAVE_LEFT_N"
+  fi
+  WAVE_TAKEN="$take"
+  WAVE_SLICE="$(printf '%s\n' "${left[@]:0:take}")"$'\n'
+  WAVE_LEFT[$name]=""
+  [ "$take" -ge "$WAVE_LEFT_N" ] || WAVE_LEFT[$name]="$(printf '%s\n' "${left[@]:take}")"$'\n'
 }
 
 # The major version of the vitest a step in folder $1 resolves, from the
@@ -1002,13 +1062,17 @@ run_command() {
 
 # The body of one background job. Its result reaches the main loop through a
 # file written by rename, because `wait -n` before bash 5.1 does not say which
-# job ended. $2 is the step's worker count.
+# job ended. $2 is the step's worker count, $3 its wave, 0 for a step that
+# runs in one go, and $4 the files of that wave.
 run_step() {
-  local name="$1" workers="$2" log started="$SECONDS" rc=0 cmd prefix script tdir prog
+  local name="$1" workers="$2" wave="$3" log started="$SECONDS" rc=0 cmd prefix script tdir prog
   log="$(log_of "$name")"
   script="$STATE_DIR/$name.sh"
   tdir="$(trace_dir_of "$name")"
   export DEVBOX_WORKERS="$workers"
+  # A wave runs its slice of the list. The job is a fork, so the slice
+  # replaces the list in this job alone.
+  [ "$wave" = 0 ] || RUNLIST[$name]="$4"
   # A command of a few thousand file arguments is longer than the 128 KiB one
   # argument may hold, so it runs from a file rather than bash -c, and a list
   # past BATCH_BYTES runs in batches, for a wrapper that joins its arguments.
@@ -1017,7 +1081,9 @@ run_step() {
   elif ! prefix="$(compose "$name" "$workers" 2>>"$log")" || ! split_batches "$name" "$prefix" "$script"; then
     rc=2
     printf 'devbox-steps: could not compose the command of %s, so it did not run\n' "$name" >>"$log"
-  elif [ -n "${TRACED[$name]+x}" ] && ! { rm -rf "$tdir" && mkdir -p "$tdir"; }; then
+  # A later wave keeps the trace files of the waves before it, as a later
+  # batch does.
+  elif [ -n "${TRACED[$name]+x}" ] && [ "$wave" -le 1 ] && ! { rm -rf "$tdir" && mkdir -p "$tdir"; }; then
     rc=2
     printf 'devbox-steps: cannot create the trace folder %s, so %s did not run\n' "$tdir" "$name" >>"$log"
   elif [ -n "${TRACED[$name]+x}" ] && [ "${RUNNER[$name]}" = - ]; then
@@ -1058,29 +1124,39 @@ run_step() {
   mv -f "$STATE_DIR/$name.tmp" "$STATE_DIR/$name.done"
 }
 
-# start_step <name> <workers> <reservation in bytes>
+# start_step <name> <workers> <reservation in bytes> [<fair share>]: the
+# step, or the wave WAVE_NO names, over the files of WAVE_SLICE. A later wave
+# keeps the step's log and its ledger `start`.
 start_step() {
-  local name="$1" workers="$2"
-  : >"$(log_of "$name")" || fatal "cannot write the log $(log_of "$name")"
-  ledger_step "$name" start
+  local name="$1" workers="$2" wave="${WAVE_NO[$1]:-0}" log text
+  log="$(log_of "$name")"
   RESERVED[$name]="$3"
-  # Before the fork, so a streamed step's first line never comes before its
-  # header. The reservation is named only where a budget holds steps.
-  if [ -n "$BUDGET" ]; then
-    echo "$(stamp) $name started, reserving $(gib "$3")"
-  else
-    echo "$(stamp) $name started"
+  if [ "$wave" -le 1 ]; then
+    : >"$log" || fatal "cannot write the log $log"
+    ledger_step "$name" start
+    # Before the fork, so a streamed step's first line never comes before its
+    # header. The reservation is named only where a budget holds steps.
+    if [ -n "$BUDGET" ]; then
+      echo "$(stamp) $name started, reserving $(gib "$3")"
+    else
+      echo "$(stamp) $name started"
+    fi
+    if [ -n "${UNTRACED[$name]+x}" ]; then
+      echo "devbox-steps: untraced $name ${UNTRACED[$name]}"
+      echo "devbox-steps: $name runs untraced: ${UNTRACED[$name]}" >>"$log"
+    fi
+    [ "$name" != "$STREAM" ] || echo "== $name: $log"
   fi
-  if [ -n "${UNTRACED[$name]+x}" ]; then
-    echo "devbox-steps: untraced $name ${UNTRACED[$name]}"
-    echo "devbox-steps: $name runs untraced: ${UNTRACED[$name]}" >>"$(log_of "$name")"
+  if [ "$wave" -ge 1 ]; then
+    text="$name wave $wave: $WAVE_TAKEN of $WAVE_LEFT_N files left, $workers of its $4 workers"
+    if [ "$wave" = 1 ]; then echo "$(stamp) $text"; else echo "$(stamp) $text, reserving $(gib "$3")"; fi
+    printf 'devbox-steps: %s\n' "$text" >>"$log" || fatal "cannot write the log $log"
   fi
-  [ "$name" != "$STREAM" ] || echo "== $name: $(log_of "$name")"
   # Monitor mode for the fork alone gives the job its own process group, so a
   # signal to this program reaches every process of a step through that group.
   # Left on, it would print a job notice on stderr for every step that ends.
   set -m
-  run_step "$name" "$workers" &
+  run_step "$name" "$workers" "$wave" "$WAVE_SLICE" &
   PID[$name]=$!
   set +m
   STATUS[$name]=running
@@ -1170,9 +1246,29 @@ for name in "${NAMES[@]}"; do
 done
 [ "$running" = 1 ] || STREAM=""
 
-finish_step() {
+# wave_ended <name>: the end of one wave of step <name>, read from its result
+# file. Every wave runs, also after one fails, as every batch does, and the
+# step's code is the first failed wave's.
+wave_ended() {
   local name="$1" rc secs
   read -r rc secs <"$STATE_DIR/$name.done"
+  rm -f "$STATE_DIR/$name.done"
+  if [ "$rc" != 0 ]; then
+    printf 'devbox-steps: %s wave %s failed with code %s\n' "$name" "${WAVE_NO[$name]}" "$rc" >>"$(log_of "$name")" \
+      || fatal "cannot write the log $(log_of "$name")"
+    [ "${WAVE_RC[$name]}" != 0 ] || WAVE_RC[$name]="$rc"
+  fi
+  RESERVED[$name]=0
+}
+
+finish_step() {
+  local name="$1" rc secs
+  if [ -n "${WAVE_NO[$name]+x}" ]; then
+    wave_ended "$name"
+    rc="${WAVE_RC[$name]}" secs=$((SECONDS - WAVE_T0[$name]))
+  else
+    read -r rc secs <"$STATE_DIR/$name.done"
+  fi
   CODE[$name]="$rc" SECS[$name]="$secs"
   if [ "$rc" = 0 ]; then
     OUTCOME[$name]=pass
@@ -1258,10 +1354,30 @@ while :; do
     reserved=$((reserved + RESERVED[$name]))
     active=$((active + 1))
   done
+  # A runner step whose wave ended starts its next wave before any step
+  # starts: it already runs, and its files are the ones left. The wave gets
+  # the fair share, or what fits of it, and at least one worker.
+  for name in "${NAMES[@]}"; do
+    [ -n "${WAVE_NEXT[$name]+x}" ] || continue
+    unset 'WAVE_NEXT[$name]'
+    share="$(step_workers "$name" "$runners")"
+    workers="$share"
+    if [ -n "$BUDGET" ] && [ "$(step_reservation "$name" "$workers")" -gt $((BUDGET - reserved)) ]; then
+      workers=0
+      [ "$BUDGET" -le "$reserved" ] || workers=$(((BUDGET - reserved) / $(worker_memory "$name")))
+      [ "$workers" -ge 1 ] || workers=1
+    fi
+    wave_take "$name" "$workers" "$share"
+    [ "$workers" -le "$WAVE_TAKEN" ] || workers="$WAVE_TAKEN"
+    need="$(step_reservation "$name" "$workers")"
+    start_step "$name" "$workers" "$need" "$share"
+    reserved=$((reserved + need))
+  done
   mem_held=0
   mem_first=""
   for name in ${starting[@]+"${starting[@]}"}; do
     workers="$(step_workers "$name" "$runners")"
+    share="$workers"
     need="$(step_reservation "$name" "$workers")"
     if [ -n "$BUDGET" ] && [ "$need" -gt $((BUDGET - reserved)) ]; then
       fit=0
@@ -1275,7 +1391,12 @@ while :; do
         continue
       fi
     fi
-    start_step "$name" "$workers" "$need"
+    if [ "$workers" -lt "$share" ] && wave_ready "$name"; then
+      WAVE_LEFT[$name]="$(step_files "$name")"$'\n'
+      WAVE_TOTAL[$name]="${FILE_COUNT[$name]}" WAVE_NO[$name]=0 WAVE_RC[$name]=0 WAVE_T0[$name]="$SECONDS"
+      wave_take "$name" "$workers" "$share"
+    fi
+    start_step "$name" "$workers" "$need" "$share"
     reserved=$((reserved + need))
     active=$((active + 1))
   done
@@ -1311,6 +1432,13 @@ while :; do
       }
     fi
     [ -f "$STATE_DIR/$name.done" ] || continue
+    if [ -n "${WAVE_LEFT[$name]-}" ]; then
+      # A wave ended and files are left: the step still runs, and the next
+      # pass starts its next wave.
+      wave_ended "$name"
+      WAVE_NEXT[$name]=1
+      continue
+    fi
     STATUS[$name]=ended
     ended+=("$name")
   done

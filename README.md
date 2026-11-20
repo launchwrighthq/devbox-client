@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.4.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.4.1"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.4.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.4.1"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.4.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.4.1"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `/vendor/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.4.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.4.1 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -290,7 +290,8 @@ memory, any other step its `memory=`, else `DEVBOX_STEP_MEMORY`, else 2G. A step
 while its reservation fits, the ready runner steps start before the steps without a runner, a
 runner step first shrinks its workers to fit, and one line says
 `<n> steps wait for memory` the first time a step waits. When no step runs, the next one starts
-whatever its size. The client never passes `--exclude`: a resumed or selected step gets the files it must
+whatever its size. A runner step that starts below its fair share runs its files in waves, each
+with the workers that fit when it starts, so it grows once the memory frees. The client never passes `--exclude`: a resumed or selected step gets the files it must
 run, each under its `dir=` and a test file of its runner.
 
 Every gate writes a record under `<git common dir>/devbox/records/`. It gives each test file to
