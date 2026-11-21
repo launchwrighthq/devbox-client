@@ -91,6 +91,34 @@ assert_fail 'and the finish step removed that symlink' test -L "$SYNC_DEST/.venv
 assert_eq "gitdir: $SYNC_DEST/.git-common/worktrees/worktree" "$(cat "$SYNC_DEST/.git")" \
   'the workspace .git points at the synced common dir, not at the laptop'
 
+# A folder the laptop no longer has leaves the workspace whole. Its protected and
+# excluded entries once kept it there: a seeded workspace held two module folders
+# of a sibling branch with only ts/node_modules in them, and rsync exited 0.
+printf '# a comment\n- dist/\ncoverage/\n' > .devbox/exclude
+for d in gone/ts/node_modules/pkg gone/.venv/bin gone/.pytest_cache gone/dist gone/coverage gone/ts/.idea; do
+  mkdir -p "$SYNC_DEST/$d"
+  echo stale > "$SYNC_DEST/$d/file"
+done
+mkdir -p live dist coverage "$SYNC_DEST/live/node_modules/pkg"
+echo source > live/file
+echo built > dist/out
+echo report > coverage/index
+echo cached > "$SYNC_DEST/live/node_modules/pkg/file"
+out="$(devbox_sync 2>&1)"; rc=$?
+assert_eq 0 "$rc" 'a sync runs with a folder in the workspace that the laptop no longer has'
+case "$out" in *"cannot delete"*) _fail 'and rsync deleted every folder it was asked to' "got: $out" ;;
+  *) _pass 'and rsync deleted every folder it was asked to' ;; esac
+assert_fail 'that folder is gone with its node_modules, venv, caches and excluded files' test -e "$SYNC_DEST/gone"
+assert_eq cached "$(cat "$SYNC_DEST/live/node_modules/pkg/file")" 'a live folder keeps its node_modules'
+assert_eq cached "$(cat "$SYNC_DEST/node_modules/cache")" 'the root node_modules stays'
+assert_fail 'a "- " line of the exclude file still excludes' test -e "$SYNC_DEST/dist"
+assert_fail 'a bare line of the exclude file still excludes' test -e "$SYNC_DEST/coverage"
+assert_fail 'a comment line of the exclude file is no pattern' test -e "$SYNC_DEST/# a comment"
+mv .devbox/exclude .devbox/exclude.moved
+assert_ok 'a checkout with no exclude file syncs with the built-in rules' devbox_sync
+assert_eq report "$(cat "$SYNC_DEST/coverage/index")" 'and nothing it would name is excluded'
+mv .devbox/exclude.moved .devbox/exclude
+
 # A caller that defines no remote step gets a refusal, never a sync that ran
 # half its steps against nothing.
 out="$(unset -f devbox_sync_finish; devbox_sync 2>&1)"; rc=$?

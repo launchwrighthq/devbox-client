@@ -36,20 +36,48 @@
 # that itself rather than depend on every consumer spelling it correctly.
 # The editor, agent and browser scratch after /.build/ is excluded for every project, which
 # had each listed it in its own exclude file.
+# Every rule but /.git-common/ is perishable (`p`): it holds only outside a folder that
+# `--delete` removes. A protect or exclude rule also guards a path from `--delete`, so
+# a folder the laptop no longer had stayed in the workspace whenever it still held a
+# node_modules, a cache or an excluded file. rsync deleted its tracked files, printed
+# `cannot delete non-empty directory` and exited 0. MEASURED: a new worktree, seeded
+# from a sibling whose branch had two more module folders, kept both folders with
+# only `ts/node_modules` in them, and the project's module check failed on each one
+# for a missing manifest. A live folder's node_modules stays protected.
 devbox_sync_filters() {
   DEVBOX_SYNC_FILTERS=(
-    --filter='P node_modules/' --filter='P .venv/'
-    --filter='- .venv' --filter='- node_modules'
-    --filter='P .mypy_cache/' --filter='P .pytest_cache/' --filter='P .ruff_cache/'
+    --filter='Pp node_modules/' --filter='Pp .venv/'
+    --filter='-p .venv' --filter='-p node_modules'
+    --filter='Pp .mypy_cache/' --filter='Pp .pytest_cache/' --filter='Pp .ruff_cache/'
     --filter='P /.git-common/'
-    --filter='- devbox-runpod/' --filter='- devbox-hetzner/'
-    --filter='+ .env*.example' --filter='- .env*' --filter='- .devbox.env'
-    --filter='- *.pem' --filter='- *.key' --filter='- /vendor/' --filter='- /.build/'
-    --filter='- .idea/' --filter='- .aider*' --filter='- .playwright-mcp/'
-    --filter='- playwright-report/' --filter='- test-results/'
-    --filter='- /.claude/settings.local.json' --filter='- /.claude/logs/' --filter='- /.claude/worktrees/'
-    --exclude-from="$DEVBOX_EXCLUDE"
+    --filter='-p devbox-runpod/' --filter='-p devbox-hetzner/'
+    --filter='+ .env*.example' --filter='-p .env*' --filter='-p .devbox.env'
+    --filter='-p *.pem' --filter='-p *.key' --filter='-p /vendor/' --filter='-p /.build/'
+    --filter='-p .idea/' --filter='-p .aider*' --filter='-p .playwright-mcp/'
+    --filter='-p playwright-report/' --filter='-p test-results/'
+    --filter='-p /.claude/settings.local.json' --filter='-p /.claude/logs/' --filter='-p /.claude/worktrees/'
   )
+  devbox_sync_exclude_filters
+}
+
+# The project's own exclude file, one perishable rule per line, read the way
+# `--exclude-from` reads it: a blank line and a line that starts with `#` or `;`
+# are skipped, a `+ ` or `- ` prefix names the rule, and any other line is an
+# exclude pattern. A checkout with no such file adds no rule, and one that cannot
+# be read fails the sync. rsync offers no modifier for `--exclude-from`, and
+# `merge,-p` reads a `- ` prefix as part of the pattern, which every project's file
+# carries.
+devbox_sync_exclude_filters() {
+  local line
+  [ -e "$DEVBOX_EXCLUDE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '' | '#'* | ';'*) ;;
+      '+ '*) DEVBOX_SYNC_FILTERS+=(--filter="$line") ;;
+      '- '*) DEVBOX_SYNC_FILTERS+=(--filter="-p ${line#- }") ;;
+      *) DEVBOX_SYNC_FILTERS+=(--filter="-p $line") ;;
+    esac
+  done <"$DEVBOX_EXCLUDE"
 }
 
 devbox_sync() {
@@ -60,7 +88,7 @@ for f in devbox_sync_push devbox_sync_finish; do
   declare -F "$f" >/dev/null || { echo "devbox sync: the caller defines no $f, so nothing was synced" >&2; return 1; }
 done
 local WORKTREE=""
-devbox_sync_filters
+devbox_sync_filters || return 1
 devbox_sync_push "" -a --delete "${rsync_args[@]}" "${DEVBOX_SYNC_FILTERS[@]}" "$ROOT/"
 
 # A linked worktree's `.git` is a one-line `gitdir:` pointer at a path on THIS
@@ -125,7 +153,7 @@ devbox_sync_finish "$WORKTREE"
 devbox_sync_manifest() {
   local dest="$1" listing line
   local -a files=()
-  devbox_sync_filters
+  devbox_sync_filters || return 1
   listing="$(rsync -a --dry-run --out-format='%i %n%L' --filter='- /.git' "${DEVBOX_SYNC_FILTERS[@]}" "$ROOT/" "$dest/")" || return 1
   while IFS= read -r line; do
     [[ "$line" =~ ^[\>c.]([fL])[^\ ]{9}\ (.*)$ ]] || continue
