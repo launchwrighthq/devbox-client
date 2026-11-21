@@ -423,6 +423,67 @@ pool_may_grant() {
   return 0
 }
 
+# ── the drain of a host ──────────────────────────────────────────────────────
+#
+# MEASURED: an operator had to restart shared hosts. No setting stopped new
+# gates, so the operator waited for an idle moment and raced the next grant, and a restart
+# that lost the race would kill a running gate. A drained host takes no new gate
+# and lets the running ones finish (docs/specs/2026-11-21-host-drain-design.md).
+#
+# The drain is one root-owned file, /etc/devbox/drain, which survives a
+# reboot: one line, `<epoch> [<reason words>]`. `devbox-runner drain` writes it
+# by rename and removes it. devbox-pool grants nothing while it exists, and the
+# watchdog's health line names it, so every client skips the host with no
+# protocol change. Both programs read it here, so the pool cannot refuse on a
+# file the health line reads as absent.
+#
+# The reason is words of letters, digits and . _ : / + -, one space between
+# two, at most 100 characters. No comma: the health line joins its reasons
+# with ", ", and devbox-runner finds the drain's part by that separator. No
+# quote, no glob character and no $: infra/deploy sends the reason over ssh.
+devbox_drain_reason_ok() {
+  local r="${1-}"
+  [ -n "$r" ] || return 0
+  [ "${#r}" -le 100 ] || return 1
+  [[ "$r" =~ ^[A-Za-z0-9._:/+-]+(\ [A-Za-z0-9._:/+-]+)*$ ]]
+}
+
+# Read the drain file $1 into DRAIN_SINCE and DRAIN_REASON. Returns 1, with
+# both empty, when the file does not exist: the host is in service. Returns 0
+# when it exists. A file that does not read as `<epoch> [<reason>]` still
+# drains, with DRAIN_SINCE `-`: the operator wrote it to take the host out,
+# and a typo must not put the host back into service. stderr is redirected
+# before the open, so an unreadable file is an answer and not a message.
+# shellcheck disable=SC2034  # DRAIN_SINCE and DRAIN_REASON are read by the caller
+devbox_drain_read() {
+  local file="${1-}" line="" epoch="" rest=""
+  DRAIN_SINCE=""; DRAIN_REASON=""
+  [ -e "$file" ] || [ -L "$file" ] || return 1
+  if ! { IFS= read -r line || [ -n "$line" ]; } 2>/dev/null <"$file"; then line=""; fi
+  read -r epoch rest <<<"$line" || true
+  if [[ "$epoch" =~ ^[0-9]{1,12}$ ]] && devbox_drain_reason_ok "$rest"; then
+    DRAIN_SINCE="$epoch"; DRAIN_REASON="$rest"
+  else
+    DRAIN_SINCE=-
+  fi
+  return 0
+}
+
+# The words that name a drain, after a devbox_drain_read of the file $1 that
+# returned 0: the first part of the health line's reason, the pool's status
+# and its doctor line. They hold no comma, for the reason
+# devbox_drain_reason_ok gives, and devbox-runner finds the drain's part of a
+# health line by their first four words.
+devbox_drain_text() {
+  local file="${1-}" when
+  if [ "$DRAIN_SINCE" = - ]; then
+    printf 'drained by the operator; %s does not read as <epoch> <reason>' "$file"
+    return 0
+  fi
+  when="$(date -u -d "@$DRAIN_SINCE" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || when="epoch $DRAIN_SINCE"
+  printf 'drained by the operator since %s%s' "$when" "${DRAIN_REASON:+: $DRAIN_REASON}"
+}
+
 # The ONE rule for comparing a `name=version` pin in the requires-token format
 # against what a program reports for itself. It lives HERE because this library
 # is the only file both halves already load, and because two programs compared

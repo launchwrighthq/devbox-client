@@ -183,13 +183,16 @@ _devbox_services_up() {
       redis)
         # ensure-workspace starts it with these arguments. Started here too,
         # for a server that died since and for a target that starts none.
+        # A server started here may be swapped out until the next
+        # ensure-workspace moves it into the runner's devbox-redis cgroup.
         if ! pgrep -x redis-server >/dev/null; then
           if ! command -v redis-server >/dev/null; then
             echo "devbox verify: service redis: this workspace has no redis-server, so the host's image lacks the redis feature" >&2
             return 3
           fi
           redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no \
-            --maxmemory-policy noeviction --maxmemory 1gb --daemonize yes >/dev/null || return 3
+            --maxmemory-policy noeviction --maxmemory 1gb --latency-monitor-threshold 100 \
+            --daemonize yes >/dev/null || return 3
         fi
         _devbox_services_wait redis _devbox_services_redis_ping || return 3
         export "$v=redis://127.0.0.1:6379" ;;
