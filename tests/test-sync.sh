@@ -58,7 +58,12 @@ for f in .idea/workspace.xml .aider.chat.history.md .playwright-mcp/page.png pla
   echo scratch > "$f"
 done
 echo shared > .claude/settings.json
+mkdir -p vendor/pkg/1.0.0 vendor/devbox/client
+echo wheel > vendor/pkg/1.0.0/pkg-1.0.0-py3-none-any.whl
+echo clone > vendor/devbox/client/marker
 assert_ok 'syncs a linked checkout using the shared helper' devbox_sync
+assert_eq wheel "$(cat "$SYNC_DEST/vendor/pkg/1.0.0/pkg-1.0.0-py3-none-any.whl")" 'sends a vendored package under vendor/'
+assert_fail 'does not send the vendored client clone' test -e "$SYNC_DEST/vendor/devbox"
 assert_eq fixture "$(git -C "$SYNC_DEST" branch --show-current)" 'retains the real branch, not a synthetic clone'
 assert_eq "$(git rev-parse HEAD)" "$(git -C "$SYNC_DEST" rev-parse HEAD)" 'retains the checkout commit and its shared objects'
 assert_fail 'removes a prior copy of an unrelated worktree' test -e "$SYNC_DEST/.git-common/worktrees/peer"
