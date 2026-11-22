@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.5.2"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.5.3"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.5.2"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.5.3"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.5.2"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.5.3"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `vendor/devbox/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.5.2 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.5.3 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -459,10 +459,18 @@ target, under that grant. The client takes the first rule that matches:
 ```
 ==> devbox: lan1 unreachable (no answer in 3s)
 ==> devbox: cloud1 skipped: degraded (disk 96%)
+==> devbox: waiting for a host: no grant after 10s
 ==> devbox: queuing on cloud2: 30/32 tokens, 3/3 jobs, 1 waiting: about 240s of queuing
-==> devbox: queuing on cloud3: 4/16 tokens, 1/3 jobs, 0 waiting: this ask fits now
-==> devbox: granted 12 tokens on cloud3 lane 1 after 2s (also queued on cloud2)
+==> devbox: queuing on cloud3: 16/16 tokens, 3/3 jobs, 0 waiting: about 30s of queuing
+==> devbox: granted 12 tokens on cloud3 lane 1 after 31s (also asked cloud2)
 ```
+
+The join lines and the affinity grace line wait for a grant. A grant within 10 seconds of the
+first join shows the grant line alone, as in
+`==> devbox: granted 12 tokens on cloud3 lane 1 after 2s (also asked cloud2)`. With no grant by
+then, the run prints one `waiting for a host` line with its wait so far, then every held line,
+as above. A run that ends before any grant prints them too. `DEVBOX_JOIN_QUIET_SECONDS` (10
+seconds, from the environment) sets the time, and 0 shows each line as its target is joined.
 
 A target fits now when its host says `now`, and the client does no token arithmetic of its own.
 The lines above are from hosts that admit on tokens. A host that admits on pressure, the

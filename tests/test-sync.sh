@@ -52,9 +52,9 @@ mkdir -p "$(git rev-parse --path-format=absolute --git-common-dir)/devbox/record
 echo log > "$(git rev-parse --path-format=absolute --git-common-dir)/devbox/records/run.log"
 echo stale > "$SYNC_DEST/.git-common/devbox/records/old.log"
 echo untracked > new-source
-mkdir -p .idea .playwright-mcp playwright-report test-results .claude/logs .claude/worktrees/peer
+mkdir -p .idea .playwright-mcp playwright-report test-results .claude/logs .claude/state .claude/worktrees/peer
 for f in .idea/workspace.xml .aider.chat.history.md .playwright-mcp/page.png playwright-report/index.html \
-  test-results/run.json .claude/settings.local.json .claude/logs/session.log .claude/worktrees/peer/file; do
+  test-results/run.json .claude/settings.local.json .claude/logs/session.log .claude/state/goal.json .claude/worktrees/peer/file; do
   echo scratch > "$f"
 done
 echo shared > .claude/settings.json
@@ -75,7 +75,7 @@ assert_eq template "$(cat "$SYNC_DEST/.env.staging.example")" 'keeps credential 
 for file in .env.staging .devbox.env signing.pem .git-common/worktrees/worktree/devbox-runpod/key \
   .git-common/worktrees/worktree/devbox-hetzner/gate-password \
   .idea .aider.chat.history.md .playwright-mcp playwright-report test-results \
-  .claude/settings.local.json .claude/logs .claude/worktrees; do
+  .claude/settings.local.json .claude/logs .claude/state .claude/worktrees; do
   assert_fail "does not transfer $file" test -e "$SYNC_DEST/$file"
 done
 assert_eq shared "$(cat "$SYNC_DEST/.claude/settings.json")" 'still transfers the rest of .claude/'

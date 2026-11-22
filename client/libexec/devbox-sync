@@ -41,6 +41,10 @@
 # MEASURED: a project bumped a vendored wheel, uv.lock named the new file, and the workspace
 # never received it. uv sync failed with "Distribution not found", and on a skipped setup the
 # suite ran against the old installed wheel and failed two test files for no product reason.
+# /.claude/state/ holds a Claude Code session's hook state, which the session rewrites while a
+# gate runs. MEASURED: two release gates in a row ended with "files changed while it ran" on a
+# clean tree with an unmoved base, because a session's goal-spec state file there changed
+# between the gate's first and last hash, and neither pass could carry.
 # Every rule but /.git-common/ is perishable (`p`): it holds only outside a folder that
 # `--delete` removes. A protect or exclude rule also guards a path from `--delete`, so
 # a folder the laptop no longer had stayed in the workspace whenever it still held a
@@ -60,7 +64,7 @@ devbox_sync_filters() {
     --filter='-p *.pem' --filter='-p *.key' --filter='-p /vendor/devbox/' --filter='-p /.build/'
     --filter='-p .idea/' --filter='-p .aider*' --filter='-p .playwright-mcp/'
     --filter='-p playwright-report/' --filter='-p test-results/'
-    --filter='-p /.claude/settings.local.json' --filter='-p /.claude/logs/' --filter='-p /.claude/worktrees/'
+    --filter='-p /.claude/settings.local.json' --filter='-p /.claude/logs/' --filter='-p /.claude/state/' --filter='-p /.claude/worktrees/'
   )
   devbox_sync_exclude_filters
 }

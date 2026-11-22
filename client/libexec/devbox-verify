@@ -454,6 +454,9 @@ steps_cancel_older() {
 steps_on_term() {
   local rc=0 target="$STEPS_TARGET" stop
   trap - TERM
+  # The join lines a TERM before any grant ends with, ahead of its own line.
+  # Guarded, because a TERM can come before join_show_held is defined.
+  ! declare -F join_show_held >/dev/null || join_show_held
   steps_stop_job
   # This laptop and a RunPod pod have no gate account, so no verb goes there.
   case "$target" in local|runpod) target=- ;; esac
@@ -1243,6 +1246,11 @@ REJOIN_SECONDS="${DEVBOX_REJOIN_SECONDS:-30}"
 # from either.
 LOCK_WAIT="${DEVBOX_LOCK_WAIT:-3600}"
 require_uint "DEVBOX_LOCK_WAIT" "$LOCK_WAIT" "the environment"
+# How long the join lines wait for a grant before they are shown (join_say).
+# 0 shows each line as its target is joined. It lands in bash arithmetic
+# below, so it is checked like the lane wait.
+JOIN_QUIET_SECONDS="${DEVBOX_JOIN_QUIET_SECONDS:-10}"
+require_uint "DEVBOX_JOIN_QUIET_SECONDS" "$JOIN_QUIET_SECONDS" "the environment"
 
 # ── what this project needs from the workspace image ─────────────────────────
 #
@@ -1626,7 +1634,38 @@ join_start() {
   JOIN_STATE[$name]=lock
   JOINED+=("$name")
   [ -n "$JOIN_T0" ] || JOIN_T0="$SECONDS"
-  echo "==> devbox: queuing on $name$3"
+  join_say "==> devbox: queuing on $name$3"
+}
+
+# The join lines are held until JOIN_QUIET_SECONDS after the first join, and a
+# grant within that time drops them. MEASURED: agents that ran gates read
+# `queuing on <t>: no usable queue estimate, so this run waits in its queue`
+# and `waiting up to 60s on <t> alone` and told their operator the devbox was
+# busy, again and again, while every host stood mostly idle and the grant came
+# about 3 seconds later. A run with no grant by then shows one line with its
+# wait so far, then every held line, so a real wait is visible within the
+# quiet time and still names each target's answer. An exit before any grant
+# shows them too (cleanup_probe), so the reader sees why no target took it.
+JOIN_HELD=()
+JOIN_HOLDING=1
+[ "$JOIN_QUIET_SECONDS" -gt 0 ] || JOIN_HOLDING=0
+join_say() {
+  if [ "$JOIN_HOLDING" = 1 ]; then
+    JOIN_HELD+=("$1")
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# Show the held lines, under one line with the wait so far. Every later line
+# is shown at once.
+join_show_held() {
+  local line
+  [ "${#JOIN_HELD[@]}" -gt 0 ] || return 0
+  JOIN_HOLDING=0
+  echo "==> devbox: waiting for a host: no grant after $((SECONDS - ${JOIN_T0:-$SECONDS}))s"
+  for line in "${JOIN_HELD[@]}"; do printf '%s\n' "$line"; done
+  JOIN_HELD=()
 }
 
 # Close one fd of a join, once. No redirection on the close: see devbox_on_exit.
@@ -1728,9 +1767,12 @@ join_wait() {
       fi
       [ ! -e "$d/lane" ] || JOIN_STATE[$name]=queued
     done
+    if [ "$JOIN_HOLDING" = 1 ] && [ $((SECONDS - JOIN_T0)) -ge "$JOIN_QUIET_SECONDS" ]; then
+      join_show_held
+    fi
     if [ "${#GRACE_REST[@]}" -gt 0 ]; then
       if [ "$SECONDS" -ge "$GRACE_UNTIL" ] || [ "${JOIN_STATE[$GRACE_TARGET]-}" = ended ]; then
-        echo "==> devbox: no grant on $GRACE_TARGET within the grace, so this run joins the other targets"
+        join_say "==> devbox: no grant on $GRACE_TARGET within the grace, so this run joins the other targets"
         for name in "${GRACE_REST[@]}"; do join_start_target "$name"; done
         GRACE_REST=()
         continue
@@ -1900,7 +1942,7 @@ rejoin_read() {
   REJOIN_PENDING=(${still[@]+"${still[@]}"})
   # Joined after the loop, so no join job holds the here-string as its stdin.
   for name in ${late[@]+"${late[@]}"}; do
-    echo "==> devbox: $name answered again, so this run joins it too"
+    join_say "==> devbox: $name answered again, so this run joins it too"
     join_start_target "$name"
   done
 }
@@ -2013,6 +2055,7 @@ PROBE_DIR="$(mktemp -d)" || { echo "devbox verify: mktemp -d failed; refusing to
 # Every join ends first: its lane lock, its place in a queue, or its held grant.
 # shellcheck disable=SC2317  # reached through the EXIT trap below, never by name
 cleanup_probe() {
+  join_show_held
   join_release_all
   # Before the masters close: a pass still running would open one more.
   rejoin_stop
@@ -2813,7 +2856,7 @@ join_targets() {
     # SECONDS counts whole seconds, so one more makes the grace at least its
     # length: a deadline of SECONDS + 2 read at x.9 seconds ended 1.1 seconds on.
     GRACE_UNTIL=$((SECONDS + AFFINITY_GRACE + 1))
-    echo "==> devbox: waiting up to ${AFFINITY_GRACE}s on $GRACE_TARGET alone, where this worktree's workspace is warm, before joining ${GRACE_REST[*]}"
+    join_say "==> devbox: waiting up to ${AFFINITY_GRACE}s on $GRACE_TARGET alone, where this worktree's workspace is warm, before joining ${GRACE_REST[*]}"
     return 0
   fi
   for name in "$@"; do join_start_target "$name"; done
@@ -2865,6 +2908,8 @@ run_joins() {
     0) return 0 ;;
     1) return 1 ;;
   esac
+  # Before the refusal, so each target's join line comes ahead of its reason.
+  join_show_held
   joins_failed
 }
 
@@ -2875,6 +2920,8 @@ queued_past_ceiling=0
 queue_ceiling() {
   local -a waited=()
   local name
+  # A ceiling shorter than the quiet time ends the joins with their lines held.
+  join_show_held
   for name in "${JOINED[@]}"; do
     case "${JOIN_STATE[$name]}" in lock|queued) waited+=("$name") ;; esac
   done
@@ -3042,6 +3089,10 @@ fi
 for name in "${JOINED[@]}"; do
   [ "$name" = "$WINNER" ] || join_abort "$name"
 done
+# A grant within the quiet time drops the held join lines: the grant line
+# names the other targets.
+JOIN_HELD=()
+JOIN_HOLDING=0
 also=""
 for name in "${JOINED[@]}"; do
   [ "$name" != "$WINNER" ] || continue
@@ -3054,7 +3105,7 @@ read -r SLUG <"$WIN_DIR/lane"
 lane=1
 while [ "$lane" -lt "${#LANE_SLUGS[@]}" ] && [ "${LANE_SLUGS[lane - 1]}" != "$SLUG" ]; do lane=$((lane + 1)); done
 granted="$(sed -n 's/^devbox-pool: held \([0-9][0-9]*\) .*/\1/p' "$GATE_ERR" | sed -n 1p)"
-echo "==> devbox: granted ${granted:-?} tokens on $TARGET lane $lane after $((SECONDS - JOIN_T0))s${also:+ (also queued on $also)}"
+echo "==> devbox: granted ${granted:-?} tokens on $TARGET lane $lane after $((SECONDS - JOIN_T0))s${also:+ (also asked $also)}"
 # The marker names the target from the grant on, so a newer gate of this
 # checkout reaches this gate's host with the cancel verb even when this client
 # is gone (section 6.5). A marker that cannot be written leaves its own line.

@@ -20,6 +20,11 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# devbox verify holds its join lines until a grant or DEVBOX_JOIN_QUIET_SECONDS,
+# and drops them at a grant within that time. These cases read the join lines
+# of runs granted at once, so 0 shows each line as its target is joined.
+# tests/test-late-binding.sh proves the hold.
+export DEVBOX_JOIN_QUIET_SECONDS=0
 # Every case runs the gate of one unchanged tree again, and the client carries
 # a step from the last complete record of its key (client-owns-the-gate spec,
 # D5), so a second case would run nothing. DEVBOX_RERUN=full runs every step

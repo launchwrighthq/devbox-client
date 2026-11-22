@@ -15,6 +15,11 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# devbox verify holds its join lines until a grant or DEVBOX_JOIN_QUIET_SECONDS,
+# and drops them at a grant within that time. These cases read the join line
+# of a run granted at once, so 0 shows each line as its target is joined.
+# tests/test-late-binding.sh proves the hold.
+export DEVBOX_JOIN_QUIET_SECONDS=0
 # shellcheck source=tests/gate-stub-hold.sh
 source ./gate-stub-hold.sh
 command -v jq >/dev/null || { echo 'install jq to test the Hetzner provider' >&2; exit 1; }

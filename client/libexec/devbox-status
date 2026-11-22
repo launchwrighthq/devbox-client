@@ -465,12 +465,20 @@ cells() {
 
 # The target line, from the parsed reply.
 #
-# `tokens` is a reservation and `cpu` a measurement, side by side
-# (docs/pool.md section 1.1): a host can have every token reserved while its
-# cores are mostly idle, and every core busy with tokens to spare. The two bars
-# show both.
+# `hints` and `cpu` side by side, one the grants' figure and one a
+# measurement (docs/pool.md section 1.1): a host can have every token held
+# while its cores are mostly idle, and every core busy with tokens to spare.
+# The two bars show both.
+#
+# `queued` is the tickets the host reported, the runs that wait for a grant.
+# It is the one figure that says whether a gate waits. The first bar was
+# labelled `tokens` and turned yellow when full, and agents that run gates
+# reported a busy devbox from a full bar while no host had a queued run: under
+# DEVBOX_ADMISSION=pressure, the default, that figure is the worker hints of
+# the running jobs over the core count, which may pass it and hold nothing
+# back (docs/pool.md section 3.2).
 render_host() {
-  local name="$1" hw hcol="" reason="" line col n used pct disp lv tok cpu mem jobs
+  local name="$1" hw hcol="" reason="" line col n used pct disp lv tok cpu mem jobs jv
   case "$STATUS_HEALTH" in
     ok)
       # 90 seconds is the age at which verify skips the target, because the
@@ -487,19 +495,27 @@ render_host() {
   esac
   paint_to "$hcol" "$hw"
   printf -v line '%-*s%s%*s' "$COL" "$name" "$PAINTED" $((10 - ${#hw})) ''
-  # A full pool queues the next gate, whatever the load. A pool that admits on
-  # pressure sends `-` for its job limit, and there the bar is the worker hints
-  # over the cores: a full one queues nothing, so it is never yellow.
+  # The status reply names no admission rule (lib/devbox-lib.sh, the status
+  # reply). Its one sign of the rule is the `-` that a pool of 4.1.3 or earlier
+  # sends for its job limit under pressure, and there the bar decides nothing,
+  # so blanks of its width take its place and the next bar keeps its column.
+  # Every later pool sends a number under either rule, so the bar stays, as
+  # `hints`, the word for the figure under the default rule. Under
+  # DEVBOX_ADMISSION=tokens the same figure is the tokens reserved. It is never
+  # yellow: a full bar queues nothing under pressure, and `queued` says when a
+  # run waits under either rule.
   local pressure=0
   [ "$STATUS_MAX_JOBS" != - ] || ! isnum "$STATUS_JOBS" || pressure=1
-  col=""
-  if isnum "$STATUS_HELD" && isnum "$STATUS_TOTAL" && [ "$STATUS_TOTAL" -gt 0 ]; then
-    n="$(cells "$STATUS_HELD" "$STATUS_TOTAL")"
-    [ "$STATUS_HELD" -lt "$STATUS_TOTAL" ] || [ "$pressure" = 1 ] || col=yellow
+  if [ "$pressure" = 1 ]; then
+    # `hints`, a space, the bar, a space and the value padded to 7.
+    printf -v tok '%*s' $((5 + 1 + BAR_W + 1 + 7)) ''
   else
     n=0
+    if isnum "$STATUS_HELD" && isnum "$STATUS_TOTAL" && [ "$STATUS_TOTAL" -gt 0 ]; then
+      n="$(cells "$STATUS_HELD" "$STATUS_TOTAL")"
+    fi
+    gauge hints "$n" "$STATUS_HELD/$STATUS_TOTAL" "" 7; tok="$GAUGE"
   fi
-  gauge tokens "$n" "$STATUS_HELD/$STATUS_TOTAL" "$col" 7; tok="$GAUGE"
   # The cores that were busy over the host's 1-second sample, of its core
   # count. This bar was the 1-minute load average through 3.0.0, and a host
   # whose gates used nearly all of its cores showed a load of several times
@@ -529,23 +545,30 @@ render_host() {
     gauge mem 0 "-" "" 9
   fi
   mem="$GAUGE"
-  # The jobs limit queues a gate even with tokens free.
+  # The jobs limit queues a gate under either rule.
   col=""
   if isnum "$STATUS_JOBS" && isnum "$STATUS_MAX_JOBS" && [ "$STATUS_JOBS" -ge "$STATUS_MAX_JOBS" ]; then col=yellow; fi
   if [ "$pressure" = 1 ]; then
-    paint_to "" "$STATUS_JOBS"
+    col=""; jv="$STATUS_JOBS"
   else
-    paint_to "$col" "$STATUS_JOBS/$STATUS_MAX_JOBS"
+    jv="$STATUS_JOBS/$STATUS_MAX_JOBS"
   fi
-  jobs="jobs $PAINTED"
-  line+="$tok  $cpu  $mem  $jobs"
+  # Padded to 5, as `12/12`, so `queued` starts in one column on every line.
+  paint_to "$col" "$jv"
+  n=$((5 - ${#jv}))
+  [ "$n" -ge 0 ] || n=0
+  printf -v jobs 'jobs %s%*s' "$PAINTED" "$n" ''
+  col=""
+  [ "$STATUS_TICKET_COUNT" -eq 0 ] || col=yellow
+  paint_to "$col" "$STATUS_TICKET_COUNT"
+  line+="$tok  $cpu  $mem  $jobs  queued $PAINTED"
   # Swap in use, after the bars. A host with no swap paid a memory peak with a
   # killed process: the kernel killed test workers in several workspaces and the
   # shared broker. Every host now has swap, and a host that keeps paging is one
   # whose headroom is too low for its gates (docs/specs/2026-11-13-late-binding-queue-design.md
   # section 7.4). No bar and no colour: the host owns the threshold, and its
   # health word turns `degraded swap <pct>%` past it. Shown only while swap is
-  # in use, after the jobs, so a line stays as wide as before on a host that
+  # in use, after `queued`, so a line stays as wide as before on a host that
   # does not page and a watch keeps it inside the terminal. `no swap` is a host
   # with none at all, which the operator chose with DEVBOX_SWAP_SIZE=0.
   if isnum "$STATUS_SWAP_TOTAL" && [ "$STATUS_SWAP_TOTAL" -eq 0 ]; then

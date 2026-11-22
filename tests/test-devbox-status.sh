@@ -176,8 +176,8 @@ STATUS_ARGS=()
 # mark `>` is this checkout's: both slugs are worktrees of this repository,
 # named <repository>/<worktree>, and the main checkout by its repository alone.
 expected_view="$(cat <<EOF
-lan1      ok        tokens #######. 28/32    cpu #####... 21.4/32  mem #####... 40G/64G    jobs 2/3
-cloud1    ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap
+lan1      ok        hints #######. 28/32    cpu #####... 21.4/32  mem #####... 40G/64G    jobs 2/3    queued 1
+cloud1    ok        hints ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3    queued 0  no swap
 
   STATE      TASK                  TARGET  TOKENS   TIME  LEFT        CORES  MEM
 > running    fix-cache/feat-login  lan1        20  6m12s  ~3m          18.3  7.1G/12G
@@ -241,8 +241,8 @@ tw=20
 [ "${#gone}" -le "$tw" ] || tw="${#gone}"
 row() { printf '%s %-9s  %-*s  %s\n' "$1" "$2" "$tw" "$3" "$4" | sed 's/ *$//'; }
 expected_other="$(
-  echo "lan1      degraded  tokens #######. 28/32    cpu ##...... 9.5/32   mem ........ -          jobs 3/3  swap 1.5G/16G  disk 91%"
-  echo "cloud1    ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap"
+  echo "lan1      degraded  hints #######. 28/32    cpu ##...... 9.5/32   mem ........ -          jobs 3/3    queued 2  swap 1.5G/16G  disk 91%"
+  echo "cloud1    ok        hints ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3    queued 0  no swap"
   echo
   row " " STATE TASK "TARGET  TOKENS    TIME  LEFT           CORES  MEM"
   row " " stopping "other laptop" "lan1         8   1h06m                   0.0  1.0G/2.0G  no work for 1200s, 2 OOM kills"
@@ -311,7 +311,7 @@ reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
 # one line, in its place. cloud1 runs nothing, and it answered, so the table
 # says that no gate runs or waits. The gates of lan1 are not in the table:
 # nothing this client could read said they exist.
-cloud1_block="$(printf '%s\n\n%s' "cloud1    ok        tokens ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3  no swap" "no gate runs or waits")"
+cloud1_block="$(printf '%s\n\n%s' "cloud1    ok        hints ........ 0/20     cpu #....... 0.3/8    mem #....... 2.0G/32G   jobs 0/3    queued 0  no swap" "no gate runs or waits")"
 case_line() {  # $1 the expected lan1 line, $2 the expected exit code, $3 the case
   assert_eq "$2" "$rc" "$3: exit $2"
   assert_eq "$1" "$(printf '%s\n' "$out" | head -1)" "$3: lan1 keeps its place, with its reason"
@@ -440,11 +440,11 @@ assert_eq "$expected_view" "$cd_out" "run from the linked worktree, which borrow
 # expected one, so the two forms cannot drift apart.
 if locale -a 2>/dev/null | grep -qixE 'c\.utf-?8'; then
   utf_view="$(printf '%s\n' "$expected_view" \
-    | sed -E -e ':b' -e 's/((tokens|cpu|mem) (█|░)*)#/\1█/' -e 's/((tokens|cpu|mem) (█|░)*)\./\1░/' -e 'tb' -e 's/^> /▶ /')"
+    | sed -E -e ':b' -e 's/((hints|cpu|mem) (█|░)*)#/\1█/' -e 's/((hints|cpu|mem) (█|░)*)\./\1░/' -e 'tb' -e 's/^> /▶ /')"
   utf_out="$(cd "$CO" && env LC_ALL=C.UTF-8 PATH="$TMP/bin:$PATH" HOME="$TMP/fakehome" XDG_RUNTIME_DIR="$TMP/run" \
     FAKE_STATUS_DIR="$TMP/replies" FAKE_PROTO="$PROTO" FAKE_FP="$FP" bash "$STATUS" 2>&1)"
   assert_eq "$utf_view" "$utf_out" "with a UTF-8 charmap, the bars are blocks and this checkout's mark is a triangle"
-  assert_ok "and the expected view did change: it holds a full block" contains "tokens ███████░ 28/32" "$utf_view"
+  assert_ok "and the expected view did change: it holds a full block" contains "hints ███████░ 28/32" "$utf_view"
 else
   echo "  note: no C.UTF-8 locale on this machine, so the block character case did not run"
 fi
@@ -478,22 +478,74 @@ for case in "8.0 ####.... 8.0/16 " "12.0 ######.. 12.0/16" "15.7 ######## 15.7/1
   cpu_reply "$word"
   run_status
   assert_ok "busy $word of 16 cores: cpu $bar $shown" \
-    grep -qE "^cloud1    ok        tokens \.{8} 0/20     cpu ${bar//./\\.} ${shown//./\\.} +mem " <<<"$out"
+    grep -qE "^cloud1    ok        hints \.{8} 0/20     cpu ${bar//./\\.} ${shown//./\\.} +mem " <<<"$out"
 done
 assert_fail "and no target line names load" grep -q ' load ' <<<"$out"
-# A pool that admits on pressure applies no job limit and sends `-` for it. The
-# jobs cell then shows the count alone, never `3/-`, and the token bar is the
-# worker hints over the cores, which may pass the core count.
+# A pool of 4.1.3 or earlier that admits on pressure applies no job limit and
+# sends `-` for it, the one sign of the rule the reply carries. The jobs cell
+# then shows the count alone, never `3/-`, and the first bar, the worker hints
+# over the cores, decides nothing there: blanks of its width take its place,
+# so `cpu` keeps the column it has on every other target line.
 {
   printf '%s %s %s\n' "$PROTO" "$FP" "$E"
   printf 'host ok 5 25 16 3 - 0 12.0 16 %s %s 0 0\n' "$((30 * GIB))" "$((32 * GIB))"
   printf 'end\n'
 } >"$TMP/replies/cloud1.invalid.status"
 run_status
-assert_ok "a pool with no job limit shows its running jobs alone" \
-  grep -qE '^cloud1    ok        tokens #{8} 25/16    cpu ######\.\. 12\.0/16  mem .* jobs 3  no swap$' <<<"$out"
+assert_ok "a pool with no job limit shows its running jobs alone, and queued 0" \
+  grep -qE '^cloud1    ok {32}cpu ######\.\. 12\.0/16  mem .* jobs 3      queued 0  no swap$' <<<"$out"
+assert_fail "and no hints bar" grep -q 'hints' <<<"$out"
+lines_cols="$(printf '%s\n' "$out" | grep '^cloud1 ')"
 STATUS_ARGS=()
 reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
+
+# ═══ queued: the runs that wait ══════════════════════════════════════════════
+#
+# Agents that run gates reported a busy devbox from a full `tokens` bar while
+# no host had a queued run. Under DEVBOX_ADMISSION=pressure that bar is the
+# worker hints of the running jobs over the cores, and a full one holds
+# nothing back. Each target line now ends its counts with `queued N`, the
+# tickets the host reported. A current pool sends a number for its job limit
+# under either rule, and the reply names no rule, so the bar stays there as
+# `hints`, plain even when it passes the core count.
+#
+# $1 the job limit, $2 the number of tickets.
+queued_reply() {
+  local k
+  {
+    printf '%s %s %s\n' "$PROTO" "$FP" "$E"
+    printf 'host ok 5 25 16 3 %s %s 12.0 16 %s %s 0 0\n' "$1" "$2" "$((30 * GIB))" "$((32 * GIB))"
+    for ((k = 1; k <= $2; k++)); do
+      printf 'ticket %s other - 8 4 %s 60 -\n' "$k" "$((E - 30 * k))"
+    done
+    printf 'end\n'
+  } >"$TMP/replies/cloud1.invalid.status"
+}
+STATUS_ARGS=(--target cloud1)
+queued_reply 12 0
+run_status
+assert_ok "a pressure host with no ticket: its hints bar, past the cores, and queued 0" \
+  grep -qxF 'cloud1    ok        hints ######## 25/16    cpu ######.. 12.0/16  mem #....... 2.0G/32G   jobs 3/12   queued 0  no swap' <<<"$out"
+queued_reply 12 2
+run_status
+assert_ok "a pressure host with two tickets: queued 2" \
+  grep -qxF 'cloud1    ok        hints ######## 25/16    cpu ######.. 12.0/16  mem #....... 2.0G/32G   jobs 3/12   queued 2  no swap' <<<"$out"
+assert_eq "2" "$(printf '%s\n' "$out" | grep -c '^  queued #')" "and the table lists the two tickets"
+lines_cols+=$'\n'"$(printf '%s\n' "$out" | grep '^cloud1 ')"
+STATUS_ARGS=()
+reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
+# A pool under DEVBOX_ADMISSION=tokens sends a number for its job limit too, so
+# it keeps the bar: lan1's line of the first view, 28 of 32 with one ticket.
+run_status
+assert_ok "a host that sends a job limit keeps the bar, and counts its one ticket" \
+  grep -qE '^lan1      ok        hints #######\. 28/32 .* jobs 2/3    queued 1$' <<<"$out"
+# One column for `cpu` and one for `queued` on every target line, whatever the
+# width of the jobs cell and whether the first bar shows: jobs 3 with no bar,
+# 3/12, 2/3 and 0/3.
+lines_cols+=$'\n'"$(printf '%s\n' "$out" | grep -E '^(lan1|cloud1) ')"
+cols="$(printf '%s\n' "$lines_cols" | LC_ALL=C awk '{ print index($0, " cpu "), index($0, " queued ") }' | sort -u)"
+assert_eq "4" "$(printf '%s\n' "$lines_cols" | grep -c ' queued ')" "four target lines to compare"
+assert_eq "1" "$(printf '%s\n' "$cols" | wc -l | tr -d ' ')" "cpu and queued start in one column on every target line ($cols)"
 
 # ═══ R15: colour ═════════════════════════════════════════════════════════════
 assert_fail "a non-terminal output has no escape byte" contains "$ESC" "$out"
@@ -529,24 +581,19 @@ if script --version 2>/dev/null | grep -q util-linux; then
                 grep -qE "cpu ${ESC}\[31m[^ ]+ ${shown//./\\.}${ESC}\[0m" <<<"$tty_out" ;;
     esac
   done
-  # A full token bar queues the next gate on a pool with a job limit, and is
-  # yellow. A pool with none admits on pressure, where the bar is worker hints
-  # that may pass the core count and queue nothing, so it stays plain.
-  for case in "3 yellow" "- plain"; do
-    read -r max band <<<"$case"
-    {
-      printf '%s %s %s\n' "$PROTO" "$FP" "$E"
-      printf 'host ok 5 25 16 3 %s 0 8.0 16 %s %s 0 0\n' "$max" "$((30 * GIB))" "$((32 * GIB))"
-      printf 'end\n'
-    } >"$TMP/replies/cloud1.invalid.status"
-    tty_out="$(on_tty TERM=xterm)"
-    case "$band" in
-      yellow) assert_ok "a full token bar with a job limit of 3 is yellow" \
-                grep -qE "tokens ${ESC}\[33m[^ ]+ 25/16${ESC}\[0m" <<<"$tty_out" ;;
-      plain)  assert_ok "and with no job limit it is plain" \
-                grep -qE "tokens [^${ESC}]+ 25/16 " <<<"$tty_out" ;;
-    esac
-  done
+  # A full bar was yellow on a pool with a job limit, and agents read a busy
+  # devbox from it while no host had a queued run. Under pressure the bar is
+  # worker hints that may pass the core count and queue nothing, and the reply
+  # names no rule, so a full bar is plain. `queued` is yellow while a run
+  # waits, and plain at 0.
+  queued_reply 12 0
+  tty_out="$(on_tty TERM=xterm)"
+  assert_ok "a full hints bar with a job limit of 12 is plain" \
+    grep -qE "hints [^${ESC}]+ 25/16 " <<<"$tty_out"
+  assert_ok "and queued 0 is plain" grep -qE "  queued 0  no swap" <<<"$tty_out"
+  queued_reply 12 2
+  tty_out="$(on_tty TERM=xterm)"
+  assert_ok "queued 2 is yellow" grep -qF "  queued ${ESC}[33m2${ESC}[0m" <<<"$tty_out"
   reply_cloud1 "$E" >"$TMP/replies/cloud1.invalid.status"
   tty_out="$(on_tty "TERM=xterm NO_COLOR=1")"
   assert_ok "NO_COLOR on a terminal: the view is there" contains "lan1      ok" "$tty_out"
@@ -652,8 +699,10 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
   restored "SIGTERM"
 
   # R18: about 6 seconds at --interval 2 is three refreshes or more. lan1
-  # answers once, then never finishes its second status.
-  watch_tty "" "DEVBOX_STATUS_FRAMES=24 FAKE_STALL_SECOND=lan1.invalid DEVBOX_PROBE_ANSWER_SECONDS=60" --interval 2
+  # answers once, then never finishes its second status. 140 columns: lan1's
+  # line is 110 with `queued 1`, and the mark adds 17, which a 120-column
+  # terminal cuts off with the rest of a line past its width.
+  WATCH_COLS=140 watch_tty "" "DEVBOX_STATUS_FRAMES=24 FAKE_STALL_SECOND=lan1.invalid DEVBOX_PROBE_ANSWER_SECONDS=60" --interval 2
   assert_eq "0" "$rc" "a watch with a stalled target: exit 0"
   n_cloud="$(count_in_log 'devbox-gate@cloud1.invalid status ')"
   assert_ok "cloud1 answers at every refresh: 3 status calls or more (got $n_cloud)" test "$n_cloud" -ge 3
@@ -665,9 +714,9 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
   # The line lan1 answered at the first refresh is older than two intervals by
   # the end, and says so.
   assert_ok "the old lan1 line ends with the time it is from" \
-    grep -qE '^lan1      ok        tokens .* jobs 2/3 \(as of [0-9]{2}:[0-9]{2}:[0-9]{2}\)$' <<<"$(plain "$out")"
+    grep -qE '^lan1      ok        hints .* jobs 2/3    queued 1 \(as of [0-9]{2}:[0-9]{2}:[0-9]{2}\)$' <<<"$(plain "$out")"
   assert_ok "and cloud1, which answers, has no such mark" \
-    grep -qxF 'cloud1    ok        tokens ░░░░░░░░ 0/20     cpu █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3  no swap' <<<"$(plain "$out")"
+    grep -qxF 'cloud1    ok        hints ░░░░░░░░ 0/20     cpu █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3    queued 0  no swap' <<<"$(plain "$out")"
   # The rows of the old answer stay in the table, under the line that dates them.
   assert_ok "lan1's gates stay in the table" grep -qE '^▶ running    fix-cache/feat-login  lan1 ' <<<"$(plain "$out")"
   # The spinner turns in the header alone, while a refresh is out. One beside
@@ -709,7 +758,7 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
   assert_ok "with a charmap other than UTF-8, the spinner is |/-\\" \
     grep -qE 'q quits +[|/\\-]$' <<<"$(plain "$out")"
   assert_fail "and no braille frame is drawn" grep -qE "$SPIN" <<<"$out"
-  assert_ok "and the bars are ASCII" grep -qF 'tokens #######.' <<<"$(plain "$out")"
+  assert_ok "and the bars are ASCII" grep -qF 'hints #######.' <<<"$(plain "$out")"
 else
   echo "  note: no util-linux script or no xterm terminfo on this machine, so the watch cases did not run"
 fi

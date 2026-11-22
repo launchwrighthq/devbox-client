@@ -17,6 +17,11 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit
 # shellcheck source=tests/lib.sh
 source ./lib.sh
+# devbox verify holds its join lines until a grant or DEVBOX_JOIN_QUIET_SECONDS,
+# and drops them at a grant within that time. These cases read the join lines
+# of runs granted at once, so 0 shows each line as its target is joined.
+# The cases of the hold, below, set their own value.
+export DEVBOX_JOIN_QUIET_SECONDS=0
 # Every case runs the gate of one unchanged tree again, and the client carries
 # a step from the last complete record of its key (client-owns-the-gate spec,
 # D5), so a second case would run nothing. DEVBOX_RERUN=full runs every step
@@ -185,7 +190,7 @@ assert_ok "D1: and vps2" contains "==> devbox: queuing on vps2: " "$out"
 assert_ok "D1: the gate runs on vps1, the first that granted" contains "GATE RAN ON $A_VPS1 IN ${LANES[0]}" "$out"
 assert_fail "D1: and nowhere else" contains "GATE RAN ON $A_LAN1" "$out"
 assert_ok "D1: the grant line names the target, the lane, the wait and the other queues" \
-  grep -qE '^==> devbox: granted 4 tokens on vps1 lane 1 after [0-9]+s \(also queued on lan1, vps2\)$' <<<"$out"
+  grep -qE '^==> devbox: granted 4 tokens on vps1 lane 1 after [0-9]+s \(also asked lan1, vps2\)$' <<<"$out"
 assert_eq "0" "$(tickets_left)" "D1: no queue keeps a ticket of this run"
 # A queued pool reads no stdin, so the client leaves it by killing that ssh.
 assert_ok "D1: lan1's queue was left when its session ended" contains "left session" "$(grep " $A_LAN1 " "$HOLD_LOG")"
@@ -353,6 +358,69 @@ assert_ok "R4: and the reason names the queues" \
   contains "the queue on lan1 vps1 vps2 did not free up within your DEVBOX_MAX_QUEUE_WAIT of 2s" "$out"
 assert_eq "0" "$(tickets_left)" "R4: no queue keeps a ticket after the fallback"
 write_env
+
+# ═══ Q1 to Q4: the join lines wait for a grant ═══════════════════════════════
+#
+# MEASURED: agents that ran gates read `queuing on <t>: ... waits in its queue`
+# and told their operator the devbox was busy, while every host stood mostly
+# idle and the grant came about 3 seconds later. The join lines are held for
+# DEVBOX_JOIN_QUIET_SECONDS after the first join, and a grant within it shows
+# the grant line alone.
+#
+# The line number of the first line of $1 that matches the ERE $2, 0 for none.
+line_of() { awk -v re="$2" '$0 ~ re { print NR; f = 1; exit } END { if (!f) print 0 }' <<<"$1"; }
+FAKE_GRANT="$A_LAN1:never $A_VPS1:1 $A_VPS2:never" DEVBOX_JOIN_QUIET_SECONDS=10 verify
+assert_eq "0" "$rc" "Q1: a grant within the quiet time: the run completes"
+assert_ok "Q1: the grant line names the other targets as asked" \
+  grep -qE '^==> devbox: granted 4 tokens on vps1 lane 1 after [0-9]+s \(also asked lan1, vps2\)$' <<<"$out"
+assert_fail "Q1: no join line is shown" contains "queuing on" "$out"
+assert_fail "Q1: and no waiting line" contains "waiting for a host" "$out"
+assert_fail "Q1: no line says queued" grep -q 'queued' <<<"$out"
+assert_eq "0" "$(tickets_left)" "Q1: no queue keeps a ticket of this run"
+
+FAKE_GRANT="$A_LAN1:never $A_VPS1:5 $A_VPS2:never" DEVBOX_JOIN_QUIET_SECONDS=2 verify
+assert_eq "0" "$rc" "Q2: a grant after the quiet time: the run completes"
+q_wait="$(line_of "$out" '^==> devbox: waiting for a host: no grant after [0-9]+s$')"
+q_grant="$(line_of "$out" '^==> devbox: granted 4 tokens on vps1 lane 1 after ')"
+assert_ok "Q2: one waiting line says how long the run waited ($q_wait)" test "$q_wait" -gt 0
+assert_eq "1" "$(grep -c 'waiting for a host' <<<"$out")" "Q2: exactly one waiting line"
+assert_eq "==> devbox: queuing on lan1: 0/20 tokens, 0/4 jobs, 0 waiting: this ask fits now" \
+  "$(sed -n "$((q_wait + 1))p" <<<"$out")" "Q2: the held join lines follow it, as they read before"
+assert_ok "Q2: each of the three" test "$(sed -n "$((q_wait + 1)),$((q_wait + 3))p" <<<"$out" | grep -c '^==> devbox: queuing on ')" -eq 3
+assert_ok "Q2: and all of it before the grant line ($q_wait, $q_grant)" test "$q_grant" -gt "$((q_wait + 3))"
+assert_ok "Q2: the waiting line came at the quiet time, not at the grant" \
+  grep -qE '^==> devbox: waiting for a host: no grant after [2-4]s$' <<<"$out"
+assert_fail "Q2: no line says busy" grep -qi 'busy' <<<"$out"
+
+write_env 'DEVBOX_MAX_QUEUE_WAIT=3'
+FAKE_GRANT="$A_LAN1:never $A_VPS1:never $A_VPS2:never" DEVBOX_JOIN_QUIET_SECONDS=10 verify
+assert_eq "8" "$rc" "Q3: no grant within a ceiling shorter than the quiet time: exit 8"
+q_wait="$(line_of "$out" '^==> devbox: waiting for a host: no grant after [0-9]+s$')"
+q_fail="$(line_of "$out" 'gave up waiting for tokens on lan1 vps1 vps2 after 3s')"
+assert_ok "Q3: the held lines are shown ($q_wait)" test "$q_wait" -gt 0
+assert_eq "3" "$(grep -c '^==> devbox: queuing on ' <<<"$out")" "Q3: with each target's join line"
+assert_ok "Q3: ahead of the refusal ($q_wait, $q_fail)" test "$q_fail" -gt "$((q_wait + 3))"
+write_env
+
+reset_logs
+(cd "$CO" && exec env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" DEVBOX_LOCK_WAIT=30 \
+  DEVBOX_JOIN_QUIET_SECONDS=30 FAKE_GRANT="$A_LAN1:never $A_VPS1:never $A_VPS2:never" \
+  bash "$REPO/client/libexec/devbox-verify" >"$TMP/q4.out" 2>&1) &
+q4=$!
+for _ in $(seq 1 100); do
+  [ "$(find "$TMP/tickets" -type f | wc -l)" -lt 3 ] || break
+  sleep 0.1
+done
+kill -TERM "$q4"
+wait "$q4" 2>/dev/null  # the status is the TERM asked for
+out="$(cat "$TMP/q4.out")"
+assert_ok "Q4: a TERM before any grant shows the waiting line" \
+  grep -qE '^==> devbox: waiting for a host: no grant after [0-9]+s$' <<<"$out"
+assert_eq "3" "$(grep -c '^==> devbox: queuing on ' <<<"$out")" "Q4: and each target's join line"
+q_wait="$(line_of "$out" '^==> devbox: waiting for a host: ')"
+q_term="$(line_of "$out" 'stopped by SIGTERM')"
+assert_ok "Q4: ahead of the line of the TERM ($q_wait, $q_term)" test "$q_term" -gt "$((q_wait + 3))"
+assert_eq "0" "$(tickets_left)" "Q4: no queue keeps a ticket of this run"
 
 # ═══ D1: a target whose estimate is over the ceiling is still joined ═════════
 #
