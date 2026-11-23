@@ -120,7 +120,9 @@ verify() {
   out="$(cd "$CO" && env PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" TMPDIR="$TMP/tmp" \
     DEVBOX_LOCK_WAIT=30 bash "$REPO/client/libexec/devbox-verify" "$@" 2>&1)" || rc=$?
 }
-verdict() { printf '%s\n' "$out" | tail -n 1; }
+# The failures line follows a red verdict, so the verdict is the last
+# `devbox: ` line, not the last line.
+verdict() { printf '%s\n' "$out" | grep '^devbox: ' | tail -n 1; }
 
 # ═══ D1: a resume reruns its own failed files, whatever another branch says ═
 echo "-- D1"
@@ -142,6 +144,8 @@ assert_eq "resume=1 a.test.ts b.test.ts" "$(sed -n 2p "$VITEST_LOG")" \
 assert_fail "D1: the step did not resume as passed" contains "every file it runs passed in an earlier run" "$out"
 assert_eq 1 "$rc" "D1: the resumed gate fails"
 assert_eq "devbox: red (test failed: 2 files)" "$(verdict)" "D1: and its verdict is red over its own two files"
+assert_eq 'verify: failures {"test": {"code": 1, "attributable": true, "failedFiles": ["a.test.ts", "b.test.ts"]}}' \
+  "$(printf '%s\n' "$out" | tail -n 1)" "D1: and the failures line names those two files from the runner's ledger"
 
 # ═══ D4: a file that passed before the stop keeps its reads and the run id ══
 echo "-- D4"

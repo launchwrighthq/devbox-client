@@ -812,7 +812,15 @@ steps_record_finish() {
   # every script that reads the code, as README "Exit codes" tells it to.
   # MEASURED: a resumed gate recorded its step pass beside two failed files.
   # 1 is the code of a failed gate whose own step gave none.
-  case "$line" in "devbox: red ("*) [ "$STEPS_GATE_CODE" != 0 ] || STEPS_GATE_CODE=1 ;; esac
+  # After a red verdict, the failures line a landing script reads, on every
+  # path that ends here: a target, a rented pod, --local and --step. A record
+  # that does not carry reads `incomplete`, never red, and gets no line.
+  case "$line" in
+    "devbox: red ("*)
+      [ "$STEPS_GATE_CODE" != 0 ] || STEPS_GATE_CODE=1
+      devbox_record_failures "$rec" || echo "devbox verify: could not print the failures line of this gate; devbox result --json holds the record" >&2
+      ;;
+  esac
 }
 
 # The end of a gate on a rented RunPod pod, which devbox-runpod runs with its

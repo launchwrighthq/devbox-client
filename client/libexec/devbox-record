@@ -76,6 +76,35 @@ $1 == "scope" { scope = $2 }
 END { if (NR > 0) done() }
 '
 
+# The JSON helpers every record reader that prints JSON shares: `devbox result
+# --json` and devbox_record_failures. js() escapes a string by the rules of
+# RFC 8259: the backslash, the quote and every control character below 0x20. A
+# path may hold any byte but a tab or a newline, which the record itself cannot
+# carry. num() prints the digits as written, not v + 0: an awk may print a large
+# number in its %.6g form, and an epoch second would arrive as 1.7e+09. A field
+# that does not read as an integer is null, so a reader never meets a number
+# that is a string on one run and a number on the next. Run awk under LC_ALL=C.
+# shellcheck disable=SC2016  # an awk program: awk expands its $1, never bash
+_DEVBOX_RECORD_AWK_JSON='
+BEGIN { for (i = 1; i < 32; i++) ctl[sprintf("%c", i)] = sprintf("\\u%04x", i) }
+function js(s,   out, i, c) {
+  out = ""
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\\") out = out "\\\\"
+    else if (c == "\"") out = out "\\\""
+    else if (c in ctl) out = out ctl[c]
+    else out = out c
+  }
+  return "\"" out "\""
+}
+function num(v) {
+  if (v !~ /^[0-9]+$/) return "null"
+  sub(/^0+/, "", v)
+  return v == "" ? "0" : v
+}
+'
+
 # The first line of a sorted stream, read to its end. MEASURED: `sort | head -n 1`
 # under pipefail failed at random once a checkout held a few hundred records:
 # head exited after one line, sort died writing the rest with "Broken pipe",
@@ -293,5 +322,48 @@ devbox_record_summary() {
       else if (red != "") printf "devbox: red (%s)\n", red
       else if (scope == "partial") printf "devbox: partial pass (%s; only the named steps ran, so this is not a green gate)\n", counts
       else printf "devbox: green (%s)\n", counts
+    }' "$1"
+}
+
+# Print the failures line of the record file $1 for a landing script, or
+# nothing: `verify: failures {"<step>": {"code": <n>, "attributable": <bool>,
+# "failedFiles": ["<path>", ...]}, ...}`, one entry per failed step in record
+# order, on one line. devbox verify prints it after a red verdict.
+#
+# A landing script runs the failed files again on the base branch to tell a
+# failure of the branch from one the base already has, so a step is
+# attributable only when its failed files name every failure of it. That is the
+# rule a narrow trusts (_devbox_plan_narrow, section 6.4): the step failed with
+# code 1, the runner's "tests failed" and not a crash, at least one test file
+# of it failed, and none was still open when it ended. A step that reads pass
+# beside a failed file of its own is red by devbox_record_summary: its code
+# here is 1, the code devbox verify exits with, and its files name the failure.
+# Any other failed step is `"attributable": false` with no file, so the script
+# counts the whole step as unexplained.
+#
+# A `complete 0` record prints nothing: a cancelled, stopped or killed gate,
+# and one whose files changed while it ran, proves nothing about the tree it
+# names, and a reader with no line treats the whole gate as unexplained. A
+# record with no failed step prints nothing either. The paths are the ledger's,
+# relative to the repository root.
+devbox_record_failures() {
+  LC_ALL=C awk -F'\t' "$_DEVBOX_RECORD_AWK_JSON"'
+    $1 == "complete" { complete = $2 }
+    $1 == "step" { n++; name[n] = $2; outcome[$2] = $4; code[$2] = num($6) }
+    $1 == "file" && $5 == "fail" { files[$2] = files[$2] (nf[$2]++ ? ", " : "") js($4) }
+    $1 == "file" && $5 == "open" { open[$2] = 1 }
+    END {
+      if (complete != "1") exit
+      out = ""
+      for (i = 1; i <= n; i++) {
+        s = name[i]
+        failed = (outcome[s] == "fail")
+        if (!failed && !(s in files)) continue
+        c = code[s]
+        if (c == "null" || c == "0") c = "1"
+        ok = (s in files) && !(s in open) && (!failed || c == "1")
+        out = out (out == "" ? "" : ", ") js(s) ": {\"code\": " c ", \"attributable\": " (ok ? "true" : "false") ", \"failedFiles\": [" (ok ? files[s] : "") "]}"
+      }
+      if (out != "") print "verify: failures {" out "}"
     }' "$1"
 }

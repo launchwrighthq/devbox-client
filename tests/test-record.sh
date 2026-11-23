@@ -371,6 +371,48 @@ assert_eq "a.test.ts	30
 c.test.ts	4" "$(devbox_record_durations test)" \
   "the durations: the newest seconds of each file, a 3.3 line with none left out"
 
+echo "-- the failures line of a red gate, for a landing script"
+# A landing script runs the failed files again on the base branch. A step is
+# attributable only by the rule a narrow trusts: code 1, a failed file, no open
+# one. The line is one JSON object that python3's json.loads must read.
+new_repo failures
+fail_line() { record_text "$@" >"$TMP/fail.txt"; devbox_record_failures "$TMP/fail.txt"; }
+assert_eq 'verify: failures {"test": {"code": 1, "attributable": true, "failedFiles": ["src/a.test.ts", "src/c.test.ts"]}, "typecheck": {"code": 2, "attributable": false, "failedFiles": []}}' \
+  "$(fail_line "$R1" 1000 main full 1 "step lint k-lint pass 4 0 full" "step test k-test fail 30 1 full" \
+    "step typecheck k-tc fail 9 2 full" "file test vitest src/a.test.ts fail" "file test vitest src/b.test.ts pass" \
+    "file test vitest src/c.test.ts fail")" \
+  "one entry per failed step in record order: the failed files of a code 1 step, none for a step with no file"
+assert_eq "" "$(fail_line "$R1" 1000 main full 1 "step lint k-lint pass 4 0 full" "step test k-test carried 0 0 full" \
+  "file test vitest src/a.test.ts pass")" "a green record prints no line"
+assert_eq 'verify: failures {"test": {"code": 1, "attributable": false, "failedFiles": []}}' \
+  "$(fail_line "$R1" 1000 main full 1 "step test k-test fail 30 1 full" \
+    "file test pytest tests/test_a.py fail" "file test pytest tests/test_b.py open")" \
+  "a file still open when the step ended has no result, so the failed files do not name every failure"
+assert_eq 'verify: failures {"test": {"code": 137, "attributable": false, "failedFiles": []}}' \
+  "$(fail_line "$R1" 1000 main full 1 "step test k-test fail 30 137 full" "file test vitest src/a.test.ts fail")" \
+  "a code other than 1 is a crash of the runner, so its one failed file does not name every failure"
+assert_eq 'verify: failures {"test": {"code": 1, "attributable": true, "failedFiles": ["src/a.test.ts"]}}' \
+  "$(fail_line "$R1" 1000 main full 1 "step test k-test pass 30 0 full" "file test vitest src/a.test.ts fail")" \
+  "a step that reads pass beside a failed file is failed with code 1, the code devbox verify exits with"
+assert_eq 'verify: failures {"lint": {"code": 1, "attributable": false, "failedFiles": []}}' \
+  "$(fail_line "$R1" 1000 main partial 1 "step lint k-lint fail 4 1 shard")" \
+  "a partial record of one shard prints its failed step too"
+assert_eq "" "$(fail_line "$R1" 1000 main full 0 "step test k-test fail 12 143 full" "file test vitest src/a.test.ts fail")" \
+  "a complete 0 record prints no line: a cancelled or stopped gate proves nothing about its tree"
+record_text "$R1" 1000 main full 1 "step test k-test fail 30 1 full" >"$TMP/fail.txt"
+printf 'file\ttest\tvitest\t%s\tfail\t1\n' 'src/a "q" \b.test.ts' >>"$TMP/fail.txt"
+line="$(devbox_record_failures "$TMP/fail.txt")"
+assert_eq 'verify: failures {"test": {"code": 1, "attributable": true, "failedFiles": ["src/a \"q\" \\b.test.ts"]}}' "$line" \
+  "a quote and a backslash in a path are escaped"
+assert_eq "1" "$(printf '%s\n' "$line" | wc -l)" "and the line stays one line"
+if command -v python3 >/dev/null 2>&1; then
+  assert_eq 'src/a "q" \b.test.ts' \
+    "$(python3 -I -c 'import json, sys; print(json.loads(sys.stdin.read()[len("verify: failures "):])["test"]["failedFiles"][0])' <<<"$line")" \
+    "python3 json.loads reads the path back byte for byte"
+else
+  echo "  note python3 is missing, so json.loads did not read the failures line; the checks above still ran"
+fi
+
 echo "-- many records: the newest read never fails on a broken pipe"
 # sort's output must pass the 64 KiB pipe buffer for head to close the pipe
 # under it: 800 records of a long run id give about 100 KiB of sort output.

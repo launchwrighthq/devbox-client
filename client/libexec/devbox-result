@@ -92,33 +92,9 @@ case "$mode" in
       END { for (i = 1; i <= n; i++) if (out[name[i]] == "fail" || (name[i] in ff)) print name[i] }' "$record"
     ;;
   json)
-    # One object on one line. A string is escaped by the rules of RFC 8259:
-    # the backslash, the quote and every control character below 0x20. A path
-    # may hold any byte but a tab or a newline, which the record itself
-    # cannot carry. A number field that does not read as an integer is null,
-    # so a reader never meets a number that is a string on one run and a
-    # number on the next. Each step lists its failed test files in record
-    # order.
-    LC_ALL=C awk -F'\t' '
-      BEGIN { for (i = 1; i < 32; i++) ctl[sprintf("%c", i)] = sprintf("\\u%04x", i) }
-      function js(s,   out, i, c) {
-        out = ""
-        for (i = 1; i <= length(s); i++) {
-          c = substr(s, i, 1)
-          if (c == "\\") out = out "\\\\"
-          else if (c == "\"") out = out "\\\""
-          else if (c in ctl) out = out ctl[c]
-          else out = out c
-        }
-        return "\"" out "\""
-      }
-      # The digits as written, not v + 0: an awk may print a large number in
-      # its %.6g form, and an epoch second would arrive as 1.7e+09.
-      function num(v) {
-        if (v !~ /^[0-9]+$/) return "null"
-        sub(/^0+/, "", v)
-        return v == "" ? "0" : v
-      }
+    # One object on one line, built with the js() and num() of devbox-record.
+    # Each step lists its failed test files in record order.
+    LC_ALL=C awk -F'\t' "$_DEVBOX_RECORD_AWK_JSON"'
       function hdr(k) { return (k in h) ? js(h[k]) : "null" }
       $1 == "run" || $1 == "client" || $1 == "branch" || $1 == "commit" || $1 == "target" || $1 == "scope" || $1 == "at" || $1 == "complete" { h[$1] = $2 }
       $1 == "step" {

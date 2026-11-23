@@ -140,6 +140,9 @@ verify() {
 result() { (cd "${IN:-$CO}" && bash "$REPO/client/libexec/devbox-result" "$@" 2>&1); }
 ran() { tr '\n' ' ' <"$STEP_LOG" | sed 's/ $//'; }
 last_line() { printf '%s\n' "$out" | tail -n 1; }
+# A red gate ends in two lines: the verdict, then the failures line.
+verdict_line() { printf '%s\n' "$out" | grep '^devbox: ' | tail -n 1; }
+failures_lines() { printf '%s\n' "$out" | grep -c '^verify: failures '; }
 # The newest record of the checkout $IN, by its `at` and then its file name.
 newest_record() {
   local dir="${IN:-$CO}/.git/devbox/records"
@@ -155,6 +158,7 @@ assert_ok "D1: every step ran on the host" test "$(sort "$STEP_LOG" | tr '\n' ' 
 assert_ok "D1: test ran after lint, as after=lint says" \
   test "$(grep -n '^lint$' "$STEP_LOG" | cut -d: -f1)" -lt "$(grep -n '^test$' "$STEP_LOG" | cut -d: -f1)"
 assert_eq "devbox: green (3 steps: 3 ran, 0 carried)" "$(last_line)" "D1: the last line is the green verdict"
+assert_eq "0" "$(failures_lines)" "failures line: a green gate prints none"
 assert_fail "D1: the runner's result lines stay out of the terminal" contains "devbox-steps: result" "$out"
 assert_ok "D1: the runner and the plan crossed in the hooks into the workspace" \
   test -f "$TMP/ws/$A_LAN1/$(ls "$TMP/ws/$A_LAN1")/steps/devbox-steps"
@@ -202,7 +206,12 @@ assert_eq "lint test typecheck" "$(sort "$STEP_LOG" | tr '\n' ' ' | sed 's/ $//'
 # ═══ the exit code: the first failed step in plan order ══════════════════════
 FAKE_RC_lint=2 FAKE_RC_typecheck=5 verify --target lan1 --full
 assert_eq "2" "$rc" "exit code: lint fails with 2 and typecheck with 5, so devbox verify exits 2"
-assert_eq "devbox: red (lint failed; typecheck failed)" "$(last_line)" "exit code: the red verdict names both"
+assert_eq "devbox: red (lint failed; typecheck failed)" "$(verdict_line)" "exit code: the red verdict names both"
+# The line after the verdict names each failed step: no test file of these
+# two failed, so neither is attributable.
+assert_eq 'verify: failures {"lint": {"code": 2, "attributable": false, "failedFiles": []}, "typecheck": {"code": 5, "attributable": false, "failedFiles": []}}' \
+  "$(last_line)" "failures line: the last line of a red gate names each failed step and its code"
+assert_eq "1" "$(failures_lines)" "failures line: a red gate prints exactly one"
 assert_ok "exit code: a failed step's log follows its header" grep -qx 'step lint output' <<<"$out"
 RED="$(newest_record)"
 assert_eq "fail 5 full" "$(step_line "$RED" typecheck)" "D10: the record keeps each step's own code"
@@ -285,10 +294,15 @@ FAKE_FAILED_FILE=tests/a.test.ts FAKE_FAILED_FILE_STEP=lint verify --target lan1
 assert_eq "pass" "$(step_line "$(newest_record)" lint | cut -d' ' -f1)" "D1a: the record holds the step pass"
 assert_eq "fail" "$(awk -F'\t' '$1 == "file" && $2 == "lint" { print $5 }' "$(newest_record)")" \
   "D1a: beside a failed test file of that step"
-assert_eq "devbox: red (lint passed with 1 failed files)" "$(last_line)" "D1a: the verdict is red"
+assert_eq "devbox: red (lint passed with 1 failed files)" "$(verdict_line)" "D1a: the verdict is red"
+assert_eq 'verify: failures {"lint": {"code": 1, "attributable": true, "failedFiles": ["tests/a.test.ts"]}}' \
+  "$(last_line)" "failures line: a --step run names the failed test file, relative to the repository root"
 assert_eq "1" "$rc" "D1a: and the gate exits 1, the code of a failed gate, never 0"
 FAKE_FAILED_FILE=tests/a.test.ts FAKE_FAILED_FILE_STEP=lint verify --local --full --step lint
-assert_eq "devbox: red (lint passed with 1 failed files)" "$(last_line)" "D1a: a gate on this laptop reads red too"
+assert_eq "devbox: red (lint passed with 1 failed files)" "$(verdict_line)" "D1a: a gate on this laptop reads red too"
+assert_eq 'verify: failures {"lint": {"code": 1, "attributable": true, "failedFiles": ["tests/a.test.ts"]}}' \
+  "$(last_line)" "failures line: --local prints the same line"
+assert_eq "1" "$(failures_lines)" "failures line: and exactly one"
 assert_eq "1" "$rc" "D1a: and exits 1"
 
 # ═══ D10a: a file changed while the gate ran: complete 0, nothing carries ════
