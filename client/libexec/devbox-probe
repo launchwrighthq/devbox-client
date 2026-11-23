@@ -19,6 +19,16 @@
 # or a file could not run: it is gone at <rev>, its step is not in <rev>'s
 # steps file, or the run never reached it. 2 for a usage error, an unknown
 # revision or a directory outside a git checkout.
+#
+# `devbox probe --record [--local] [--from <worktree>] [--wait <s>] <files...>`
+# runs the named failed files in THIS checkout: no revision and no worktree.
+# A landing script calls it in a detached worktree of the merged base, which
+# has no record of its own, so --from names the checkout whose newest record
+# and steps file give each file its step. After the per-file lines, a failed
+# file adds the gate's `verify: failures {json}` line as the last stdout line.
+# Exit 0 when every file passed, 1 when one failed, and 2 when the probe could
+# not run: no file, a file the record does not name as failed, a held lock
+# (--wait waits that many seconds for it first), or a run that broke.
 set -euo pipefail
 _here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 DEVBOX_LIB=""
@@ -32,40 +42,118 @@ source "$DEVBOX_LIB"
 source "$_here/devbox-config"
 # shellcheck source=client/libexec/devbox-steps-file
 source "$_here/devbox-steps-file"
+# shellcheck source=client/libexec/devbox-record
+source "$_here/devbox-record"
 
 usage() {
   echo "usage: devbox probe [--local] <rev>" >&2
+  echo "       devbox probe --record [--local] [--from <worktree>] [--wait <s>] <files...>" >&2
   exit 2
 }
-local_run=0 rev=""
+local_run=0 record_mode=0 from="" wait_s="" rev=""
+declare -a args=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --local) local_run=1; shift ;;
+    --record) record_mode=1; shift ;;
+    --from) { [ "$#" -ge 2 ] && [ -n "$2" ]; } || usage; from="$2"; shift 2 ;;
+    --wait) { [ "$#" -ge 2 ] && [[ "$2" =~ ^[0-9]+$ ]]; } || usage; wait_s="$2"; shift 2 ;;
+    --) shift; args+=("$@"); break ;;
     -*) usage ;;
-    *) [ -z "$rev" ] || usage; rev="$1"; shift ;;
+    *) args+=("$1"); shift ;;
   esac
 done
-[ -n "$rev" ] || usage
+for a in "${args[@]+"${args[@]}"}"; do [ -n "$a" ] || usage; done
+if [ "$record_mode" = 1 ]; then
+  [ "${#args[@]}" -gt 0 ] || usage
+else
+  { [ "${#args[@]}" -eq 1 ] && [ -z "$from" ] && [ -z "$wait_s" ]; } || usage
+  rev="${args[0]}"
+fi
+# The record mode keeps exit 1 for a failed file, so each refusal of it is 2.
+refuse=1
+[ "$record_mode" = 0 ] || refuse=2
+# A caller of the record mode reads exit 1 as "a file failed" and then reads
+# the failures line. A command that set -e ends would exit 1 with no such
+# line, so every status but 0 and a signal's is 2 until the line is printed.
+verdict=0
+final_rc() {
+  local rc="$1"
+  if [ "$record_mode" = 1 ] && [ "$verdict" = 0 ]; then
+    case "$rc" in 0 | 130 | 143) ;; *) rc=2 ;; esac
+  fi
+  printf '%s\n' "$rc"
+}
+[ "$record_mode" = 0 ] || trap 'exit "$(final_rc "$?")"' EXIT
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "devbox probe: $PWD is not inside a git checkout" >&2; exit 2; }
-sha="$(git rev-parse --verify --quiet --end-of-options "$rev^{commit}")" || {
-  echo "devbox probe: '$rev' names no commit in this repository" >&2
-  exit 2
-}
+if [ "$record_mode" = 1 ]; then
+  root="$(git rev-parse --show-toplevel)"
+  steps_root="$root"
+  if [ -n "$from" ]; then
+    steps_root="$(git -C "$from" rev-parse --show-toplevel 2>/dev/null)" || {
+      echo "devbox probe: --from $from is not inside a git checkout" >&2
+      exit 2
+    }
+  fi
+  at="this checkout" steps_of="$steps_root"
+else
+  sha="$(git rev-parse --verify --quiet --end-of-options "$rev^{commit}")" || {
+    echo "devbox probe: '$rev' names no commit in this repository" >&2
+    exit 2
+  }
+  steps_root="$PWD" at="$rev" steps_of="$rev"
+fi
 
 # The failed steps and files come from devbox result, the one reader of the
 # record, so the probe picks the record a landing script reads: the newest of
-# this branch, else the newest of any.
-steps_out="$(bash "$_here/devbox-result" --failed-steps)" || exit "$?"
-if [ -z "$steps_out" ]; then
+# this branch, else the newest of any. The record mode asks in the --from
+# checkout, so the branch of that checkout picks the record.
+steps_out="$(cd -- "$steps_root" && bash "$_here/devbox-result" --failed-steps)" || {
+  rc=$?
+  [ "$record_mode" = 0 ] || rc=2
+  exit "$rc"
+}
+if [ -z "$steps_out" ] && [ "$record_mode" = 0 ]; then
   echo "devbox probe: the newest record has no failed step, so there is nothing to probe" >&2
   exit 0
 fi
-mapfile -t failed_steps <<<"$steps_out"
+declare -a failed_steps=()
+[ -z "$steps_out" ] || mapfile -t failed_steps <<<"$steps_out"
 declare -A failed_files=()
-for step in "${failed_steps[@]}"; do
-  failed_files[$step]="$(bash "$_here/devbox-result" --failed-files "$step")"
+for step in "${failed_steps[@]+"${failed_steps[@]}"}"; do
+  failed_files[$step]="$(cd -- "$steps_root" && bash "$_here/devbox-result" --failed-files "$step")"
 done
+
+# The record mode runs the named files only. A file is known when the record
+# names it as a failed file of a step, and that step runs it. A step with no
+# named file leaves the probe, so no `unattributed` line prints.
+if [ "$record_mode" = 1 ]; then
+  nl=$'\n'
+  declare -A want=()
+  for f in "${args[@]}"; do want[${f#./}]=0; done
+  declare -a kept=()
+  for step in "${failed_steps[@]+"${failed_steps[@]}"}"; do
+    named=""
+    while IFS= read -r path; do
+      if [ -n "$path" ] && [ -n "${want[$path]+x}" ]; then
+        want[$path]=1
+        named+="${named:+$nl}$path"
+      fi
+    done <<<"${failed_files[$step]}"
+    [ -n "$named" ] || continue
+    failed_files[$step]="$named"
+    kept+=("$step")
+  done
+  failed_steps=("${kept[@]+"${kept[@]}"}")
+  unknown=0
+  for f in "${args[@]}"; do
+    [ "${want[${f#./}]}" = 0 ] || continue
+    echo "devbox probe: ${f#./} is not a failed file of the newest record of $steps_root, so no file ran" >&2
+    unknown=1
+  done
+  [ "$unknown" = 0 ] || exit 2
+fi
 
 # One worktree path per repository, so a probe through `devbox run` finds the
 # warm workspace of the last probe: the workspace slug is a hash of this path,
@@ -76,29 +164,48 @@ common="$(git rev-parse --path-format=absolute --git-common-dir)"
 wt="$common/devbox/probe"
 lock="$common/devbox/probe.lock"
 mkdir -p -- "$common/devbox"
-if ! mkdir -- "$lock" 2>/dev/null; then
+# The record mode takes the same lock, so one probe of a repository runs at a
+# time. --wait asks again each second until the owner ends or the seconds do.
+deadline=$((SECONDS + ${wait_s:-0}))
+while ! mkdir -- "$lock" 2>/dev/null; do
   owner=""
   [ ! -r "$lock/pid" ] || read -r owner <"$lock/pid" || owner=""
   if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-    echo "devbox probe: another probe of this repository runs as pid $owner, and both would use $wt" >&2
-    exit 1
+    if [ "$SECONDS" -lt "$deadline" ]; then
+      sleep 1
+      continue
+    fi
+    if [ "$record_mode" = 1 ] && [ "${wait_s:-0}" -gt 0 ]; then
+      echo "devbox probe: another probe of this repository runs as pid $owner, and it held the lock for the ${wait_s}s of --wait" >&2
+    elif [ "$record_mode" = 1 ]; then
+      echo "devbox probe: another probe of this repository runs as pid $owner; --wait <s> waits for it" >&2
+    else
+      echo "devbox probe: another probe of this repository runs as pid $owner, and both would use $wt" >&2
+    fi
+    exit "$refuse"
   fi
   echo "devbox probe: taking over the lock of a probe that is gone (pid ${owner:-unknown})" >&2
   rm -rf -- "$lock"
-  mkdir -- "$lock" || { echo "devbox probe: could not take the lock $lock" >&2; exit 1; }
-fi
+  ! mkdir -- "$lock" 2>/dev/null || break
+  # Two probes that wait behind one dead owner both come here, and one mkdir
+  # wins. The other waits for the winner while --wait has seconds left. The
+  # sleep gives the winner time to write its pid, so it is not read as gone.
+  [ "$SECONDS" -lt "$deadline" ] || { echo "devbox probe: could not take the lock $lock" >&2; exit "$refuse"; }
+  sleep 1
+done
 printf '%s\n' "$$" >"$lock/pid"
 added=0
 marks="$(mktemp)"
+failures="$(mktemp)"
 cleanup() {
   local rc=$?
-  rm -f -- "$marks"
+  rm -f -- "$marks" "$failures"
   if [ "$added" = 1 ] && ! git worktree remove --force -- "$wt"; then
     echo "devbox probe: could not remove the worktree $wt; 'git worktree remove --force $wt' removes it" >&2
     rc=1
   fi
   rm -rf -- "$lock"
-  exit "$rc"
+  exit "$(final_rc "$rc")"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -107,21 +214,24 @@ trap 'exit 143' TERM
 # this path, so it goes: through git when git still lists it, and by rm when
 # git does not (the refusal is that case, so its text is dropped), after which
 # prune drops git's entry for a directory that is gone.
-if [ -e "$wt" ]; then
-  echo "devbox probe: removing the worktree a stopped probe left at $wt" >&2
-  git worktree remove --force -- "$wt" >/dev/null 2>&1 || rm -rf -- "$wt"
+if [ "$record_mode" = 0 ]; then
+  if [ -e "$wt" ]; then
+    echo "devbox probe: removing the worktree a stopped probe left at $wt" >&2
+    git worktree remove --force -- "$wt" >/dev/null 2>&1 || rm -rf -- "$wt"
+  fi
+  git worktree prune
+  git worktree add --quiet --detach -- "$wt" "$sha" >&2
+  added=1
+  root="$wt" steps_root="$wt"
 fi
-git worktree prune
-git worktree add --quiet --detach -- "$wt" "$sha" >&2
-added=1
 
 # The steps of <rev>, because the command main runs is the one that fits
 # main's code. STEP_DIR is declared first: a parser that does not fill it
 # leaves it empty, and an undeclared ${STEP_DIR[$s]} would evaluate the step
 # name as arithmetic.
 declare -A STEP_DIR=()
-if [ -f "$wt/.devbox/steps" ]; then
-  devbox_steps_load "$wt/.devbox/steps" "$wt" || { echo "devbox probe: the steps file of $rev is refused above" >&2; exit 1; }
+if [ -f "$steps_root/.devbox/steps" ]; then
+  devbox_steps_load "$steps_root/.devbox/steps" "$steps_root" || { echo "devbox probe: the steps file of $steps_of is refused above" >&2; exit "$refuse"; }
 else
   STEP_NAMES=()
 fi
@@ -148,7 +258,7 @@ missing=0
 for step in "${failed_steps[@]}"; do
   [ -n "${failed_files[$step]}" ] || continue
   if [ -z "${rev_cmd[$step]+x}" ]; then
-    echo "devbox probe: step $step is not in the steps file of $rev, so its failed files did not run" >&2
+    echo "devbox probe: step $step is not in the steps file of $steps_of, so its failed files did not run" >&2
     missing=1
     continue
   fi
@@ -156,14 +266,14 @@ for step in "${failed_steps[@]}"; do
   # the repository root, and the runner gets it from the folder.
   dir="${STEP_DIR[$step]-}"
   [ -n "$dir" ] || dir=./
-  if [ ! -d "$wt/$dir" ]; then
-    echo "devbox probe: step $step runs in $dir, which $rev does not hold, so its failed files did not run" >&2
+  if [ ! -d "$root/$dir" ]; then
+    echo "devbox probe: step $step runs in $dir, which $at does not hold, so its failed files did not run" >&2
     missing=1
     continue
   fi
   while IFS= read -r path; do
-    if [ ! -e "$wt/$path" ]; then
-      echo "devbox probe: $path does not exist at $rev, so it did not run" >&2
+    if [ ! -e "$root/$path" ]; then
+      echo "devbox probe: $path does not exist at $at, so it did not run" >&2
       missing=1
       continue
     fi
@@ -188,30 +298,40 @@ filter() {
   done
 }
 run_rc=0
+# The record mode runs every named file or none: a caller that reads exit 2
+# must not find a half answer.
+if [ "$record_mode" = 1 ] && [ "$missing" = 1 ]; then
+  echo "devbox probe: no file ran" >&2
+  exit 2
+fi
 if [ "${#expect[@]}" -gt 0 ]; then
   if [ "$local_run" = 1 ]; then
     # A fresh worktree has no node_modules and no .venv, so the project's
     # setup runs first, as a workspace runs it. The setup key is a
     # workspace's: here the setup always runs.
-    hooks="$(cd "$wt" && devbox_config_load >&2 && DEVBOX_SETUP_INPUTS='' DEVBOX_STEPS_HOOKS='' devbox_hooks_script)" || {
-      echo "devbox probe: could not read the config of $rev, so no file ran" >&2
-      exit 1
+    hooks="$(cd "$root" && devbox_config_load >&2 && DEVBOX_SETUP_INPUTS='' DEVBOX_STEPS_HOOKS='' devbox_hooks_script)" || {
+      echo "devbox probe: could not read the config of $at, so no file ran" >&2
+      exit "$refuse"
     }
     set +e
-    (cd "$wt" && bash -c "$hooks"$'\n'"devbox_setup >&2 && devbox_environment && bash -c $(printf '%q' "$script")") 2>&1 | filter
+    (cd "$root" && bash -c "$hooks"$'\n'"devbox_setup >&2 && devbox_environment && bash -c $(printf '%q' "$script")") 2>&1 | filter
     run_rc="${PIPESTATUS[0]}"
     set -e
   else
     set +e
-    (cd "$wt" && bash "$_here/devbox-run" -- bash -c "$script") 2>&1 | filter
+    (cd "$root" && bash "$_here/devbox-run" -- bash -c "$script") 2>&1 | filter
     run_rc="${PIPESTATUS[0]}"
     set -e
   fi
 fi
 
 # The lines in record order, a step's unattributed line where the step stands.
+# Each failed file also becomes a record line, for the record mode: the one
+# function that prints the failures line of a gate reads a record.
+printf 'complete\t1\n' >"$failures"
 for step in "${failed_steps[@]}"; do
   [ -n "${failed_files[$step]}" ] || printf 'probe %s - unattributed\n' "$step"
+  step_failed=0
   for e in "${expect[@]+"${expect[@]}"}"; do
     [ "${e%%$'\t'*}" = "$step" ] || continue
     path="${e#*$'\t'}"
@@ -222,6 +342,14 @@ for step in "${failed_steps[@]}"; do
       continue
     fi
     printf 'probe %s %s %s\n' "$step" "$path" "$outcome"
+    [ "$outcome" = fail ] || continue
+    [ "$step_failed" = 1 ] || printf 'step\t%s\t-\tfail\t0\t1\tfull\n' "$step" >>"$failures"
+    step_failed=1
+    printf 'file\t%s\t-\t%s\tfail\t-\n' "$step" "$path" >>"$failures"
   done
 done
-[ "$missing" = 0 ] || exit 1
+[ "$missing" = 0 ] || exit "$refuse"
+if [ "$record_mode" = 1 ]; then
+  line="$(devbox_record_failures "$failures")"
+  [ -z "$line" ] || { verdict=1; printf '%s\n' "$line"; exit 1; }
+fi

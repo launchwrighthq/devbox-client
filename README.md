@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.7.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.8.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.7.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.8.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.7.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.8.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `vendor/devbox/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.7.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.8.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -298,7 +298,9 @@ Every gate writes a record under `<git common dir>/devbox/records/`. It gives ea
 the step whose plan names it, else to the step whose `dir=` is the closest folder above it, a
 step without `dir=` counting as the checkout root. `devbox result` prints the newest;
 `--failed-steps`, `--failed-files` and `--json` give a landing tool what it needs, and
-`devbox probe <rev>` runs the failed test files at another revision. A new `devbox verify`
+`devbox probe <rev>` runs the failed test files at another revision.
+`devbox probe --record <files...>` runs the named failed files in the current checkout, and
+prints the `verify: failures {json}` line of a gate as its last stdout line when one fails. A new `devbox verify`
 cancels the older gate of the same worktree, which exits 14; `devbox cancel` does the same by
 hand. A gate stopped by any other SIGTERM exits 143. With `DEVBOX_SETUP_INPUTS`, the workspace
 skips the setup when the setup text and those files did not change since the last setup that
@@ -626,6 +628,7 @@ minutes, and 4 when another run of this worktree held the creation for 15 minute
 | `devbox verify --plan` | Prints what each step would do and why, with each selected test file and its reason, and runs nothing. |
 | `devbox result [--failed-steps \| --failed-files [<step>] \| --log <step> \| --json]` | Prints the newest record, its failed steps, its failed test files, one step's saved log, or the record as one JSON object. |
 | `devbox probe [--local] <rev>` | Runs the failed test files of the newest record at `<rev>` in a temporary worktree and prints `probe <step> <path> pass\|fail` per file. Exit 0 when every file ran, 1 when one could not, 2 for a revision that names no commit. |
+| `devbox probe --record [--local] [--from <worktree>] [--wait <s>] <files...>` | Runs the named failed test files in the current checkout, with no worktree, and prints one `probe` line per file, then `verify: failures {json}` when a file fails. `--from` names the checkout whose newest record and steps file give each file its step, for a detached worktree. `--wait` waits that many seconds for the lock of another probe. Exit 0 when every file passes, 1 when one fails, 2 when it could not run. |
 | `devbox ci matrix` | Prints the GitHub Actions matrix of `.devbox/steps`, one entry per step and shard. Exit 2 for a broken steps file. |
 | `devbox cancel` | Cancels this checkout's running gate, here and on its target. |
 | `devbox run [--target <name>] -- <command>` | Runs one command in the remote workspace after setup. It never runs locally. |

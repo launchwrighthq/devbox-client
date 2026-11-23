@@ -48,6 +48,13 @@ usage: devbox <command> [args]
   probe [--local] <rev>  run the failed test files of the newest record at <rev>
                          in a temporary worktree, through devbox run or here with
                          --local, and print one line per file
+  probe --record [--local] [--from <worktree>] [--wait <s>] <files...>
+                         run the named failed test files in this checkout and
+                         print one line per file, then the failures line of a
+                         gate when one fails; exit 0 all pass, 1 one fails, 2 no
+                         run; --from names the checkout whose newest record and
+                         steps file give each file its step; --wait waits that
+                         many seconds for the lock of another probe
   setup                  run DEVBOX_SETUP here, skipped when its inputs and outputs
                          are unchanged since it last passed; no step runs
   ci matrix              print the GitHub Actions matrix of .devbox/steps: one
