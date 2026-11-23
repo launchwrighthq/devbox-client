@@ -28,6 +28,13 @@ set -euo pipefail
 # cannot switch it, because the caller that needs it is not the developer.
 STRICT=0
 [ "${DEVBOX_STRICT:-}" = 1 ] && STRICT=1
+# DEVBOX_STRICT_TREE=1: a gate whose every step passed, and whose synced files
+# changed while it ran, exits 13 (steps_record_finish). Without it that gate
+# exits 0, because the steps passed, and only its verdict line says that the
+# result does not describe the files on disk. From the environment alone, as
+# DEVBOX_STRICT is: the caller that reads the code sets it.
+STRICT_TREE=0
+[ "${DEVBOX_STRICT_TREE:-}" = 1 ] && STRICT_TREE=1
 # DEVBOX_RERUN as the environment holds it, read before any config load: the
 # config parser sets a key it reads as the shell variable of the same name, so
 # after it a developer's `DEVBOX_RERUN=full` could no longer be told from the
@@ -805,6 +812,13 @@ steps_record_finish() {
     echo "devbox verify: could not create the record directory under the git common dir, so this gate left no record" >&2
   fi
   [ "$verdict" = 0 ] && return 0
+  # 13 means: every step passed, and the synced files changed while the gate
+  # ran (README "Exit codes"). A failed step keeps its code. The line goes
+  # first, so the verdict stays the last line.
+  if [ "$STRICT_TREE" = 1 ] && [ "$STEPS_GATE_CODE" = 0 ] && [ "$reason" = "files changed while it ran" ]; then
+    STEPS_GATE_CODE=13
+    echo "devbox verify: DEVBOX_STRICT_TREE=1, so this gate exits 13: every step passed, and the files are not the ones the gate ran on" >&2
+  fi
   line="$(devbox_record_summary "$rec" | tail -n 1)"
   printf '%s\n' "$line"
   # The code follows the verdict. A step whose result line said pass while a

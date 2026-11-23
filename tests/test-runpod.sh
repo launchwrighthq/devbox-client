@@ -344,4 +344,49 @@ wait "$term_pid"
 assert_eq 143 "$?" 'a TERM ends a verify gate on a pod with 143 from the trap'
 assert_ok 'within 5 s, while the 60 s pod gate still had most of its time' test $((SECONDS - term_at)) -le 5
 assert_fail 'and the ssh session of the gate is stopped' kill -0 "$gate_pid"
+
+# DEVBOX_STRICT_TREE=1 on a pod. runpod_execute returns the code that
+# devbox-verify's own steps_gate_finish and steps_record_finish set, with the
+# real record library. POD_TREE_CHANGED=1 stands for a changed file list.
+cat > "$TMP/execute-tree.sh" <<'DRIVER'
+# The last line read is a test that is false without the key, and the driver runs under set -e.
+eval "$(sed -n '/^STRICT_TREE=0$/,/^\[ "\${DEVBOX_STRICT_TREE:-}" = 1 \]/p' "$REPO/client/libexec/devbox-verify")" || true
+eval "$(sed -n '/^steps_record_finish() {/,/^}/p;/^steps_gate_finish() {/,/^}/p' "$REPO/client/libexec/devbox-verify")"
+source "$REPO/client/libexec/devbox-record"
+devbox_record_dir() { printf '%s\n' "$TMP/podrecords"; }
+devbox_record_write() { :; }
+devbox_record_branch() { printf 'main'; }
+STEPS_JOB_PID="" STEPS_ACTIVE=1 STEPS_NO_MANIFEST=0 STEPS_GATE_CODE=0 RUN_ID=pod-run
+STEPS_DIR="$TMP/podsteps" _here="$REPO/client/libexec"
+mkdir -p "$STEPS_DIR"
+: > "$STEPS_DIR/plan"
+PLAN_STEPS=() STEPS_ASKED=()
+declare -A PLAN_ACTION=() PLAN_MODE=() STEPS_RESULT=()
+steps_display() { tee "$1"; }
+steps_results() { :; }
+steps_gate_code() { STEPS_GATE_CODE="$2"; }
+steps_tree_unchanged() { [ "$POD_TREE_CHANGED" != 1 ]; }
+steps_file_lines() { :; }
+steps_on_int() { exit 130; }
+DRIVER
+sed '/^runpod_execute$/d' "$TMP/execute.sh" > "$TMP/execute-strict-tree.sh"
+# shellcheck disable=SC2016  # the driver expands $TMP when it runs, not here
+printf 'source "$TMP/execute-tree.sh"\nrunpod_execute\n' >> "$TMP/execute-strict-tree.sh"
+pod_tree_run() {
+  rm -f "$TMP/pod.log"
+  DEVBOX_STRICT_TREE="$1" POD_TREE_CHANGED="$2" POD_REQUIRES='' POD_LOG="$TMP/pod.log" POD_LIBEXEC="$REPO/client/libexec" \
+    PATH="$TMP/podbin:$PATH" bash "$TMP/execute-strict-tree.sh" >"$TMP/pod.out" 2>"$TMP/pod.err"
+}
+pod_tree_run 1 1
+assert_eq 13 "$?" 'DEVBOX_STRICT_TREE=1: a pod gate whose files changed exits 13'
+assert_eq 'devbox: incomplete (run pod-run does not carry: files changed while it ran)' "$(tail -n 1 "$TMP/pod.out")" \
+  'and the last line is the incomplete verdict'
+assert_ok 'and one stderr line names the key and the code' \
+  grep -q -x 'devbox verify: DEVBOX_STRICT_TREE=1, so this gate exits 13: every step passed, and the files are not the ones the gate ran on' "$TMP/pod.err"
+pod_tree_run 0 1
+assert_eq 0 "$?" 'DEVBOX_STRICT_TREE=0: the same pod gate exits 0'
+assert_eq 'devbox: incomplete (run pod-run does not carry: files changed while it ran)' "$(tail -n 1 "$TMP/pod.out")" \
+  'with the same last line'
+pod_tree_run 1 0
+assert_eq 0 "$?" 'DEVBOX_STRICT_TREE=1: a pod gate whose files did not change exits 0'
 printf '%d %d\n' "$TESTS_RUN" "$TESTS_FAILED"

@@ -32,7 +32,7 @@ the release that matches the server half you use.
 ```json
 {
   "devDependencies": {
-    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.6.0"
+    "@launchwrighthq/devbox-client": "github:launchwrighthq/devbox-client#v4.7.0"
   }
 }
 ```
@@ -41,11 +41,11 @@ the release that matches the server half you use.
 
 ```toml
 [dependency-groups]
-dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.6.0"]
+dev = ["devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.7.0"]
 ```
 
 ```sh
-uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.6.0"
+uv pip install "devbox-client @ git+https://github.com/launchwrighthq/devbox-client@v4.7.0"
 ```
 
 **A vendored copy.** A project in neither ecosystem clones a tag into `vendor/devbox`. The
@@ -53,7 +53,7 @@ command is then `vendor/devbox/client/bin/devbox`. Remove `vendor/devbox/.git` i
 the copy. The sync never sends `vendor/devbox/` to the remote machine.
 
 ```sh
-git clone --depth 1 --branch v4.6.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
+git clone --depth 1 --branch v4.7.0 https://github.com/launchwrighthq/devbox-client vendor/devbox
 ```
 
 Each executable finds `lib/devbox-lib.sh` through its real path, so a symlink to
@@ -739,10 +739,22 @@ files still say, as 4.0 refuses `DEVBOX_VERIFY`, `select=related`, `DEVBOX_NEEDS
 | 10 | the watchdog on the target stopped the gate: past `DEVBOX_GATE_MAX_SECONDS`, or no CPU used for too long. This is not a test result |
 | 11 | the pool on the target lost the gate's queue ticket and could not restore it; the gate did not run |
 | 12 | the pool released the grant twice because the sync and the setup took longer than the host's `DEVBOX_HOLD_PREP_SECONDS`; the gate did not run. The first release queues the run once more by itself. This is not a test result. The lane is warm afterwards |
+| 13 | only with `DEVBOX_STRICT_TREE=1`: every step passed, and the synced files changed while the gate ran. The last line is `devbox: incomplete (run <run-id> does not carry: files changed while it ran)`. This is not a test result. Run the gate again on the files as they are now |
 | 14 | a newer `devbox verify` of this checkout, or `devbox cancel`, cancelled this gate. This is not a test result |
 | 75 | the pool on the host stopped waiting and ran nothing |
 
 A SIGTERM from anything else gives 143 and `devbox verify: stopped by SIGTERM`.
+
+13 is off by default. `DEVBOX_STRICT_TREE` is 0 when the environment does not set it, and
+such a gate then exits 0. Only the environment of `devbox verify` sets it: `.devbox.env` and
+`.devbox/config.env` do not. With `DEVBOX_STRICT_TREE=1`, a gate on a target, a rented pod and
+`--local` each exit 13, after the stderr line
+`devbox verify: DEVBOX_STRICT_TREE=1, so this gate exits 13: every step passed, and the files
+are not the ones the gate ran on`. The record and the last line stay the same. A gate with a
+failed step keeps that step's code, and a gate whose files did not change exits 0. A file list
+that devbox cannot hash again after the gate counts as a change. `DEVBOX_STRICT=1` does not
+move the 13, because the gate ran to its end. A caller that reads the output takes only
+`devbox: green (` as a pass.
 
 A caller that must know whether the remote gate ran sets `DEVBOX_STRICT=1` in the environment.
 Then devbox never falls back to a local gate, the environment wins over `.devbox.env`, and

@@ -22,7 +22,7 @@ source ./lib.sh
 # shellcheck source=tests/gate-stub-hold.sh
 source ./gate-stub-hold.sh
 # A CI job sets CI, and DEVBOX_LOCAL_GATE=ci reads it. Every case names its own.
-unset CI DEVBOX_RERUN DEVBOX_STRICT
+unset CI DEVBOX_RERUN DEVBOX_STRICT DEVBOX_STRICT_TREE
 
 REPO="$(cd .. && pwd)"
 TMP="$(mktemp -d)" || { echo "mktemp -d failed" >&2; exit 1; }
@@ -319,6 +319,34 @@ assert_ok "D10a: and the verdict names that reason" \
 printf 'four\n' >"$CO/src/a.ts"
 verify --plan
 assert_ok "D10a: with the planned tree back, lint does not carry from that record" grep -qE '^lint  run  ' <<<"$out"
+
+# ═══ DEVBOX_STRICT_TREE=1: such a gate exits 13, and nothing else changes ═════
+TREE_VERDICT='^devbox: incomplete \(run [^ ]+ does not carry: files changed while it ran\)$'
+printf 'four-a\n' >"$CO/src/a.ts"
+DEVBOX_STRICT_TREE=1 FAKE_TOUCH="$CO/src/a.ts" FAKE_TOUCH_STEP=lint verify --target lan1
+assert_eq "13" "$rc" "strict tree: every step passed and a file changed, so the gate exits 13"
+assert_ok "strict tree: the last line is the same incomplete verdict" grep -qE "$TREE_VERDICT" <<<"$(last_line)"
+assert_ok "strict tree: one line names the key and the code" \
+  contains "devbox verify: DEVBOX_STRICT_TREE=1, so this gate exits 13: every step passed, and the files are not the ones the gate ran on" "$out"
+assert_eq "0" "$(field "$(newest_record)" complete)" "strict tree: the record is complete 0, as without the key"
+printf 'four-b\n' >"$CO/src/a.ts"
+DEVBOX_STRICT_TREE=1 FAKE_TOUCH="$CO/src/a.ts" FAKE_TOUCH_STEP=lint verify --local
+assert_eq "13" "$rc" "strict tree: a gate on this machine exits 13 too"
+assert_ok "strict tree: with the same last line" grep -qE "$TREE_VERDICT" <<<"$(last_line)"
+printf 'four-c\n' >"$CO/src/a.ts"
+DEVBOX_STRICT_TREE=0 FAKE_TOUCH="$CO/src/a.ts" FAKE_TOUCH_STEP=lint verify --target lan1
+assert_eq "0" "$rc" "strict tree: DEVBOX_STRICT_TREE=0 is the default, exit 0"
+printf 'four-d\n' >"$CO/src/a.ts"
+DEVBOX_STRICT_TREE=1 FAKE_RC_lint=3 FAKE_TOUCH="$CO/src/a.ts" FAKE_TOUCH_STEP=lint verify --target lan1
+assert_eq "3" "$rc" "strict tree: a failed step keeps its own code"
+printf 'four-s\n' >"$CO/src/a.ts"
+DEVBOX_STRICT=1 DEVBOX_STRICT_TREE=1 FAKE_TOUCH="$CO/src/a.ts" FAKE_TOUCH_STEP=lint verify --target lan1
+assert_eq "13" "$rc" "strict tree: DEVBOX_STRICT=1 does not move the 13"
+assert_ok "strict tree: and the last line is the same incomplete verdict" grep -qE "$TREE_VERDICT" <<<"$(last_line)"
+printf 'four-e\n' >"$CO/src/a.ts"
+DEVBOX_STRICT_TREE=1 verify --target lan1
+assert_eq "0" "$rc" "strict tree: a gate whose files did not change exits 0"
+assert_ok "strict tree: and reads green" contains "devbox: green" "$(last_line)"
 
 # ═══ R3: --local runs the same steps with the same runner and record ═════════
 printf 'five\n' >"$CO/src/a.ts"
