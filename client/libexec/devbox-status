@@ -1623,13 +1623,18 @@ watch_table() {
 # Old numbers are never shown as current: a block older than
 # $3 seconds says from when it is, at the end of its first line. $1 the name of
 # the variable that holds the block, $2 the job whose answer it shows.
+# The first line is cut to leave room for the mark. A host line of 110 columns
+# plus the 17 of the mark passed a 120-column terminal, the frame's cut took
+# the mark with the rest, and the old numbers read as current.
 mark_stale() {
   local -n blk="$1"
-  local first rest
+  local first rest mark
   [ $((NOW - ${ANS_AT[$2]})) -gt "$3" ] || return 0
   first="${blk%%$'\n'*}"
   rest="${blk:${#first}}"
-  blk="$first (as of ${ANS_CLOCK[$2]})$rest"
+  mark=" (as of ${ANS_CLOCK[$2]})"
+  cut_line $((COLS - ${#mark})) "$first"
+  blk="$CUT$mark$rest"
 }
 
 watch_draw() {

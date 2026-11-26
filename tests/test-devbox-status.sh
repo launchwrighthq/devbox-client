@@ -699,10 +699,10 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
   restored "SIGTERM"
 
   # R18: about 6 seconds at --interval 2 is three refreshes or more. lan1
-  # answers once, then never finishes its second status. 140 columns: lan1's
-  # line is 110 with `queued 1`, and the mark adds 17, which a 120-column
-  # terminal cuts off with the rest of a line past its width.
-  WATCH_COLS=140 watch_tty "" "DEVBOX_STATUS_FRAMES=24 FAKE_STALL_SECOND=lan1.invalid DEVBOX_PROBE_ANSWER_SECONDS=60" --interval 2
+  # answers once, then never finishes its second status. 120 columns: lan1's
+  # line is 110 with `queued 1` and the mark adds 17, so the line is cut to
+  # keep the mark, which the frame's cut once took with the rest of the line.
+  WATCH_COLS=120 watch_tty "" "DEVBOX_STATUS_FRAMES=24 FAKE_STALL_SECOND=lan1.invalid DEVBOX_PROBE_ANSWER_SECONDS=60" --interval 2
   assert_eq "0" "$rc" "a watch with a stalled target: exit 0"
   n_cloud="$(count_in_log 'devbox-gate@cloud1.invalid status ')"
   assert_ok "cloud1 answers at every refresh: 3 status calls or more (got $n_cloud)" test "$n_cloud" -ge 3
@@ -713,8 +713,8 @@ if script --version 2>/dev/null | grep -q util-linux && TERM=xterm tput smcup >/
     "lan1: its first answer, then one call that never ends, and no second call stacked on it"
   # The line lan1 answered at the first refresh is older than two intervals by
   # the end, and says so.
-  assert_ok "the old lan1 line ends with the time it is from" \
-    grep -qE '^lan1      ok        hints .* jobs 2/3    queued 1 \(as of [0-9]{2}:[0-9]{2}:[0-9]{2}\)$' <<<"$(plain "$out")"
+  assert_ok "the old lan1 line ends with the time it is from, inside 120 columns" \
+    grep -qE '^lan1      ok        hints .{77} \(as of [0-9]{2}:[0-9]{2}:[0-9]{2}\)$' <<<"$(plain "$out")"
   assert_ok "and cloud1, which answers, has no such mark" \
     grep -qxF 'cloud1    ok        hints ░░░░░░░░ 0/20     cpu █░░░░░░░ 0.3/8    mem █░░░░░░░ 2.0G/32G   jobs 0/3    queued 0  no swap' <<<"$(plain "$out")"
   # The rows of the old answer stay in the table, under the line that dates them.
